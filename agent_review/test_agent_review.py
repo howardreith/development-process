@@ -4398,8 +4398,15 @@ class UnitTests(unittest.TestCase):
 
     def test_project_and_plans_load_under_owner_policy(self):
         cfg = ar.load_project("kingmaker-gunslinger")
-        self.assertEqual(("gpt-6.2-astra", "high"), (cfg["reviewer"]["model"], cfg["reviewer"]["effort"]))
+        self.assertEqual(("gpt-6.2-astra", "max"), (cfg["reviewer"]["model"], cfg["reviewer"]["effort"]))
         self.assertEqual(("opus", "high"), (cfg["developer"]["model"], cfg["developer"]["effort"]))
+        for path in sorted((ar.HERE / "projects").glob("*.json")):  # every shipped profile meets the policy
+            shipped = ar.load_project(path.stem)
+            self.assertEqual(("max", "high"), (shipped["reviewer"]["effort"], shipped["developer"]["effort"]), path.name)
+        stale = json.loads(json.dumps(cfg))
+        stale["reviewer"]["effort"] = "high"  # a snapshot pinned before the policy change is refused, not run
+        with self.assertRaisesRegex(ar.UsageError, "reviewer.effort"):
+            ar.check_policy(stale)
         for name in ("black-tentacles", "agent-review-setup"):
             self.assertEqual("final", ar.load_plan(name)["checkpoints"][-1]["type"])
 

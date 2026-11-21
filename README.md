@@ -3,7 +3,7 @@
 Machine-level development workflow for the repositories under `C:\Dev`.
 
 **agent-review**: Claude Opus (high effort) develops a mission; Codex with
-GPT-6.2 Astra (`gpt-6.2-astra`, high effort) independently reviews each
+GPT-6.2 Astra (`gpt-6.2-astra`, max effort) independently reviews each
 checkpoint; a small local controller runs both, verifies every result and
 keeps the whole exchange on a GitHub draft PR. The owner steps in only for a
 human decision, a precise blocker, or the final review.

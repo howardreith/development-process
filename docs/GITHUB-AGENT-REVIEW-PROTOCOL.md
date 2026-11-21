@@ -18,7 +18,7 @@ the setup agent, not installed automation.
 | Role | Required behavior |
 |---|---|
 | Developer | Claude Opus with high effort owns implementation, focused validation, evidence collection, and finding dispositions. |
-| Reviewer | Codex with explicit model ID `gpt-6.2-astra` independently evaluates the candidate against the mission and evidence. High reasoning effort is the proposed initial default. |
+| Reviewer | Codex with explicit model ID `gpt-6.2-astra` independently evaluates the candidate against the mission and evidence. Max reasoning effort is the owner-selected setting (raised from the initial high default on 2026-11-21). |
 | Controller | A small deterministic program owns request IDs, candidate snapshots, subprocesses, model settings, schema validation, locks, publication, retries, and readiness checks. |
 | Owner | Howie performs final product/visual review and separately controls merging and release. |
 
@@ -372,7 +372,7 @@ realistic scenario covers several.
 
 | ID | Required demonstration |
 |---|---|
-| WF01 | Actual supported CLI/auth routes invoke Opus high and Astra; requested/observed metadata and limitations are recorded. |
+| WF01 | Actual supported CLI/auth routes invoke Opus high and Astra max; requested/observed metadata and limitations are recorded. |
 | WF02 | A real draft setup PR receives a review request and an independent Astra result for its fixed candidate. |
 | WF03 | Claude receives findings, posts dispositions, preserves a new corrective commit, and requests rereview; distinguish a real finding cycle from a clearly labeled fixture simulation. |
 | WF04 | A moved material head or changed comparison input cannot reuse a stale ready result. |

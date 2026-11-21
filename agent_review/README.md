@@ -2,7 +2,7 @@
 
 A machine-level development workflow for the GitHub repositories under
 `C:\Dev`. Claude Opus (high effort) implements a mission; Codex with GPT-6.2
-Astra (`gpt-6.2-astra`, high reasoning effort) independently reviews each
+Astra (`gpt-6.2-astra`, max reasoning effort) independently reviews each
 checkpoint; a small local controller runs both, verifies every result and
 keeps the whole exchange on a GitHub **draft PR**. The owner is involved only
 for a human decision, a precise blocker, or the final review. Nothing merges,
@@ -62,7 +62,7 @@ project. Plans: `single` (any mission), `black-tentacles`, `agent-review-setup`.
           ┌─────────────────────┼──────────────────────────────┐
           ▼                     ▼                              ▼
   Claude Code -p          Codex exec (read-only)          gh (owner's auth)
-  opus / high             gpt-6.2-astra / high            draft PR comments,
+  opus / high             gpt-6.2-astra / max             draft PR comments,
   developer worktree      detached snapshot of H          PR body status
   push + verify helpers   structured review JSON          (controller only)
 ```
@@ -81,7 +81,7 @@ project. Plans: `single` (any mission), `black-tentacles`, `agent-review-setup`.
   `review --report`; each report is bound to that session's CLI-recorded
   model and effort.
 - **Reviewer**: `codex -a never exec --ignore-user-config -m gpt-6.2-astra
-  -c model_reasoning_effort="high" -c windows.sandbox="elevated" --sandbox
+  -c model_reasoning_effort="max" -c windows.sandbox="elevated" --sandbox
   read-only --disable <connectors/agents/browser/...> -C <snapshot>
   --output-schema <schema> -o <result> --json -`, prompt on stdin, in a
   detached worktree of H. Its inputs (mission, diff, prior findings, report,
