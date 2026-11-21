@@ -2303,7 +2303,13 @@ class Controller:
     def missing_gates(self, commit, checkpoint=None):
         cp = checkpoint or self.checkpoint
         status = self.gate_status(commit)
-        return [g for g in cp.get("required_gates", []) if not status.get(g, (False, []))[0]]
+        return [g for g in self.required_gates(cp) if not status.get(g, (False, []))[0]]
+
+    def required_gates(self, checkpoint=None):
+        """The gates required at a checkpoint: the project's required gates (its own validation policy; by default
+        every declared gate) together with any the plan's checkpoint adds. A generic plan cannot drop them."""
+        cp = checkpoint or self.checkpoint
+        return sorted(set(project_required_gates(self.cfg)) | set(cp.get("required_gates", [])))
 
     def run_gate(self, gate_id, extra=()):
         """Run a project-declared validation gate on the clean candidate and write a receipt bound to it."""
@@ -2360,7 +2366,7 @@ class Controller:
                        .replace("{repo_root}", self.state["repo_root"]).replace("{branch}", self.state["branch"]),
                        "transcript_dir": self.cfg["transcript_dir"], "correction": "",
                        "enrollment_id": self.state["enrollment_id"], "allowed_commands": self.allowed_commands(),
-                       "required_gates": ", ".join(f"`{g}`" for g in self.checkpoint.get("required_gates", [])) or "none",
+                       "required_gates": ", ".join(f"`{g}`" for g in self.required_gates()) or "none",
                        "verify_command": f"python {Path(self.wf).resolve().as_posix()}/agent_review.py verify "
                                          f"--enrollment {self.state['enrollment_id']} --gate"})
         resume = self.developer.session_exists(dev["session_id"])
@@ -2424,10 +2430,9 @@ class Controller:
             raise Stop("BLOCKED", f"developer invocation {n} did not start a session (exit {out['exit_code']}): {tail}")
         if out["session_id"] != dev["session_id"]:
             raise Stop("BLOCKED", f"developer ran in session {out['session_id']}, not the enrolled {dev['session_id']}")
-        allowed = re.compile(self.cfg["developer"]["allowed_model_pattern"])
-        models = [out["init_model"], *out["main_models"], *out.get("transcript_models", [])]
-        if any(not m or not allowed.match(m) for m in models):  # stream and this invocation's transcript records
-            raise Stop("BLOCKED", f"developer ran on {models}, not an allowed {self.cfg['developer']['model']} model")
+        problem = developer_model_problem(self.cfg, out)
+        if problem:
+            raise Stop("BLOCKED", problem)
         efforts = out["observed_effort"]
         if efforts != [self.cfg["developer"]["effort"]]:
             raise Stop("BLOCKED", f"developer effort not affirmatively {self.cfg['developer']['effort']}: the session "
@@ -3481,6 +3486,22 @@ def pr_identity_problems(pr, repository, number, branch, target):
     return problems
 
 
+def developer_model_problem(cfg, out):
+    """The developer model check shared by report admission and preflight: the stream's init and main-thread models
+    and the models recorded in this invocation's transcript must all match the allowed pattern."""
+    allowed = re.compile(cfg["developer"]["allowed_model_pattern"])
+    models = [out.get("init_model"), *out.get("main_models", []), *out.get("transcript_models", [])]
+    if not out.get("init_model") or any(not m or not allowed.match(m) for m in models):
+        return f"developer ran on {models}, not an allowed {cfg['developer']['model']} model"
+    return None
+
+
+def project_required_gates(cfg):
+    """A project's required gates: its explicit `required_gates`, or else every gate it declares."""
+    declared = cfg.get("gates") or {}
+    return list(cfg["required_gates"]) if "required_gates" in cfg else sorted(declared)
+
+
 def check_policy(cfg):
     for role, required in POLICY.items():
         for key, value in required.items():
@@ -3494,6 +3515,9 @@ def load_project(name_or_path, root=HERE):
     if cfg.get("schema_version") != "agent-review.project.v1":
         raise UsageError(f"{path} is not an agent-review project config")
     check_policy(cfg)
+    unknown = sorted(set(project_required_gates(cfg)) - set(cfg.get("gates") or {}))
+    if unknown:
+        raise UsageError(f"{path} requires undeclared gates: {unknown}")
     return cfg
 
 
@@ -3783,11 +3807,11 @@ def preflight(cfg, root=HERE):
     allowed = re.compile(cfg["developer"]["allowed_model_pattern"])
     out["developer"] = {"cli": dev.version(), "requested": dev.requested, "session_id": sid,
                         "observed_model_init": dev_out["init_model"], "observed_models_api": dev_out["main_models"],
+                        "observed_models_transcript": dev_out.get("transcript_models", []),
                         "observed_effort_transcript": dev_out["observed_effort"],
                         "api_key_source": dev_out["api_key_source"], "model_usage": dev_out["model_usage"],
                         "structured_output_ok": isinstance(dev_out["structured_output"], dict),
-                        "ok": bool(dev_out["init_model"]) and all(allowed.match(m or "") for m in
-                                                                   [dev_out["init_model"], *dev_out["main_models"]])
+                        "ok": developer_model_problem(cfg, dev_out) is None
                         and dev_out["observed_effort"] == [cfg["developer"]["effort"]]
                         and dev_out["exit_code"] == 0 and not dev_out["is_error"] and dev_out["subtype"] == "success"
                         and dev_out["session_id"] == sid and isinstance(dev_out["structured_output"], dict)

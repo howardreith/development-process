@@ -153,6 +153,12 @@ Shipped configs belong in `projects/` here (reviewed); `init-project` writes
 user-local ones to `~/.agent-review/projects/`. A project with
 `"enrollment_allowed": false` can be checked but never enrolled.
 
+Required gates: a project's `required_gates` (by default every declared gate)
+are required at every checkpoint of every plan, including the generic `single`
+plan. A plan checkpoint can add gates but cannot drop them. Declare
+supplemental gates and list only the required ones, as development-process
+does (`"required_gates": ["unit"]`).
+
 ## Running a mission
 
 ```powershell

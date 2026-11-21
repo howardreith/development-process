@@ -272,6 +272,7 @@ class Env:
                    push_command=["git", "-C", "{repo_root}", "push", "--quiet", "origin", "HEAD:refs/heads/{branch}"],
                    state_root=str(root / "state"), runtime_lock_paths=[str(root / "runtime.lock")])
         cfg["limits"].update(retry_backoff_seconds=[0, 0], uncertain_send_window_seconds=0)
+        cfg["required_gates"] = []  # fixtures opt into gates through their plan (or override this explicitly)
         for key, value in (cfg_overrides or {}).items():
             cfg[key] = value
         for rel, data in (extra_wf_files or {}).items():
@@ -3790,6 +3791,33 @@ class FirstReleaseTests(Base):
         bad = report(env, "phase-1", [{"finding_id": "R2-F1", "disposition": "deferred_optional", "commits": [],
                                        "evidence": "defer"}])
         self.assertIn("cannot be deferred", ctl.accept_report(bad))
+
+    def test_generic_plan_keeps_the_projects_required_gates(self):
+        """R11-F1: a plan without required_gates (like `single`) cannot drop the project's required gate; a failed
+        run of it blocks readiness, and the developer prompt names it."""
+        gates = {"unit": {"argv": [sys.executable, "-c", "import sys; sys.exit(1)"]},
+                 "extra": {"argv": [sys.executable, "-c", "print('supplemental')"]}}
+        plan = {"schema_version": "agent-review.plan.v1", "mission_id": "single", "checkpoints": [
+            {"id": "final", "type": "final", "scope": "s", "exit_conditions": ["e"]}]}
+        env = Env("foreground", plan=plan, cfg_overrides={"gates": gates, "required_gates": ["unit"]})
+        self.addCleanup(env.cleanup)
+        ctl = env.controller()
+        head = git(env.work, "rev-parse", "HEAD")
+        self.assertEqual(["unit"], ctl.required_gates())
+        ctl.run_gate("unit")  # fails
+        self.assertEqual(["unit"], ctl.missing_gates(head))
+        error = ctl.accept_report(report(env, "final"))  # report admission refuses the failed required gate
+        self.assertIn("unit", error)
+        del ctl.cfg["required_gates"]  # default: every declared gate is required
+        self.assertEqual(["extra", "unit"], ctl.required_gates())
+
+    def test_preflight_uses_the_same_developer_model_check(self):
+        """R11-F2."""
+        cfg = {"developer": {"allowed_model_pattern": "^claude-opus-", "model": "opus"}}
+        good = {"init_model": OPUS, "main_models": [OPUS], "transcript_models": [OPUS]}
+        self.assertIsNone(ar.developer_model_problem(cfg, good))
+        self.assertTrue(ar.developer_model_problem(cfg, dict(good, transcript_models=[OPUS, "claude-sonnet-x"])))
+        self.assertTrue(ar.developer_model_problem(cfg, dict(good, init_model=None)))
 
     def test_conflicting_transcript_model_is_refused(self):
         """R10-F1."""
