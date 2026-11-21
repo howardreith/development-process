@@ -4042,43 +4042,88 @@ def find_enrollment(value):
     raise UsageError(f"enrollment {value} is not registered under {folder}")
 
 
+LIST_ROW = {"enrollment": None, "repository": None, "branch": None,
+            "status": "unknown", "phase": None, "pr": None, "updated_at": None}
+
+
+def remote_path_reason(text):
+    """Why a path names network storage, or None. Decided from the path string and the local drive table only,
+    before anything touches the path: a UNC or device path (\\\\server\\share, //server/share, \\\\?\\UNC\\...)
+    or a drive letter mapped to a network share (GetDriveTypeW == DRIVE_REMOTE). Windows only."""
+    if os.name != "nt":
+        return None
+    path = text.replace("/", "\\")
+    local_device = re.match(r"\\\\[?.]\\([A-Za-z]):", path)  # \\?\C:\... is a local drive in long-path form
+    if path.startswith("\\\\") and not local_device:
+        return "a UNC or device path (possibly a network share)"
+    letter = local_device or re.match(r"([A-Za-z]):", path)
+    if letter:
+        import ctypes
+        if ctypes.windll.kernel32.GetDriveTypeW(f"{letter.group(1)}:\\") == 4:  # DRIVE_REMOTE
+            return "on a mapped network drive"
+    return None
+
+
+def _text(value):
+    return value if isinstance(value, str) else None
+
+
+def _list_row(entry):
+    row = dict(LIST_ROW)
+    try:
+        claim = read_json(entry)
+        if not isinstance(claim, dict):
+            raise ValueError("claim is not a JSON object")
+    except (OSError, ValueError, RecursionError) as exc:  # RecursionError: pathologically nested JSON
+        return {**row, "error": f"claim {entry.name} is unreadable: {type(exc).__name__}: {exc}"}
+    row.update(enrollment=_text(claim.get("enrollment_id")), repository=_text(claim.get("repository")),
+               branch=_text(claim.get("branch")))
+    folder = claim.get("dir")
+    if not isinstance(folder, str) or not folder.strip():
+        return {**row, "error": f"claim {entry.name} names no valid enrollment directory "
+                                f"(dir is {type(folder).__name__})"}
+    remote = remote_path_reason(folder)
+    if remote:
+        return {**row, "error": f"state directory {folder} is {remote}; list inspects local state only and did "
+                                "not access it"}
+    if not Path(folder).is_absolute():
+        return {**row, "error": f"claim {entry.name} names a relative state directory ({folder}) that cannot be "
+                                "resolved independently of the working directory; it was not read"}
+    state_path = Path(folder) / "state.json"
+    try:
+        state = read_json(state_path)
+        if not isinstance(state, dict):
+            raise ValueError("state is not a JSON object")
+    except FileNotFoundError:
+        return {**row, "error": f"state file is missing: {state_path}"}
+    except (OSError, ValueError, RecursionError) as exc:
+        return {**row, "error": f"state file is unreadable: {state_path}: {type(exc).__name__}: {exc}"}
+    pr = state.get("pr")
+    number = pr.get("number") if isinstance(pr, dict) else None
+    row.update(phase=_text(state.get("phase")), updated_at=_text(state.get("updated_at")),
+               pr=number if isinstance(number, int) and not isinstance(number, bool) and number > 0 else None)
+    status = state.get("status")
+    if isinstance(status, str) and status:
+        row["status"] = status
+    else:
+        row["error"] = f"state file has no valid status: {state_path}"
+    return row
+
+
 def list_enrollments():
     """Every enrollment claim in the host registry with its state summary, sorted by enrollment ID. Strictly
-    read-only: no locks, no writes (not even creating the registry folder), no network or GitHub calls. A damaged
-    claim or state file is reported (status "unknown" with an error) instead of failing the whole listing."""
+    read-only: no locks, no writes (not even creating the registry folder), no network or GitHub calls, and no
+    access to state paths on network storage. A damaged claim or state file is reported (status "unknown" with an
+    error) instead of failing the whole listing."""
     folder = host_dir() / "registry"
     rows = []
     for entry in sorted(folder.glob("*.json")) if folder.is_dir() else []:
-        row = {"enrollment": None, "repository": None, "branch": None,
-               "status": "unknown", "phase": None, "pr": None, "updated_at": None}
         try:
-            claim = read_json(entry)
-            if not isinstance(claim, dict):
-                raise ValueError("claim is not a JSON object")
-        except (OSError, ValueError) as exc:
-            rows.append({**row, "error": f"claim {entry.name} is unreadable: {exc}"})
-            continue
-        row.update(enrollment=claim.get("enrollment_id"), repository=claim.get("repository"),
-                   branch=claim.get("branch"))
-        if not claim.get("dir"):
-            rows.append({**row, "error": f"claim {entry.name} names no enrollment directory"})
-            continue
-        state_path = Path(claim["dir"]) / "state.json"
-        try:
-            state = read_json(state_path)
-            if not isinstance(state, dict):
-                raise ValueError("state is not a JSON object")
-        except FileNotFoundError:
-            rows.append({**row, "error": f"state file is missing: {state_path}"})
-            continue
-        except (OSError, ValueError) as exc:
-            rows.append({**row, "error": f"state file is unreadable: {state_path}: {exc}"})
-            continue
-        pr = state.get("pr")
-        row.update(status=state.get("status", "unknown"), phase=state.get("phase"),
-                   pr=pr.get("number") if isinstance(pr, dict) else None, updated_at=state.get("updated_at"))
-        rows.append(row)
-    return sorted(rows, key=lambda r: (not isinstance(r["enrollment"], str), str(r["enrollment"] or "")))
+            rows.append(_list_row(entry))
+        except Exception as exc:  # last resort: one damaged enrollment never hides the others
+            rows.append({**LIST_ROW, "error": f"claim {entry.name} could not be inspected: "
+                                              f"{type(exc).__name__}: {exc}"})
+    return sorted(rows, key=lambda r: (r["enrollment"] is None, r["enrollment"] or ""))
 
 
 COMMAND_STATUSES = {"run": {"ACTIVE"}, "review": {"ACTIVE"}, "finalize": {"ACTIVE"},

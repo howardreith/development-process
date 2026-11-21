@@ -3843,18 +3843,31 @@ def tree_snapshot(root):
 
 @contextlib.contextmanager
 def forbid_processes_and_network(test):
-    """Tripwire, not a simulated response: fails the test if the code under test starts any process (git, gh) or
-    opens a network connection. Nothing is answered on the code's behalf."""
+    """Tripwire, not a simulated response: fails the test if the code under test starts any process (git, gh),
+    opens a network connection, or reads a JSON file on a UNC/device path. Nothing is answered on the code's
+    behalf; every attempt is recorded and refused, and the record is checked after the block (so a catch-all in
+    the code under test cannot hide a violation)."""
     from unittest import mock
+    attempts = []
+    real_read_json = ar.read_json
 
     def refuse(what):
         def _refuse(*args, **kwargs):
-            test.fail(f"read-only command attempted {what}: {args[:1]}")
+            attempts.append(what)
+            raise AssertionError(f"read-only command attempted {what}")
         return _refuse
+
+    def guarded_read_json(path):
+        text = str(path).replace("/", "\\")
+        if text.startswith("\\\\") and not re.match(r"\\\\[?.]\\[A-Za-z]:", text):  # \\?\C:\ is a local drive
+            return refuse(f"to read network path {path}")()
+        return real_read_json(path)
     with mock.patch.object(subprocess, "Popen", side_effect=refuse("a process")), \
             mock.patch.object(socket.socket, "connect", refuse("a network connection")), \
-            mock.patch.object(socket, "create_connection", side_effect=refuse("a network connection")):
+            mock.patch.object(socket, "create_connection", side_effect=refuse("a network connection")), \
+            mock.patch.object(ar, "read_json", guarded_read_json):
         yield
+    test.assertEqual([], attempts)
 
 
 class ListCommandTests(Base):
@@ -3915,6 +3928,95 @@ class ListCommandTests(Base):
         self.assertIn("unreadable", damaged["error"])
         self.assertEqual("unknown", broken["status"])
         self.assertIn("zz-broken.json", broken["error"])
+
+    # R1 regressions: each damaged entry is listed next to the real, healthy enrollment.
+
+    def claim(self, enrollment, folder, **extra):
+        ar.atomic_write_json(ar.host_dir() / "registry" / f"{enrollment}.json",
+                             {"enrollment_id": enrollment, "dir": folder, "repository": "owner/other",
+                              "branch": f"claude/{enrollment}", **extra})
+
+    def state_dir(self, name, text):
+        folder = self.env.root / "other-state" / name
+        folder.mkdir(parents=True)
+        (folder / "state.json").write_text(text, encoding="utf-8")
+        return str(folder)
+
+    def listed(self):
+        rows = {r["enrollment"]: r for r in json.loads(self.run_list())}
+        ctl = self.env.controller()
+        healthy = rows.pop(ctl.state["enrollment_id"])
+        self.assertEqual({"enrollment": ctl.state["enrollment_id"], "repository": "owner/repo",
+                          "branch": self.env.branch, "status": "ACTIVE", "phase": ctl.state["phase"], "pr": 7,
+                          "updated_at": ctl.state.get("updated_at")}, healthy)
+        return rows
+
+    def test_malformed_claims_never_hide_healthy_enrollments(self):
+        """R1-F1: non-string dir values and pathologically nested JSON (RecursionError) stay per-entry."""
+        deep = "[" * 200000
+        self.claim("a-dir-number", 42)
+        self.claim("b-dir-object", {"path": "x"})
+        self.claim("c-dir-empty", "")
+        self.claim("d-deep-state", self.state_dir("deep", deep))
+        (ar.host_dir() / "registry" / "e-deep-claim.json").write_text(deep, encoding="utf-8")
+        rows = self.listed()
+        for enrollment, needle in (("a-dir-number", "dir is int"), ("b-dir-object", "dir is dict"),
+                                   ("c-dir-empty", "dir is str"), ("d-deep-state", "RecursionError")):
+            self.assertEqual("unknown", rows[enrollment]["status"], enrollment)
+            self.assertEqual("owner/other", rows[enrollment]["repository"])
+            self.assertIn(needle, rows[enrollment]["error"])
+        self.assertIn("e-deep-claim.json", rows[None]["error"])
+        self.assertIn("RecursionError", rows[None]["error"])
+
+    def test_invalid_state_values_keep_the_output_types(self):
+        """R1-F2: pr is a positive integer or null; status is a string (else unknown with an error)."""
+        base = {"phase": "develop", "updated_at": "2026-11-21T00:00:00Z"}
+        for name, pr in (("p-string", {"number": "7"}), ("p-bool", {"number": True}), ("p-object", {"number": {}}),
+                         ("p-float", {"number": 7.5}), ("p-scalar", 7)):
+            self.claim(name, self.state_dir(name, json.dumps({**base, "status": "ACTIVE", "pr": pr})))
+        self.claim("s-number", self.state_dir("s-number", json.dumps({**base, "status": 5, "pr": {"number": 3},
+                                                                       "phase": ["x"]})))
+        rows = self.listed()
+        for name in ("p-string", "p-bool", "p-object", "p-float", "p-scalar"):
+            self.assertEqual(("ACTIVE", None, "develop"), (rows[name]["status"], rows[name]["pr"], rows[name]["phase"]))
+        bad = rows["s-number"]
+        self.assertEqual(("unknown", 3, None), (bad["status"], bad["pr"], bad["phase"]))
+        self.assertIn("no valid status", bad["error"])
+
+    def test_relative_state_directory_is_not_resolved_against_the_callers_directory(self):
+        """R1-F3: a relative dir would read whatever state happens to sit under the current directory. It is
+        reported (unknown, with the reason) and never read, from any working directory."""
+        decoy = self.env.root / "rel-state" / "x"
+        decoy.mkdir(parents=True)
+        (decoy / "state.json").write_text(json.dumps({"status": "AWAITING_OWNER_REVIEW", "pr": {"number": 99}}),
+                                          encoding="utf-8")
+        self.claim("relative", os.path.join("rel-state", "x"))
+        saved = os.getcwd()
+        self.addCleanup(os.chdir, saved)
+        for cwd in (self.env.root, self.env.work):  # the decoy resolves from the first; nothing from the second
+            os.chdir(cwd)
+            row = self.listed()["relative"]
+            self.assertEqual(("unknown", None), (row["status"], row["pr"]))
+            self.assertIn("relative state directory", row["error"])
+
+    @unittest.skipUnless(os.name == "nt", "UNC paths and mapped network drives are Windows path forms")
+    def test_network_state_directories_are_reported_without_access(self):
+        """R1-F4: UNC/device paths are refused from the string alone (the tripwire fails on any read of them);
+        the healthy enrollment on a local drive is still read through the drive-type check."""
+        paths = {"n-unc": r"\\agent-review-unreachable.invalid\share\state\x",
+                 "n-forward": "//agent-review-unreachable.invalid/share/state/x",
+                 "n-long-unc": r"\\?\UNC\agent-review-unreachable.invalid\share\x"}
+        for name, folder in paths.items():
+            self.claim(name, folder)
+        local_long = "\\\\?\\" + str(self.env.dir.resolve())  # long-path form of a local drive stays readable
+        self.claim("n-local-long", local_long)
+        rows = self.listed()
+        for name, folder in paths.items():
+            self.assertEqual("unknown", rows[name]["status"])
+            self.assertIn("UNC or device path", rows[name]["error"])
+            self.assertIn("did not access it", rows[name]["error"])
+        self.assertEqual(("ACTIVE", 7), (rows["n-local-long"]["status"], rows["n-local-long"]["pr"]))
+        self.assertIsNone(ar.remote_path_reason(str(self.env.root)))  # local fixed drive: not network storage
 
 
 class ToolTranscriptTests(unittest.TestCase):

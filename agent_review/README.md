@@ -182,9 +182,13 @@ Plans with intermediate checkpoints and `required_gates` go in `plans/` (or
 `repository`, `branch`, and from that enrollment's `state.json` `status`,
 `phase`, `pr` (number or null) and `updated_at`. It is strictly read-only: no
 locks, no writes and no network or GitHub calls, so it is safe while
-controllers run. A claim whose state file (or the claim itself) is missing or
-unreadable is still listed, with `status` `"unknown"` and an `error` field
-saying why; one damaged enrollment never fails the listing. Cancelled
+controllers run. A claim whose state file (or the claim itself) is missing,
+unreadable or malformed is still listed, with `status` `"unknown"` and an
+`error` field saying why; one damaged enrollment never fails the listing.
+Claims naming a relative state directory (which would resolve against the
+caller's working directory) or network storage (a UNC/device path or a
+mapped network drive) are reported the same way without being read. `pr` is
+a positive integer or null even if the state file holds something else. Cancelled
 enrollments release their claim and are not listed. Use `status --enrollment
 <id>` for the full detail of one enrollment.
 
