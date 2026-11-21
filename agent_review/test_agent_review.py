@@ -3842,14 +3842,15 @@ def tree_snapshot(root):
 
 
 @contextlib.contextmanager
-def forbid_processes_and_network(test):
+def forbid_processes_and_network(test, forbidden=()):
     """Tripwire, not a simulated response: fails the test if the code under test starts any process (git, gh),
-    opens a network connection, or reads a JSON file on a UNC/device path. Nothing is answered on the code's
-    behalf; every attempt is recorded and refused, and the record is checked after the block (so a catch-all in
-    the code under test cannot hide a violation)."""
+    opens a network connection, or reads a JSON file on a UNC/device path or under any `forbidden` path (links the
+    code must not follow). Nothing is answered on the code's behalf; every attempt is recorded and refused, and the
+    record is checked after the block (so a catch-all in the code under test cannot hide a violation)."""
     from unittest import mock
     attempts = []
     real_read_json = ar.read_json
+    blocked = [os.path.normcase(str(p)) for p in forbidden]
 
     def refuse(what):
         def _refuse(*args, **kwargs):
@@ -3861,6 +3862,8 @@ def forbid_processes_and_network(test):
         text = str(path).replace("/", "\\")
         if text.startswith("\\\\") and not re.match(r"\\\\[?.]\\[A-Za-z]:", text):  # \\?\C:\ is a local drive
             return refuse(f"to read network path {path}")()
+        if any(os.path.normcase(str(path)).startswith(prefix) for prefix in blocked):
+            return refuse(f"to read through a link: {path}")()
         return real_read_json(path)
     with mock.patch.object(subprocess, "Popen", side_effect=refuse("a process")), \
             mock.patch.object(socket.socket, "connect", refuse("a network connection")), \
@@ -3873,8 +3876,8 @@ def forbid_processes_and_network(test):
 class ListCommandTests(Base):
     """Mission: read-only `list` of every enrollment claim in the host registry."""
 
-    def run_list(self):
-        with forbid_processes_and_network(self), contextlib.redirect_stdout(io.StringIO()) as out:
+    def run_list(self, forbidden=()):
+        with forbid_processes_and_network(self, forbidden), contextlib.redirect_stdout(io.StringIO()) as out:
             code = ar.main(["list"])
         self.assertEqual(ar.EXIT_OK, code)
         return out.getvalue()
@@ -3942,8 +3945,8 @@ class ListCommandTests(Base):
         (folder / "state.json").write_text(text, encoding="utf-8")
         return str(folder)
 
-    def listed(self):
-        rows = {r["enrollment"]: r for r in json.loads(self.run_list())}
+    def listed(self, forbidden=()):
+        rows = {r["enrollment"]: r for r in json.loads(self.run_list(forbidden))}
         ctl = self.env.controller()
         healthy = rows.pop(ctl.state["enrollment_id"])
         self.assertEqual({"enrollment": ctl.state["enrollment_id"], "repository": "owner/repo",
@@ -3973,9 +3976,10 @@ class ListCommandTests(Base):
         base = {"phase": "develop", "updated_at": "2026-11-21T00:00:00Z"}
         for name, pr in (("p-string", {"number": "7"}), ("p-bool", {"number": True}), ("p-object", {"number": {}}),
                          ("p-float", {"number": 7.5}), ("p-scalar", 7)):
-            self.claim(name, self.state_dir(name, json.dumps({**base, "status": "ACTIVE", "pr": pr})))
-        self.claim("s-number", self.state_dir("s-number", json.dumps({**base, "status": 5, "pr": {"number": 3},
-                                                                       "phase": ["x"]})))
+            self.claim(name, self.state_dir(name, json.dumps({**base, "enrollment_id": name, "status": "ACTIVE",
+                                                              "pr": pr})))
+        self.claim("s-number", self.state_dir("s-number", json.dumps({**base, "enrollment_id": "s-number", "status": 5,
+                                                                       "pr": {"number": 3}, "phase": ["x"]})))
         rows = self.listed()
         for name in ("p-string", "p-bool", "p-object", "p-float", "p-scalar"):
             self.assertEqual(("ACTIVE", None, "develop"), (rows[name]["status"], rows[name]["pr"], rows[name]["phase"]))
@@ -3983,9 +3987,38 @@ class ListCommandTests(Base):
         self.assertEqual(("unknown", 3, None), (bad["status"], bad["pr"], bad["phase"]))
         self.assertIn("no valid status", bad["error"])
 
+    def test_enrollment_with_a_relative_state_root_is_listed_from_any_directory(self):
+        """R1-F3 (round 2): a real enrollment made with a relative --state-root records an absolute state_dir in
+        its claim (dir keeps its existing relative value), so list reads that enrollment's own state from any
+        working directory, never a decoy that the relative dir would resolve to there."""
+        env = self.env
+        ctl = env.controller()
+        ctl.verify_inputs()
+        self.assertEqual("CANCELLED", ctl.cancel("re-enroll with a relative state root"))
+        saved = os.getcwd()
+        self.addCleanup(os.chdir, saved)
+        os.chdir(env.root)
+        folder, state = ar.enroll(env.args(state_root="rel-root"), github=env.gh, root=env.wf)
+        enrollment = state["enrollment_id"]
+        claim = ar.read_json(ar.registry_path("owner/repo", env.branch))
+        self.assertEqual(os.path.join("rel-root", enrollment), claim["dir"])  # unchanged for other commands
+        self.assertEqual(str(env.root / "rel-root" / enrollment), claim["state_dir"])
+        on_disk = ar.read_json(env.root / "rel-root" / enrollment / "state.json")
+        decoy = env.work / "rel-root" / enrollment  # what the relative dir would mean from the work tree
+        decoy.mkdir(parents=True)
+        (decoy / "state.json").write_text(json.dumps({"enrollment_id": enrollment, "status": "AWAITING_OWNER_REVIEW",
+                                                      "phase": "done", "pr": {"number": 99}}), encoding="utf-8")
+        expected = [{"enrollment": enrollment, "repository": "owner/repo", "branch": env.branch,
+                     "status": on_disk["status"], "phase": on_disk["phase"], "pr": 7,
+                     "updated_at": on_disk.get("updated_at")}]
+        self.assertEqual("ACTIVE", on_disk["status"])
+        for cwd in (env.work, env.root, env.origin):
+            os.chdir(cwd)
+            self.assertEqual(expected, json.loads(self.run_list()))
+
     def test_relative_state_directory_is_not_resolved_against_the_callers_directory(self):
-        """R1-F3: a relative dir would read whatever state happens to sit under the current directory. It is
-        reported (unknown, with the reason) and never read, from any working directory."""
+        """R1-F3: an older claim (no state_dir) with a relative dir would read whatever state happens to sit under
+        the current directory. It is reported (unknown, with the reason) and never read, from any directory."""
         decoy = self.env.root / "rel-state" / "x"
         decoy.mkdir(parents=True)
         (decoy / "state.json").write_text(json.dumps({"status": "AWAITING_OWNER_REVIEW", "pr": {"number": 99}}),
@@ -4008,15 +4041,90 @@ class ListCommandTests(Base):
                  "n-long-unc": r"\\?\UNC\agent-review-unreachable.invalid\share\x"}
         for name, folder in paths.items():
             self.claim(name, folder)
-        local_long = "\\\\?\\" + str(self.env.dir.resolve())  # long-path form of a local drive stays readable
-        self.claim("n-local-long", local_long)
+        own = self.state_dir("long", json.dumps({"enrollment_id": "n-local-long", "status": "PAUSED",
+                                                 "pr": {"number": 11}}))
+        self.claim("n-local-long", "\\\\?\\" + str(Path(own).resolve()))  # long-path form of a local drive
         rows = self.listed()
         for name, folder in paths.items():
             self.assertEqual("unknown", rows[name]["status"])
             self.assertIn("UNC or device path", rows[name]["error"])
             self.assertIn("did not access it", rows[name]["error"])
-        self.assertEqual(("ACTIVE", 7), (rows["n-local-long"]["status"], rows["n-local-long"]["pr"]))
+        self.assertEqual(("PAUSED", 11), (rows["n-local-long"]["status"], rows["n-local-long"]["pr"]))
         self.assertIsNone(ar.remote_path_reason(str(self.env.root)))  # local fixed drive: not network storage
+
+    def test_claim_pointing_at_another_enrollments_state_shows_none_of_its_fields(self):
+        """R2-F1: identity is checked before any summary field is copied."""
+        env = self.env
+        self.claim("m-mismatch", str(env.dir))  # the healthy enrollment's own state directory
+        ar.atomic_write_json(ar.host_dir() / "registry" / "m-anonymous.json",
+                             {"dir": str(env.dir), "repository": "owner/other", "branch": "claude/anon"})
+        rows = self.listed()  # the healthy enrollment keeps its own values
+        mismatch = rows["m-mismatch"]
+        self.assertEqual(("unknown", None, None, None),
+                         (mismatch["status"], mismatch["pr"], mismatch["phase"], mismatch["updated_at"]))
+        self.assertIn("belongs to enrollment", mismatch["error"])
+        anonymous = rows[None]
+        self.assertEqual(("unknown", None, "claude/anon"), (anonymous["status"], anonymous["pr"], anonymous["branch"]))
+        self.assertIn("not to this claim's None", anonymous["error"])
+
+    @unittest.skipUnless(os.name == "nt", "junctions and reparse points are Windows filesystem links")
+    def test_links_are_refused_before_they_are_followed(self):
+        """R1-F4 (round 2): a junction as the state directory or as a parent component of it, and a junctioned
+        registry, are refused from lstat alone; the tripwire fails on any read through them. Link targets are
+        local, so conservative refusal is exercised without contacting a share."""
+        import _winapi
+        env = self.env
+        target = Path(self.state_dir("target", json.dumps({"enrollment_id": "l-direct", "status": "ACTIVE",
+                                                           "pr": {"number": 5}})))
+        (target / "sub").mkdir()
+        (target / "sub" / "state.json").write_text(json.dumps({"enrollment_id": "l-component", "status": "ACTIVE"}),
+                                                   encoding="utf-8")
+        junction = env.root / "junction"
+        _winapi.CreateJunction(str(target), str(junction))
+        self.addCleanup(os.rmdir, junction)  # removes the junction itself, never its target
+        self.claim("l-direct", str(target))  # the same content, read directly, is fine
+        self.claim("l-junction", str(junction))
+        self.claim("l-component", str(junction / "sub"))
+        rows = self.listed([junction])
+        self.assertEqual(("ACTIVE", 5), (rows["l-direct"]["status"], rows["l-direct"]["pr"]))
+        for name in ("l-junction", "l-component"):
+            self.assertEqual(("unknown", None), (rows[name]["status"], rows[name]["pr"]), name)
+            self.assertIn("reparse point", rows[name]["error"])
+            self.assertIn("did not access it", rows[name]["error"])
+        host_link = env.root / "host-link"
+        _winapi.CreateJunction(str(ar.host_dir()), str(host_link))
+        self.addCleanup(os.rmdir, host_link)
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"AGENT_REVIEW_HOST_DIR": str(host_link)}), \
+                forbid_processes_and_network(self, [host_link]), \
+                contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(ar.EXIT_USAGE, ar.main(["list"]))
+        self.assertEqual("", out.getvalue())
+        self.assertIn("reparse point", err.getvalue())
+
+    def test_symbolic_links_to_state_or_claim_files_are_refused(self):
+        """R1-F4 (round 2): a symbolic link as state.json or as a registry claim file is refused from lstat alone
+        (also on POSIX); the tripwire fails on any read through either link."""
+        env = self.env
+        target = Path(self.state_dir("target", json.dumps({"enrollment_id": "l-file", "status": "ACTIVE",
+                                                           "pr": {"number": 5}})))
+        registry = ar.host_dir() / "registry"
+        plain = env.root / "plain"
+        plain.mkdir()
+        self.claim("l-real", str(target))
+        try:
+            os.symlink(target / "state.json", plain / "state.json")
+            os.symlink(registry / "l-real.json", registry / "l-claimlink.json")
+        except OSError as exc:  # Windows needs Developer Mode or SeCreateSymbolicLinkPrivilege; junctions do not
+            self.skipTest(f"symbolic links cannot be created here: {exc}")
+        self.claim("l-file", str(plain))
+        rows = self.listed([plain / "state.json", registry / "l-claimlink.json"])
+        self.assertIn("belongs to enrollment", rows["l-real"]["error"])  # control: the target itself is readable
+        self.assertEqual(("unknown", None), (rows["l-file"]["status"], rows["l-file"]["pr"]))
+        self.assertIn("reparse point", rows["l-file"]["error"])
+        self.assertIn("did not access it", rows["l-file"]["error"])
+        self.assertIn("l-claimlink.json was not read", rows[None]["error"])
+        self.assertIn("reparse point", rows[None]["error"])
 
 
 class ToolTranscriptTests(unittest.TestCase):

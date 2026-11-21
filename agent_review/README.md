@@ -185,10 +185,17 @@ locks, no writes and no network or GitHub calls, so it is safe while
 controllers run. A claim whose state file (or the claim itself) is missing,
 unreadable or malformed is still listed, with `status` `"unknown"` and an
 `error` field saying why; one damaged enrollment never fails the listing.
-Claims naming a relative state directory (which would resolve against the
-caller's working directory) or network storage (a UNC/device path or a
-mapped network drive) are reported the same way without being read. `pr` is
-a positive integer or null even if the state file holds something else. Cancelled
+New claims record an absolute `state_dir` (alongside the unchanged `dir`), so
+enrollments made with a relative `--state-root` list correctly from any
+directory. Older claims naming only a relative directory, paths on network
+storage (a UNC/device path or a mapped network drive), and any path whose
+registry folder, claim file, state directory components or `state.json` is a
+symbolic link, junction or other reparse point are reported the same way
+without being read (links are refused conservatively, whatever their target;
+a linked registry folder makes `list` refuse with exit 4). A state file whose
+`enrollment_id` differs from the claim's is reported without copying any of
+its fields. `pr` is a positive integer or null even if the state file holds
+something else. Cancelled
 enrollments release their claim and are not listed. Use `status --enrollment
 <id>` for the full detail of one enrollment.
 
