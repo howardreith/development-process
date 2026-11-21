@@ -503,6 +503,17 @@ class GitHub:
         return self._lines("api", "--paginate", f"repos/{self.repo}/issues/{number}/comments",
                            "--jq", ".[] | {id: .id, user: .user.login, body: .body, url: .html_url} | @json")
 
+    def comment(self, comment_id):
+        """Authoritative lookup of one comment: its record, or None only when GitHub answers 404 (deleted)."""
+        proc = run([self.gh, "api", f"repos/{self.repo}/issues/comments/{comment_id}"], check=False, timeout=180)
+        if proc.returncode == 0:
+            data = json.loads(proc.stdout or "{}")
+            return {"id": data["id"], "url": data["html_url"], "user": (data.get("user") or {}).get("login"),
+                    "body": data.get("body")}
+        if re.search(r"HTTP 404|Not Found", proc.stderr + proc.stdout):
+            return None
+        raise CommandError(["gh", "api", "comment"], proc)
+
     def post_comment(self, number, body_file) -> dict:
         try:
             data = self._json("api", f"repos/{self.repo}/issues/{number}/comments", "-F", f"body=@{body_file}")
@@ -538,8 +549,12 @@ class GitHub:
     def commit_checks(self, sha):
         runs = self._lines("api", "--paginate", f"repos/{self.repo}/commits/{sha}/check-runs", "--jq",
                            ".check_runs[] | {name: .name, status: .status, conclusion: .conclusion, app_id: .app.id} | @json")
-        statuses = self._lines("api", f"repos/{self.repo}/commits/{sha}/status", "--jq",
-                               ".statuses[] | {name: .context, status: \"completed\", conclusion: .state, app_id: null} | @json")
+        statuses = self._lines("api", "--paginate", f"repos/{self.repo}/commits/{sha}/statuses", "--jq",
+                               ".[] | {name: .context, status: \"completed\", conclusion: .state, app_id: null} | @json")
+        latest = {}
+        for status in statuses:  # the statuses list is newest first: the first per context is current
+            latest.setdefault(status["name"], status)
+        statuses = list(latest.values())
         return runs + statuses
 
 
@@ -649,7 +664,7 @@ class CodexReviewer:
             if not line.strip():
                 continue
             try:
-                obj = json.loads(line)
+                obj = json.loads(line, object_pairs_hook=_no_duplicate_keys)  # duplicate members cannot hide values
             except ValueError:
                 obj = None
             if not isinstance(obj, dict) or not isinstance(obj.get("type"), str):
@@ -708,7 +723,7 @@ def _rollout_header(path):
     """The session_meta payload on a rollout's first line, or None if it is missing or malformed."""
     try:
         with open(path, encoding="utf-8", errors="replace") as handle:
-            first = json.loads(handle.readline())
+            first = json.loads(handle.readline(), object_pairs_hook=_no_duplicate_keys)
     except (ValueError, OSError):
         return None
     if isinstance(first, dict) and first.get("type") == "session_meta" and isinstance(first.get("payload"), dict):
@@ -724,9 +739,9 @@ def parse_codex_events(events_path):
         if not line.strip():
             continue
         try:
-            event = json.loads(line)
+            event = json.loads(line, object_pairs_hook=_no_duplicate_keys)
         except ValueError:
-            malformed = True  # an unparseable event leaves the invocation's outcome unknown
+            malformed = True  # an unparseable (or duplicate-member) event leaves the invocation's outcome unknown
             continue
         if not isinstance(event, dict) or not isinstance(event.get("type"), str):
             malformed = True
@@ -1619,6 +1634,10 @@ class Controller:
         rnd["status"] = "reviewing"
         self.save()
         self.reconcile_reviewer_attempt(rnd, rnd_dir)
+        fatal = [a for a in rnd["attempts"] if a.get("fatal")]
+        if fatal:  # recorded before a restart: never dispatched again without the owner's resume
+            raise Stop("BLOCKED", "review rejected: " + "; ".join(fatal[-1].get("reasons") or []) +
+                       " (no model downgrade is attempted)")
         envelope = None
         while len(rnd["attempts"]) < self.limits["max_review_attempts_per_round"]:
             self.check_stop_request()
@@ -1669,6 +1688,8 @@ class Controller:
                         "reasons": envelope["reasons"], "thread_id": info.get("thread_id"), "envelope_sha256": digest})
         if envelope["ok"]:  # promote in the same write that records the attempt: no window for a duplicate review
             rnd.update(status="validated", envelope_path=envelope["path"], envelope_sha256=digest)
+        elif envelope["fatal"]:  # the blocking outcome is persisted with the attempt that caused it
+            self.state.update(status="BLOCKED", status_reason="review rejected: " + "; ".join(envelope["reasons"]))
         self.save()
         return envelope
 
@@ -1890,9 +1911,9 @@ class Controller:
         if passing and blocking_after:
             reasons.append("blocking findings would remain open after this passing decision: " + ", ".join(sorted(blocking_after)))
         if result["decision"] == "ready_for_owner_review":
-            categories = {**{fid: (e.get("category")) for fid, e in ledger.items()},
-                          **{f["id"]: f["category"] for f in result["findings"]}}
-            defects = sorted(fid for fid in open_after if categories.get(fid) == "defect")
+            obligation = {fid for fid, e in ledger.items() if e.get("category") == "defect" or e.get("correctness_obligation")}
+            obligation |= {f["id"] for f in result["findings"] if f["category"] == "defect"}
+            defects = sorted(fid for fid in open_after if fid in obligation)  # a restated category cannot remove it
             if defects:  # protocol section 11
                 reasons.append("ready_for_owner_review with actionable correctness findings lacking an accepted "
                                "disposition: " + ", ".join(defects))
@@ -1941,14 +1962,15 @@ class Controller:
         record = self.publish(key, self.review_body(rnd, envelope))
         problem = self.publication_problems(key, record, self.gh.comments(self.state["pr"]["number"]))
         if problem:  # authenticated on GitHub, not just in the local inventory, before anything is committed
-            if record["state"] == "posted":
-                record["state"] = "pending"  # the next attempt reconciles (never re-posts blindly) and re-checks
-                listing = {c["id"] for c in self.gh.comments(self.state["pr"]["number"])}
-                for part in record["parts"]:
-                    if part.get("comment_id") not in listing:
-                        part.update(comment_id=None, url=None)
+            deleted = [part for part in record["parts"] if part.get("comment_id")
+                       and self.gh.comment(part["comment_id"]) is None]  # authoritative per-comment lookup
+            if deleted and record["state"] == "posted":
+                for part in deleted:  # only a confirmed deletion authorizes a replacement POST
+                    part.update(comment_id=None, url=None)
+                record["state"] = "pending"
                 self.save()
-            raise Stop("PAUSED", f"round {rnd['round']} verdict is not completely published on the PR: {problem}")
+            raise Stop("PAUSED", f"round {rnd['round']} verdict is not completely published on the PR: {problem}"
+                       + ("" if deleted else " (the acknowledged comments still exist; the listing may lag)"))
         rnd["published"] = [{"comment_id": p["comment_id"], "url": p["url"]} for p in record["parts"]]
         stale = self.freshness(rnd)  # publication may have taken minutes of retries
         if stale:
@@ -1977,6 +1999,8 @@ class Controller:
         for f in result["findings"]:
             entry = ledger.setdefault(f["id"], {"first_round": rnd["round"], "rounds_open": 0})
             was_blocking = bool(entry.get("blocks_readiness")) and entry.get("status") == "open"
+            entry["correctness_obligation"] = bool(entry.get("correctness_obligation")) or \
+                entry.get("category") == "defect" or f["category"] == "defect"  # kept across restatements
             entry.update({k: f[k] for k in ("title", "priority", "category")}, finding=f, finding_round=rnd["round"])
             entry.update(blocks_readiness=f["blocks_readiness"] or was_blocking, status="open", last_round=rnd["round"])
         for entry in ledger.values():
@@ -2404,7 +2428,7 @@ class Controller:
         if out["exit_code"] != 0 or out["is_error"] or out["subtype"] != "success" or                 not isinstance(out["structured_output"], dict):
             return (f"invocation {n} ended without a valid structured report (exit {out['exit_code']}, "
                     f"{out['subtype']}); return the report")
-        error = self.accept_report(out["structured_output"])
+        error = self.admit_report(out["structured_output"], "developer reported a checkpoint")
         if out["deadline_exceeded"] and not error:
             raise Stop("PAUSED", f"developer invocation {n} exceeded its soft deadline; review progress before resuming")
         return error
@@ -2463,6 +2487,15 @@ class Controller:
         if getattr(self, "_developer", None) is not None:
             self._developer.settings_path = path
 
+    def admit_report(self, report, why):
+        """Accept a developer report and leave develop under the helper lock: no push/verify helper can be between
+        its authority check and its run marker while the controller decides on gate evidence and changes phase."""
+        with self.helper_lock("report-admission"):
+            error = self.accept_report(report)
+            if not error:
+                self.transition("review", why)
+            return error
+
     def assert_claims(self):
         """This enrollment must still hold both the host branch claim and the worktree's own marker."""
         for claim in (registry_path(self.cfg["repository"], self.state["branch"]),
@@ -2520,7 +2553,8 @@ class Controller:
                 correction = self.develop_step(correction)
                 if correction:
                     continue
-                self.transition("review", "developer reported a checkpoint")
+                if self.state["phase"] == "develop":  # normally already admitted under the helper lock
+                    self.transition("review", "developer reported a checkpoint")
             elif phase == "review":
                 self.review_round()
             elif phase == "finalize":
@@ -2658,12 +2692,13 @@ class Controller:
         return "ACTIVE (foreground: continue with `review --report`)"
 
     # -- archive and readiness ---------------------------------------------------------
-    def unarchived_parts(self, pub, folder):
-        """Delivered parts of a publication whose markers appear in none of its committed records."""
-        texts = "".join(path.read_text(encoding="utf-8", errors="replace")
-                        for path in (folder.glob(f"*-{pub['key']}.md") if folder.exists() else []))
-        texts += "".join(path.read_text(encoding="utf-8", errors="replace")
-                         for path in (folder.glob(f"*-{pub['key']}-supplement.md") if folder.exists() else []))
+    def unarchived_parts(self, pub, folder=None):
+        """Delivered parts of a publication whose marker is in none of its committed records (read from the
+        committed tree at HEAD, not the working copy)."""
+        rel_dir = self.transcript_folder()
+        names = [n for n in self.git("ls-tree", "-r", "--name-only", "HEAD", "--", rel_dir).splitlines()
+                 if n.endswith((f"-{pub['key']}.md", f"-{pub['key']}-supplement.md", f"-{pub['key']}-envelope.json"))]
+        texts = "".join(self.git("show", f"HEAD:{n}") for n in names)
         return [q for q in pub["parts"] if q.get("comment_id") and q["marker"] not in texts]
 
     def transcript_folder(self):
@@ -2712,8 +2747,9 @@ class Controller:
                 if rnd:
                     path = Path(rnd["envelope_path"])
                     raw = path.read_bytes() if path.is_file() else None
-                    refs = [{"part": i + 1, "comment_id": part.get("comment_id"), "url": part.get("url")}
-                            for i, part in enumerate(carried)]  # the parts of THIS publication that reached GitHub
+                    refs = [{"part": pub["parts"].index(part) + 1, "of": len(pub["parts"]),
+                             "comment_id": part.get("comment_id"), "url": part.get("url")}
+                            for part in carried]  # original inventory positions of the parts that reached GitHub
                     if raw is not None and sha256_bytes(raw) == rnd.get("envelope_sha256"):
                         doc = {**json.loads(raw), "publication": pub["key"], "published": refs}
                     elif rnd.get("status") == "accepted":
@@ -2728,14 +2764,17 @@ class Controller:
                                   f"{pub['key']}-envelope"))
                     seq += 1
         for pub in sorted(self.state.get("publications", {}).values(), key=lambda p: p["seq"]):
-            if pub["key"] not in archived_keys:
-                continue  # covered above
+            if pub["key"] not in archived_keys or pub["state"] != "superseded":
+                continue  # posted publications are archived only once complete
             if any(p.get("posting_since") and not p.get("comment_id") for p in pub["parts"]):
                 self.visible_parts(pub["key"], pub)
-            late = self.unarchived_parts(pub, folder)
-            if late:  # parts confirmed after the key was archived: an append-only supplement
+            late = self.unarchived_parts(pub)
+            if late:  # parts confirmed after the key was archived: an append-only supplement with their references
+                refs = "\n".join(f"- part {pub['parts'].index(q) + 1} of {len(pub['parts'])}: comment {q['comment_id']} "
+                                 f"({q.get('url')})" for q in late)
                 body = (f"_Supplement: {len(late)} part(s) of `{pub['key']}` confirmed on the PR after it was "
-                        "first archived._\n\n" + "\n\n---\n\n".join(self.outbox_body(pub["key"], q) for q in late))
+                        f"first archived._\n\nAuthenticated references:\n{refs}\n\n"
+                        + "\n\n---\n\n".join(self.outbox_body(pub["key"], q) for q in late))
                 files.append((f"{rel_dir}/{seq:03d}-{pub['key']}-supplement.md", body, f"{pub['key']}-supplement-{seq}"))
                 seq += 1
         if not files:
@@ -2862,13 +2901,14 @@ class Controller:
             reasons.append(f"PR head {short(pr['headRefOid'])} is not {short(archive_head)}")
         unresolved = sorted(k for k, p in self.state.get("publications", {}).items()
                             if any(part.get("posting_since") and not part.get("comment_id") for part in p["parts"]))
-        folder = Path(self.state["repo_root"]) / self.transcript_folder()
         uncovered = sorted(k for k, p in self.state.get("publications", {}).items()
-                           if k in set(self.state.get("archived_keys", [])) and self.unarchived_parts(p, folder))
+                           if k in set(self.state.get("archived_keys", [])) and p["state"] == "superseded"
+                           and self.unarchived_parts(p))
         if uncovered:
             reasons.append("committed records lack delivered parts of " + ", ".join(uncovered))
         open_defects = sorted(fid for fid, e in self.state.get("findings", {}).items()
-                              if e.get("category") == "defect" and e.get("status") != "resolved")
+                              if (e.get("category") == "defect" or e.get("correctness_obligation"))
+                              and e.get("status") != "resolved")
         if open_defects:  # protocol section 11: actionable correctness findings need accepted dispositions
             reasons.append("actionable correctness findings without an accepted disposition: " + ", ".join(open_defects))
         if unresolved:
@@ -4171,10 +4211,9 @@ def main(argv=None):
                 if controller.state["phase"] == "review":
                     result = controller.review_round()
                 elif controller.state["phase"] == "develop":
-                    error = controller.accept_report(read_json(args.report))
+                    error = controller.admit_report(read_json(args.report), "developer submitted a checkpoint report")
                     if error:
                         raise UsageError(error)
-                    controller.transition("review", "developer submitted a checkpoint report")
                     result = controller.review_round()
                 else:
                     raise UsageError(f"phase is {controller.state['phase']}; nothing to review")

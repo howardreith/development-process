@@ -86,6 +86,9 @@ class FakeGitHub:
     def comments(self, number):
         return [dict(c) for c in self.comments_list]
 
+    def comment(self, comment_id):
+        return next((dict(c) for c in self.comments_list if c["id"] == comment_id), None)
+
     def post_comment(self, number, body_file):
         if self.fail_next:
             self.fail_next -= 1
@@ -3520,7 +3523,8 @@ class DevProcRoundEightTests(CrashFixture, Base):
         self.assertEqual(("ACTIVE", cap + 2), (on_disk["status"], on_disk["limits"]["max_review_rounds_per_checkpoint"]))
 
     def test_preceding_hashed_receipts_keep_their_failing_scope(self):
-        """R6-F3: receipts named under the preceding format (definition = argv only)."""
+        """R6-F3: the preceding hashed format (definition id = argv only, and no run markers) with an unchanged
+        declaration: its own failing receipt decides the gate."""
         flag = Path(tempfile.mkdtemp(prefix="agent-review-flag-")) / "code"
         self.addCleanup(shutil.rmtree, flag.parent, True)
         flag.write_text("1", encoding="utf-8")
@@ -3528,22 +3532,42 @@ class DevProcRoundEightTests(CrashFixture, Base):
         env = self.gated_env({"unit": {"argv": [sys.executable, "-c", code], "extra_args_pattern": "A|B"}})
         ctl = env.controller()
         head = git(env.work, "rev-parse", "HEAD")
-        ctl.run_gate("unit", ["A"])  # fails
         decl = ctl.cfg["gates"]["unit"]
-        for path in (ctl.dir / "evidence").glob("gate-unit-*.json"):
+        ctl.run_gate("unit", ["A"])  # fails
+        flag.write_text("0", encoding="utf-8")
+        ctl.run_gate("unit", ["B"])  # passes
+        evidence = ctl.dir / "evidence"
+        for marker in evidence.glob("gate-*.pending"):
+            marker.unlink()  # that format had no run markers
+        for path in evidence.glob("gate-unit-*.json"):
             path.rename(path.with_name(path.name.replace(f"-d{ar.gate_definition_id(decl)}-",
                                                          f"-d{ar.legacy_definition_id(decl)}-")))
-        flag.write_text("0", encoding="utf-8")
-        ctl.run_gate("unit", ["B"])
-        self.assertEqual(["unit"], ctl.missing_gates(head))  # A's failure survives the format change
+        self.assertFalse(list(evidence.glob("gate-*.pending")))
+        self.assertEqual(["unit"], ctl.missing_gates(head))  # decided by A's legacy failing receipt alone
         ctl.run_gate("unit", ["A"])
         self.assertEqual([], ctl.missing_gates(head))
-        ctl.cfg["gates"]["unit"]["extra_args_pattern"] = "B"  # A now positively excluded: its evidence is history
+
+    def test_earliest_format_with_a_narrowed_filter_is_history(self):
+        """R6-F3: timestamp-only receipts (no run markers); the declaration later narrows its filters."""
+        flag = Path(tempfile.mkdtemp(prefix="agent-review-flag-")) / "code"
+        self.addCleanup(shutil.rmtree, flag.parent, True)
         flag.write_text("1", encoding="utf-8")
-        self.assertEqual(["unit"], ctl.missing_gates(head))  # only B's (current-definition) run would count...
+        code = f"import sys, pathlib; sys.exit(int(pathlib.Path({str(flag)!r}).read_text()))"
+        env = self.gated_env({"unit": {"argv": [sys.executable, "-c", code], "extra_args_pattern": "A|B"}})
+        ctl = env.controller()
+        head = git(env.work, "rev-parse", "HEAD")
+        ctl.run_gate("unit", ["A"])  # fails under the earliest format
+        evidence = ctl.dir / "evidence"
+        for marker in evidence.glob("gate-*.pending"):
+            marker.unlink()
+        for path in evidence.glob("gate-unit-*.json"):
+            receipt = ar.read_json(path)
+            path.rename(evidence / f"gate-unit-{head[:12]}-{receipt['recorded_at']}.json")
+        self.assertEqual(["unit"], ctl.missing_gates(head))  # intact and in scope: it decides the gate
+        ctl.cfg["gates"]["unit"]["extra_args_pattern"] = "B"  # A is now positively excluded
         flag.write_text("0", encoding="utf-8")
         ctl.run_gate("unit", ["B"])
-        self.assertEqual([], ctl.missing_gates(head))
+        self.assertEqual([], ctl.missing_gates(head))  # the excluded legacy failure is history
 
     def test_late_confirmed_part_is_appended_and_required(self):
         """R6-F1: a key archived with part of its inventory gets an append-only supplement."""
@@ -3561,10 +3585,14 @@ class DevProcRoundEightTests(CrashFixture, Base):
         self.assertIn("r06-review", ctl.state["archived_keys"])
         folder = Path(ctl.state["repo_root"]) / ctl.transcript_folder()
         late["comment_id"], late["url"] = saved  # confirmed later
-        self.assertEqual([late], ctl.unarchived_parts(pub, folder))
+        self.assertEqual([late], ctl.unarchived_parts(pub))
         ctl.archive("second")
-        self.assertEqual([], ctl.unarchived_parts(pub, folder))
-        self.assertTrue(list(folder.glob("*-r06-review-supplement.md")))
+        self.assertEqual([], ctl.unarchived_parts(pub))
+        names = [n for n in git(env.work, "ls-tree", "-r", "--name-only", "HEAD").splitlines()
+                 if n.endswith("-r06-review-supplement.md")]
+        committed = git(env.work, "show", f"HEAD:{names[0]}")
+        total = len(pub["parts"])
+        self.assertIn(f"part {total} of {total}: comment {saved[0]} ({saved[1]})", committed)
 
     def test_receipt_corrections_are_archived(self):
         """R8-F1."""
@@ -3630,6 +3658,122 @@ class DevProcRoundEightTests(CrashFixture, Base):
                              capture_output=True, text=True, timeout=300,
                              env={k: v for k, v in os.environ.items() if k != "AGENT_REVIEW_LIVE"})
         self.assertEqual(0, out.returncode, out.stderr[-2000:])
+
+
+class DevProcRoundNineTests(CrashFixture, Base):
+    """Regressions for the development-process round-9 review findings."""
+
+    def test_lagging_listing_never_causes_a_duplicate_verdict(self):
+        """R9-F1."""
+        env = self.env
+        env.reviewer.script = [{"decision": "checkpoint_passed"}]
+        ctl = env.controller()
+        real_comments = env.gh.comments
+        env.gh.comments = lambda number: [c for c in real_comments(number) if "Astra — review" not in c["body"]]
+        ctl.accept_report(report(env, "phase-1"))
+        ctl.transition("review", "t")
+        with self.assertRaises(ar.Stop) as stop:
+            ctl.review_round()
+        self.assertIn("may lag", stop.exception.reason)
+        record = ar.read_json(env.dir / "state.json")["publications"]["r01-review"]
+        self.assertTrue(all(p["comment_id"] for p in record["parts"]))  # acknowledged IDs are kept
+        with self.assertRaises(ar.Stop):
+            env.controller().review_round()  # still lagging: still no second POST
+        env.gh.comments = real_comments
+        self.assertEqual("checkpoint_passed", env.controller().review_round())
+        self.assertEqual(1, sum("Astra — review" in c["body"] for c in env.gh.comments_list))
+
+    def test_report_admission_waits_for_a_running_helper(self):
+        """R7-F3: a push/verify helper holding the helper lock (between authority and its run marker) blocks the
+        foreground report admission and the transition out of develop."""
+        env = self.env
+        ctl = env.controller()
+        with ctl.helper_lock("verify"):  # held exactly as the verify helper holds it
+            with self.assertRaises(ar.UsageError):
+                env.controller().admit_report(report(env, "phase-1"), "t")
+        self.assertEqual("develop", ar.read_json(env.dir / "state.json")["phase"])
+        self.assertIsNone(env.controller().admit_report(report(env, "phase-1"), "t"))
+        self.assertEqual("review", ar.read_json(env.dir / "state.json")["phase"])
+
+    def test_restated_defect_keeps_its_correctness_obligation(self):
+        """R8-F3: restating a rejected defect as optional polish cannot permit a final pass."""
+        env = self.env
+        env.reviewer.script = [{"decision": "checkpoint_passed"},
+                               {"decision": "changes_required",
+                                "findings": [finding("R2-F1", blocks=False), finding("R2-F2")]},
+                               ] + [{"decision": "ready_for_owner_review",
+                                     "assessments": [("R2-F1", "fix_rejected"), ("R2-F2", "fix_verified")],
+                                     "findings": [finding("R2-F1", blocks=False, category="optional_polish")]}] * 3
+        ctl = env.controller()
+        self.submit(ctl, "phase-1")
+        self.submit(ctl, "final")
+        sha = env.commit("final.txt", "attempt\n", "attempt R2-F1 and R2-F2")
+        env.push()
+        with self.assertRaises(ar.Stop) as stop:
+            self.submit(ctl, "final", [fixed("R2-F1", sha), fixed("R2-F2", sha)])
+        self.assertIn("actionable correctness", stop.exception.reason)
+        self.assertTrue(ctl.state["findings"]["R2-F1"]["correctness_obligation"])
+
+    def test_duplicate_members_are_rejected(self):
+        """R1-F6."""
+        path = self.env.root / "events.jsonl"
+        path.write_text('{"type":"thread.started","thread_id":"%s"}\n{"type":"turn.completed","type":"turn.started"}\n'
+                        % TID, encoding="utf-8")
+        self.assertFalse(ar.parse_codex_events(path)["completed"])
+        with tempfile.TemporaryDirectory() as home:
+            rev = ar.CodexReviewer({"executable": sys.executable, "codex_home": home, "model": "m", "effort": "high"})
+            folder = Path(home) / "sessions"
+            folder.mkdir()
+            rollout = folder / f"rollout-1-{TID}.jsonl"
+            meta = json.dumps({"type": "session_meta", "payload": {"id": TID}})
+            dup = ('{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":'
+                   '{"model":"other","model":"m","reasoning_effort":"high"}}}')
+            rollout.write_text(meta + "\n" + dup + "\n", encoding="utf-8")
+            self.assertIn("malformed", rev.provenance(TID)["provenance_problem"])
+            rollout.write_text('{"type":"session_meta","payload":{"id":"x","id":"%s"}}\n' % TID, encoding="utf-8")
+            self.assertFalse(rev.provenance(TID)["rollout_found"])  # a duplicate-member header is not an identity
+
+    def test_recorded_fatal_attempt_is_never_retried_after_restart(self):
+        """R9-F2: the durable state after a fatal attempt is built on disk."""
+        env = self.env
+        ctl = env.controller()
+        ctl.accept_report(report(env, "phase-1"))
+        candidate = ctl.capture_candidate()
+        ctl.state["rounds"].append({"round": 1, "request_id": "x-r01-f", "checkpoint_id": "phase-1",
+                                    "checkpoint_type": "intermediate", **candidate, "pending_findings": [],
+                                    "report": ctl.state["last_report"], "created_at": ar.now_iso(),
+                                    "status": "reviewing", "attempt_seq": 1,
+                                    "attempts": [{"n": 1, "started": ar.now_iso(), "ended": ar.now_iso(), "ok": False,
+                                                  "fatal": True, "reasons": ["reviewer reported a usage limit"]}],
+                                    "contract": {"workflow": ctl.state["workflow"]["fingerprint"],
+                                                 "project": ar.project_digest(ctl.cfg)}})
+        ctl.state.update(active_round=1, phase="review", status="ACTIVE")
+        ctl.save()
+        with self.assertRaises(ar.Stop) as stop:
+            env.controller().review_round()
+        self.assertEqual("BLOCKED", stop.exception.status)
+        self.assertEqual([], env.reviewer.calls)
+
+    def test_commit_statuses_are_paginated_and_current(self):
+        """R9-F3: the real GitHub client against a gh shim (the external boundary)."""
+        shim_dir = Path(tempfile.mkdtemp(prefix="agent-review-gh-"))
+        self.addCleanup(shutil.rmtree, shim_dir, True)
+        script = shim_dir / "gh.py"
+        script.write_text("\n".join([
+            "import json, sys",
+            "args = sys.argv[1:]",
+            f"open({str(shim_dir / 'calls.jsonl')!r}, 'a').write(json.dumps(args) + chr(10))",
+            "if any(a.endswith('/statuses') for a in args):",
+            "    for row in [('ci', 'success'), ('ci', 'failure'), ('lint', 'success')]:  # newest first",
+            "        print(json.dumps({'name': row[0], 'status': 'completed', 'conclusion': row[1], 'app_id': None}))",
+            ""]), encoding="utf-8")
+        shim = shim_dir / "gh.cmd"
+        shim.write_text(f'@"{sys.executable}" "{script}" %*\n', encoding="utf-8")
+        checks = ar.GitHub("owner/repo", gh=str(shim)).commit_checks("a" * 40)
+        calls = [json.loads(line) for line in (shim_dir / "calls.jsonl").read_text().splitlines()]
+        status_call = next(c for c in calls if any(a.endswith("/statuses") for a in c))
+        self.assertIn("--paginate", status_call)
+        self.assertEqual({"ci": "success", "lint": "success"}, {c["name"]: c["conclusion"] for c in checks})
 
 
 class ToolTranscriptTests(unittest.TestCase):
