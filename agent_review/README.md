@@ -47,7 +47,11 @@ Every primary repository under `C:\Dev` except nima has a project config in
 
 The Kingmaker projects list all six shared runtime transaction locks, so a
 developer is never terminated and a handoff never declared while any lab's
-game transaction is active. Deploy, install, publish, live-mod, store-submit,
+game transaction is active. `kingmaker-gunslinger` also lists its
+loader-compat game-copy lock (`game-copies/loader-compat.lock`), and its
+developer may run `Build-Local.ps1` and the loader-compat harness/session
+scripts, which operate only on the disposable game copy (owner decision
+2026-11-21, PR #195). Deploy, install, publish, live-mod, store-submit,
 migration and production scripts are denied to the headless developer per
 project. Plans: `single` (any mission), `black-tentacles`, `agent-review-setup`.
 

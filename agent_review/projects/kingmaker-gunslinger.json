@@ -44,6 +44,9 @@
         "Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:/Dev/KingmakerGunslingerLab/codex-policy/Push-KingmakerGunslinger.ps1*)",
         "Bash(pwsh -NoProfile -File scripts/Invoke-KmgGate.ps1 *)",
         "Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Invoke-KmgGate.ps1 *)",
+        "Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Build-Local.ps1 *)",
+        "Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/compatibility/loader-compat/Build-LoaderCompatHarness.ps1 *)",
+        "Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/compatibility/loader-compat/Invoke-LoaderCompatSession.ps1 *)",
         "PowerShell(dotnet build *)",
         "PowerShell(dotnet test *)",
         "PowerShell(python -m unittest *)",
@@ -52,6 +55,12 @@
         "PowerShell(.\\scripts\\Invoke-KmgGate.ps1 *)",
         "PowerShell(.\\scripts\\Invoke-KingmakerRuntimeTest.ps1 *)",
         "PowerShell(.\\scripts\\Complete-KingmakerRuntimeLease.ps1 *)",
+        "PowerShell(.\\scripts\\Build-Local.ps1 *)",
+        "PowerShell(.\\scripts\\compatibility\\loader-compat\\Build-LoaderCompatHarness.ps1 *)",
+        "PowerShell(.\\scripts\\compatibility\\loader-compat\\Invoke-LoaderCompatSession.ps1 *)",
+        "PowerShell(powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Build-Local.ps1 *)",
+        "PowerShell(powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/compatibility/loader-compat/Build-LoaderCompatHarness.ps1 *)",
+        "PowerShell(powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/compatibility/loader-compat/Invoke-LoaderCompatSession.ps1 *)",
         "PowerShell(powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:/Dev/KingmakerGunslingerLab/codex-policy/Push-KingmakerGunslinger.ps1*)"
       ],
       "deny": [
@@ -101,6 +110,7 @@
   },
   "runtime_lock_paths": [
     "C:/Dev/KingmakerGunslingerLab/compatibility-state/compatibility.lock",
+    "C:/Dev/KingmakerGunslingerLab/game-copies/loader-compat.lock",
     "C:/Dev/KingmakerBuffPlannerLab/runtime-state/deployment.lock",
     "C:/Dev/KingmakerBuffPlannerLab/runtime-fixture-state/fixture.lock",
     "C:/Dev/KingmakerMemoryLeakResearchLab/runtime-state/kmld-runtime.lock",
