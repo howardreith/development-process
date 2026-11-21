@@ -77,6 +77,17 @@
         "-v"
       ],
       "timeout_minutes": 20
+    },
+    "permissions": {
+      "argv": [
+        "python",
+        "agent_review/agent_review.py",
+        "probe-permissions",
+        "--project",
+        "development-process"
+      ],
+      "timeout_minutes": 20,
+      "description": "Real headless Claude launches: production profile denies a user-level allowance and runs the enrolled helper; a control launch without setting-source isolation allows it."
     }
   }
 }

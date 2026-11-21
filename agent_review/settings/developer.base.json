@@ -97,6 +97,8 @@
       "PowerShell(python {helper} archive*)",
       "Bash(python {helper} activate*)",
       "PowerShell(python {helper} activate*)",
+      "Bash(python {helper} probe-permissions*)",
+      "PowerShell(python {helper} probe-permissions*)",
       "Bash(python {helper} install*)",
       "PowerShell(python {helper} install*)",
       "Bash(python {helper} enroll*)",

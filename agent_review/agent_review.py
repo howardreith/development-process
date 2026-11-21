@@ -85,6 +85,14 @@ class UsageError(Exception):
     """Refused: bad input, wrong target or lock held. Nothing is published."""
 
 
+class NotDelivered(Exception):
+    """GitHub definitely did not store the request (rejected with 4xx, or no connection was made)."""
+
+
+NOT_DELIVERED_RE = re.compile(r"HTTP 4\d\d|could not resolve|no such host|connection refused|dial tcp|"
+                              r"network is unreachable|error connecting to", re.I)
+
+
 class CommandError(Exception):
     def __init__(self, argv, proc):
         tail = (proc.stderr or proc.stdout or "").strip()[-800:]
@@ -495,7 +503,12 @@ class GitHub:
                            "--jq", ".[] | {id: .id, user: .user.login, body: .body, url: .html_url} | @json")
 
     def post_comment(self, number, body_file) -> dict:
-        data = self._json("api", f"repos/{self.repo}/issues/{number}/comments", "-F", f"body=@{body_file}")
+        try:
+            data = self._json("api", f"repos/{self.repo}/issues/{number}/comments", "-F", f"body=@{body_file}")
+        except CommandError as exc:
+            if NOT_DELIVERED_RE.search(exc.stderr) and not re.search(r"HTTP 408", exc.stderr):
+                raise NotDelivered(str(exc)) from exc  # rejected or never connected: nothing was stored
+            raise  # 5xx, timeouts and lost responses are ambiguous
         return {"id": data["id"], "url": data["html_url"], "user": (data.get("user") or {}).get("login")}
 
     def required_checks(self, branch):
@@ -628,10 +641,15 @@ class CodexReviewer:
             try:
                 obj = json.loads(line)
             except ValueError:
+                obj = None
+            if not isinstance(obj, dict) or not isinstance(obj.get("type"), str) or \
+                    not isinstance(obj.get("payload", {}), (dict, type(None))):
                 info["provenance_problem"] = "the rollout contains malformed records"
                 continue
             kind, payload = obj.get("type"), obj.get("payload") or {}
-            ptype = payload.get("type") if isinstance(payload, dict) else None
+            ptype = payload.get("type")
+            if kind == "session_meta" and payload.get("id") != thread_id:
+                info["provenance_problem"] = "the rollout's session metadata names more than one thread"
             if kind == "session_meta":
                 info["cli_version"] = payload.get("cli_version")
             elif kind == "turn_context":
@@ -1107,6 +1125,15 @@ class Controller:
         if self.state.get("developer_settings_sha256") and (
                 not settings.exists() or sha256_file(settings) != self.state["developer_settings_sha256"]):
             raise Stop("BLOCKED", "the enrollment's developer permission file is missing or changed")
+        if self.state.get("developer_settings_sha256") and self.state["workflow"].get("root") != str(self.wf):
+            # same behavioral version from another installed package (e.g. a config-only install): recompose the
+            # permission file so helper commands given to the developer and their allowances name the same package
+            atomic_write_json(settings, compose_developer_settings(self.cfg, self.wf, self.state["enrollment_id"],
+                                                                     self.state["repo_root"]))
+            self.state["developer_settings_sha256"] = sha256_file(settings)
+            self.state["workflow"]["root"] = str(self.wf)
+            self.state.setdefault("notes", []).append(f"{now_iso()} permissions recomposed for package {self.wf}")
+            self.save()
         return pr
 
     def mission_problem(self):
@@ -1255,10 +1282,9 @@ class Controller:
                             part["posting_since"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)).total_seconds()
                         if waited < self.limits.get("uncertain_send_window_seconds", UNCERTAIN_SEND_WINDOW_S):
                             raise RuntimeError("an earlier POST may have been stored; waiting for it to become visible")
-                        # absent from authenticated listings for the whole window: the earlier POST was not stored.
-                        # A late duplicate would still be caught by the single-copy checks at confirmation.
-                        part.pop("posting_since")
-                        self.save()
+                        raise Stop("PAUSED", f"delivery of {key} part {part['marker'][-40:]} is ambiguous: an earlier "
+                                             "POST may have been stored but has not appeared. Check the PR; if it is "
+                                             "absent, resume with --resend-undelivered (nothing is re-posted blindly)")
                     if not found and tentative is None:
                         if self.viewer() != self.cfg["expected_actor"]:  # checked at the mutation itself
                             raise Stop("BLOCKED", f"the gh login is {self._viewer}, not {self.cfg['expected_actor']}; "
@@ -1266,7 +1292,12 @@ class Controller:
                         self.pr_view()  # the enrolled open draft PR, re-read immediately before writing to it
                         part["posting_since"] = now_iso()
                         self.save()  # an interrupted or lost POST leaves this record of uncertain delivery
-                        tentative = self.gh.post_comment(number, part["body_file"])
+                        try:
+                            tentative = self.gh.post_comment(number, part["body_file"])
+                        except NotDelivered:
+                            part.pop("posting_since", None)  # definitely not stored: a later POST is safe
+                            self.save()
+                            raise
                         if tentative.get("user") not in (None, self.cfg["expected_actor"]):
                             raise Stop("BLOCKED", f"comment {tentative['id']} was posted as {tentative.get('user')}, "
                                                   f"not the expected {self.cfg['expected_actor']}; the gh login changed")
@@ -2044,8 +2075,9 @@ class Controller:
                 data = None
             if not isinstance(data, dict) or data.get("schema") != "agent-review.gate-receipt.v1" or \
                     data.get("candidate") != commit or data.get("gate") != named_gate or "argv" not in data:
+                argv = data.get("argv") if isinstance(data, dict) and isinstance(data.get("argv"), list) else None
                 data = {"schema": "agent-review.gate-receipt.v1", "candidate": commit, "damaged": True,
-                        "gate": named_gate, "argv": None, "recorded_at": "~damaged"}  # fails closed, sorts newest
+                        "gate": named_gate, "argv": argv, "recorded_at": "~damaged"}  # fails closed
             if gate is None or data.get("gate") == gate:
                 out.append((path, data))
         return out
@@ -2068,24 +2100,29 @@ class Controller:
 
     def gate_status(self, commit):
         """{gate: (passed, [latest receipt paths])}. Runs are ordered by the stamp in their controller-written file
-        names. For each gate and exact argument list the newest run supersedes older ones; a damaged receipt fails
-        its gate until a newer valid run exists. A gate passes only if every latest receipt is valid and passing."""
+        names. For each gate and exact argument list the newest run supersedes older ones. A damaged receipt fails
+        until a newer valid run of the same argument list exists; if its argument list cannot be read, every
+        argument list of that gate must have a newer valid run."""
         def stamp(path):
             return path.stem.rsplit("-", 1)[-1]
         ordered = sorted(self.gate_receipts(commit), key=lambda item: stamp(item[0]))
-        latest, damaged = {}, {}
+        latest, damage = {}, []
         for path, data in ordered:
-            if data.get("damaged") or data.get("recorded_at") != stamp(path):
-                damaged[data["gate"]] = stamp(path)  # unreadable, identity-less or re-dated: fails closed
+            argv = data.get("argv")
+            argv_key = json.dumps(argv) if isinstance(argv, list) else None
+            if data.get("damaged") or data.get("recorded_at") != stamp(path) or argv_key is None:
+                damage.append((data["gate"], argv_key, stamp(path)))  # fails closed for the run it represents
                 continue
-            latest[(data["gate"], json.dumps(data.get("argv")))] = (path, data)
+            latest[(data["gate"], argv_key)] = (path, data)
         status = {}
         for (gate, _), (path, data) in latest.items():
             ok, paths = status.get(gate, (True, []))
             status[gate] = (ok and not self.receipt_problems(path, data, commit), paths + [path])
-        for gate, when in damaged.items():
-            newest_valid = max((stamp(p) for p in status.get(gate, (True, []))[1]), default="")
-            if newest_valid <= when:
+        for gate, argv_key, when in damage:
+            runs = {k[1]: stamp(v[0]) for k, v in latest.items() if k[0] == gate}
+            covered = (runs.get(argv_key, "") > when) if argv_key is not None else \
+                (bool(runs) and all(t > when for t in runs.values()))
+            if not covered:
                 status[gate] = (False, status.get(gate, (False, []))[1])
         return status
 
@@ -2212,8 +2249,9 @@ class Controller:
         if any(not m or not allowed.match(m) for m in models):
             raise Stop("BLOCKED", f"developer ran on {models}, not an allowed {self.cfg['developer']['model']} model")
         efforts = out["observed_effort"]
-        if efforts and efforts != [self.cfg["developer"]["effort"]]:
-            raise Stop("BLOCKED", f"developer effort observed {efforts}, required {self.cfg['developer']['effort']}")
+        if efforts != [self.cfg["developer"]["effort"]]:
+            raise Stop("BLOCKED", f"developer effort not affirmatively {self.cfg['developer']['effort']}: the session "
+                                  f"transcript recorded {efforts or 'no effort setting'}")
         if out["exit_code"] != 0 or out["is_error"] or out["subtype"] != "success" or                 not isinstance(out["structured_output"], dict):
             return (f"invocation {n} ended without a valid structured report (exit {out['exit_code']}, "
                     f"{out['subtype']}); return the report")
@@ -2372,8 +2410,18 @@ class Controller:
             known.update(self.state["archived"])
             atomic_write_json(ledger, known)
 
-    def resume(self, reason, max_rounds=None):
+    def resume(self, reason, max_rounds=None, resend_undelivered=False):
         """Owner-initiated continuation after a stop; counters and session persist."""
+        if resend_undelivered:  # the owner checked the PR: parts still absent may be sent again
+            for key, pub in self.state.get("publications", {}).items():
+                for part in pub["parts"]:
+                    if part.get("posting_since") and not part.get("comment_id"):
+                        found = self.reconcile(self.state["pr"]["number"], part["marker"], self.outbox_body(key, part))
+                        if found:
+                            part["comment_id"], part["url"] = found["id"], found["url"]
+                        part.pop("posting_since")
+                        self.state.setdefault("notes", []).append(f"{now_iso()} owner cleared uncertain delivery of {key}")
+            self.save()
         if self.state["status"] == "AWAITING_OWNER_REVIEW" or self.state["phase"] == "done":
             moved = self.handoff_superseded()  # completed enrollments are recognized by phase, not only status
             if not moved:
@@ -2453,11 +2501,22 @@ class Controller:
                 n = int(review_key.group(1))
                 rnd = next((r for r in self.state["rounds"] if r["round"] == n and r.get("envelope_path")), None)
                 if rnd:
-                    if sha256_file(rnd["envelope_path"]) != rnd.get("envelope_sha256"):
+                    path = Path(rnd["envelope_path"])
+                    raw = path.read_bytes() if path.is_file() else None
+                    refs = [{"part": i + 1, "comment_id": part.get("comment_id"), "url": part.get("url")}
+                            for i, part in enumerate(carried)]  # the parts of THIS publication that reached GitHub
+                    if raw is not None and sha256_bytes(raw) == rnd.get("envelope_sha256"):
+                        doc = {**json.loads(raw), "publication": pub["key"], "published": refs}
+                    elif rnd.get("status") == "accepted":
                         raise Stop("BLOCKED", f"accepted envelope for round {n} changed on disk; refusing to archive it")
-                    env_text, _ = sanitize(json.dumps({**read_json(rnd["envelope_path"]), "published": rnd.get("published")},
-                                                      indent=2, sort_keys=True))
-                    files.append((f"{rel_dir}/{seq:03d}-r{n:02d}-envelope.json", env_text + "\n", f"r{n:02d}-envelope"))
+                    else:  # an invalidated round's damaged result is never presented as an authenticated envelope
+                        doc = {"round": n, "status": rnd.get("status"), "publication": pub["key"], "published": refs,
+                               "expected_envelope_sha256": rnd.get("envelope_sha256"),
+                               "envelope": "unavailable: the preserved result was missing or altered, so the round was "
+                                           "invalidated and not accepted; the published text above is the record"}
+                    env_text, _ = sanitize(json.dumps(doc, indent=2, sort_keys=True))
+                    files.append((f"{rel_dir}/{seq:03d}-{pub['key']}-envelope.json", env_text + "\n",
+                                  f"{pub['key']}-envelope"))
                     seq += 1
         if not files:
             return head
@@ -2651,12 +2710,13 @@ class Controller:
                 reasons.append("failing checks on the reviewed source: " + ", ".join(sorted(set(failed))))
         return reasons, notes
 
-    def retire_receipts(self, why):
+    def retire_receipts(self, why, keep=None):
         """Any unsuperseded handoff receipt stops being current. The correction for a visible receipt is persisted
         before the receipt is marked superseded, so an interruption can never lose it; queued corrections are sent
         by settle_publications."""
         for key, pub in list(self.state.get("publications", {}).items()):
-            if not key.startswith("final-status-") or not VERDICT_KEY_RE.match(key) or pub["state"] == "superseded":
+            if not key.startswith("final-status-") or not VERDICT_KEY_RE.match(key) or pub["state"] == "superseded" \
+                    or key == keep:
                 continue
             if pub["state"] == "posted" or self.visible_parts(key, pub):
                 self.queue(f"{key}-retired", f"### Workflow — correction — the owner-review handoff above is not "
@@ -2763,6 +2823,8 @@ class Controller:
                  "This is readiness for the owner's review only. It does not merge, release, or grant visual "
                  "acceptance. The PR remains a draft with no requested reviewers.", "",
                  "_Automated workflow status posted through the owner's GitHub account; not a human approval._"]
+        self.retire_receipts(f"Superseded by the handoff for archive `{short(archive_head)}`.",
+                             keep=f"final-status-{short(archive_head)}")  # never two current receipts
         self.publish(f"final-status-{short(archive_head)}", "\n".join(lines) + "\n")
         after, _ = self.readiness(archive_head)  # publication may take minutes; re-check before declaring readiness
         if after:
@@ -2803,6 +2865,12 @@ class Controller:
             if pub["state"] != "posted":
                 missing.append(key + " (not sent)")
                 continue
+            total = len(pub["parts"])
+            numbering = [re.search(r" part=(\d+)/(\d+) ", part.get("marker", "")) for part in pub["parts"]]
+            if not total or any(not m or (int(m.group(1)), int(m.group(2))) != (i + 1, total)
+                                for i, m in enumerate(numbering)):
+                missing.append(key + " (incomplete part inventory)")
+                continue
             for part in pub["parts"]:
                 remote = comments.get(part["comment_id"])
                 copies = [c for c in listing if c.get("user") == self.cfg["expected_actor"]
@@ -2829,6 +2897,8 @@ class Controller:
     def handoff_superseded(self):
         """None if the handoff is still current; otherwise what changed. Observation failures propagate."""
         handoff = self.state.get("handoff") or {}
+        if not handoff.get("A"):
+            return "no current handoff is recorded"
         pr = self.gh.pr(self.state["pr"]["number"])
         if pr["headRefOid"] != handoff.get("A") or pr["state"] != "OPEN":
             return f"PR head {short(pr['headRefOid'])} (handoff archive {short(handoff.get('A'))}), state {pr['state']}"
@@ -2841,11 +2911,13 @@ class Controller:
 
     def reopen(self, moved):
         self.retire_receipts(f"Handoff superseded: {moved}")
-        self.state.setdefault("superseded_handoffs", []).append({**self.state.get("handoff", {}), "why": moved,
-                                                                 "at": now_iso()})
-        self.state.setdefault("superseded_ready", []).append(self.state.get("ready_review"))
-        self.state.update(ready_review=None, last_report_for=None, handoff=None, develop_context="reopened")
-        self.transition("develop", f"handoff superseded: {moved}")
+        if self.state.get("handoff") or self.state.get("ready_review"):
+            self.state.setdefault("superseded_handoffs", []).append({**(self.state.get("handoff") or {}), "why": moved,
+                                                                     "at": now_iso()})
+            self.state.setdefault("superseded_ready", []).append(self.state.get("ready_review"))
+        self.state.update(ready_review=None, last_report_for=None, handoff=None, develop_context="reopened",
+                          status="ACTIVE", status_reason=f"handoff superseded: {moved}")
+        self.transition("develop", f"handoff superseded: {moved}")  # one save: phase, status and cleared handoff
         self.publish_status("REOPENED", f"The owner-review handoff was superseded ({moved}); review reopened. The "
                                         "earlier receipt is preserved above and is no longer current.")
         self.update_pr_body(f"handoff superseded ({moved}); review reopened.")
@@ -3232,19 +3304,29 @@ def _json_file(path):
 PROBE_COMPOSED = "git status --short"
 
 
-def _tool_commands(log_path):
-    """Shell commands the headless session attempted, from its stream-json log (CLI-recorded)."""
-    commands = []
+def _tool_outcomes(log_path, denied_ids):
+    """[(command, outcome)] for each shell tool use in a headless session's stream-json log (CLI-recorded):
+    "denied" (its tool_use_id is in the CLI's permission_denials), "ran" (a tool result came back), or
+    "no_result" (the launch ended before the tool returned)."""
+    uses, results = [], {}
     for line in Path(log_path).read_text(encoding="utf-8", errors="replace").splitlines():
         try:
             obj = json.loads(line)
         except ValueError:
             continue
-        if obj.get("type") == "assistant":
-            for item in (obj.get("message") or {}).get("content") or []:
-                if isinstance(item, dict) and item.get("type") == "tool_use" and item.get("name") in ("Bash", "PowerShell"):
-                    commands.append((item.get("input") or {}).get("command", ""))
-    return commands
+        if not isinstance(obj, dict):
+            continue
+        for item in (obj.get("message") or {}).get("content") or [] if isinstance(obj.get("message"), dict) else []:
+            if not isinstance(item, dict):
+                continue
+            if obj.get("type") == "assistant" and item.get("type") == "tool_use" and item.get("name") in ("Bash", "PowerShell"):
+                uses.append((item.get("id"), (item.get("input") or {}).get("command", "")))
+            elif obj.get("type") == "user" and item.get("type") == "tool_result":
+                content = item.get("content")
+                text = content if isinstance(content, str) else json.dumps(content)
+                results[item.get("tool_use_id")] = (bool(item.get("is_error")), text)
+    return [(command, "denied" if use_id in denied_ids else ("ran" if use_id in results else "no_result"))
+            for use_id, command in uses]
 
 
 class _AmbientDeveloper(ClaudeDeveloper):
@@ -3266,47 +3348,60 @@ def _user_status_allowance(cfg):
     return None
 
 
+PROBE_ENROLLMENT = "agent-review-permission-probe"
+
+
 def permission_isolation_probe(cfg, root, work):
-    """Observe the effective headless permission profile with the real launch arguments. An allowance granted in
-    the owner's user settings (the read-only `status` command) that the composed file lacks must be denied under
-    the production launch, while a composed allowance runs. A control launch without --setting-sources "" shows
-    that the same user rule would otherwise allow the command, so the denial is caused by the isolation."""
+    """Observe the effective headless permission profile with the real launch arguments.
+
+    Production launch: an allowance granted only in the owner's user settings (the read-only `status` command) is
+    denied, while the enrolled helper rule (`verify --enrollment <id>`) and a composed allowance (`git status`) run.
+    Control launch, identical but without --setting-sources "": the same user rule runs, so the production denial is
+    caused by the isolation. Each decision is read from CLI-recorded tool results, not from the model's report."""
     rule = _user_status_allowance(cfg)
     if not rule:
         return {"ok": None, "skipped": "no user-level `status` allowance exists to probe; isolation not observed"}
-    command = rule[len("Bash("):-len(" *)")] + " --enrollment agent-review-permission-probe"  # read-only, harmless
+    ambient = rule[len("Bash("):-len(" *)")] + f" --enrollment {PROBE_ENROLLMENT}"  # read-only
+    helper = f"python {Path(root).resolve().as_posix()}/agent_review.py verify --enrollment {PROBE_ENROLLMENT} --gate probe"
+    composed_cmd = "git status --short"
     repo = work / "probe-repo"
     repo.mkdir(parents=True)
     run(["git", "init", "--quiet", str(repo)])
-    composed = compose_developer_settings(cfg, root, "preflight", repo)
-    head = command.split(" status ")[0]
-    # the probe isolates the setting-source mechanism: drop composed deny rules that would also match the command
-    composed["permissions"]["deny"] = [d for d in composed["permissions"]["deny"] if head not in d]
+    composed = compose_developer_settings(cfg, root, PROBE_ENROLLMENT, repo)
+    head = ambient.split(" status ")[0]
+    # isolate the setting-source mechanism: drop composed deny rules that would also match the ambient command
+    composed["permissions"]["deny"] = [d for d in composed["permissions"]["deny"] if f"({head} status" not in d
+                                       and not d.startswith(f"Bash({head} *") and not d.startswith(f"PowerShell({head} *")]
     if any(a.startswith(f"Bash({head} status") for a in composed["permissions"]["allow"]):
         raise UsageError("the composed profile itself allows the probe command; the probe cannot discriminate")
     atomic_write_json(work / "probe-settings.json", composed)
-    prompt = (f"This is a permission probe. Use the Bash tool to run exactly `{command}`, then use the Bash tool to run "
-              f"exactly `{PROBE_COMPOSED}`. Do not retry or run anything else. Then return a report with "
-              'schema_version "agent-review.developer.v1", status "paused", checkpoint_id "preflight", '
-              'candidate_commit null, summary stating which commands ran or were denied, empty arrays, '
-              'runtime_restoration "not_applicable", blocker null, owner_decision_needed null.')
+    commands = [ambient, helper, composed_cmd]
+    prompt = ("This is a permission probe. Use the Bash tool to run each of these commands exactly, one at a time, "
+              "in this order, without retrying and without running anything else:\n" + "\n".join(f"{i + 1}. `{c}`" for i, c in enumerate(commands))
+              + '\nCommands may fail or be denied; that is expected. Then return a report with schema_version '
+              '"agent-review.developer.v1", status "paused", checkpoint_id "preflight", candidate_commit null, summary '
+              'stating which commands ran or were denied, empty arrays, runtime_restoration "not_applicable", blocker '
+              'null, owner_decision_needed null.')
     observed = {}
     for label, kind in (("production", ClaudeDeveloper), ("control_without_isolation", _AmbientDeveloper)):
         dev = kind(cfg["developer"], work / "probe-settings.json", root / REPORT_SCHEMA_FILE)
         sid = str(uuid.uuid4())
         result = dev.run(prompt, sid, False, repo, work / f"probe-{label}.jsonl", work / f"probe-{label}.err", 600)
-        attempted = _tool_commands(work / f"probe-{label}.jsonl")
         denied = [(d.get("tool_input") or {}).get("command", "") for d in result["permission_denials"]]
-        observed[label] = {"session_id": sid, "attempted": attempted, "denied": denied,
-                           "ambient_attempted": any(command in c for c in attempted),
-                           "ambient_denied": any(command in c for c in denied),
-                           "composed_attempted": any(PROBE_COMPOSED in c for c in attempted),
-                           "composed_denied": any(PROBE_COMPOSED in c for c in denied)}
+        outcomes = _tool_outcomes(work / f"probe-{label}.jsonl",
+                                  {d.get("tool_use_id") for d in result["permission_denials"]})
+
+        def decision(cmd):
+            seen = [o for c, o in outcomes if c.strip() == cmd]
+            return seen[-1] if seen else "not_attempted"
+        observed[label] = {"session_id": sid, "cli_completed": result["subtype"] == "success" and result["exit_code"] == 0,
+                           "outcomes": outcomes, "permission_denials": denied,
+                           "ambient": decision(ambient), "helper": decision(helper), "composed": decision(composed_cmd)}
     prod, ctrl = observed["production"], observed["control_without_isolation"]
-    return {"user_level_allowance": rule, "probe_command": command, **observed,
-            "ok": prod["ambient_attempted"] and prod["ambient_denied"] and prod["composed_attempted"]
-            and not prod["composed_denied"] and ctrl["ambient_attempted"] and not ctrl["ambient_denied"],
-            "source": "Claude Code stream-json result permission_denials and tool_use records (CLI-recorded)"}
+    ok = (prod["cli_completed"] and ctrl["cli_completed"] and prod["ambient"] == "denied" and prod["helper"] == "ran"
+          and prod["composed"] == "ran" and ctrl["ambient"] == "ran")
+    return {"user_level_allowance": rule, "probe_commands": commands, **observed, "ok": ok,
+            "source": "Claude Code stream-json tool_use/tool_result records and result permission_denials (CLI-recorded)"}
 
 
 def preflight(cfg, root=HERE):
@@ -3608,6 +3703,8 @@ def main(argv=None):
     p = sub.add_parser("preflight", help="real bounded calls to the configured developer and reviewer models")
     p.add_argument("--project", required=True)
     p.add_argument("--out")
+    p = sub.add_parser("probe-permissions", help="observe headless permission isolation (real Claude launches)")
+    p.add_argument("--project", required=True)
     p = sub.add_parser("init-project", help="onboard a repository: write ~/.agent-review/projects/<name>.json")
     p.add_argument("--repo", required=True)
     p.add_argument("--name", required=True)
@@ -3658,12 +3755,23 @@ def main(argv=None):
         if name == "resume":
             p.add_argument("--max-rounds", type=int)
             p.add_argument("--reason", required=True, help="what the owner changed or decided")
+            p.add_argument("--resend-undelivered", action="store_true",
+                           help="after checking the PR: re-send parts whose earlier delivery was ambiguous and absent")
     args = parser.parse_args(argv)
     try:
         if args.command == "install":
             print(json.dumps({"installed": str(Path(args.dest).resolve()),
                               "fingerprint": install(Path(args.dest))}, indent=2))
             return EXIT_OK
+        if args.command == "probe-permissions":
+            import tempfile
+            work = Path(tempfile.mkdtemp(prefix="agent-review-probe-"))
+            try:
+                result = permission_isolation_probe(load_project(args.project), HERE, work)
+            finally:
+                shutil.rmtree(work, ignore_errors=True)
+            print(json.dumps(result, indent=2))
+            return EXIT_OK if result["ok"] else EXIT_BLOCKED
         if args.command == "preflight":
             result = preflight(load_project(args.project))
             text = json.dumps(result, indent=2)
@@ -3728,7 +3836,7 @@ def main(argv=None):
             print(json.dumps(result, indent=2))
             return EXIT_OK
         if args.command == "resume":
-            return guarded(controller, "resume", lambda: controller.resume(args.reason, args.max_rounds))
+            return guarded(controller, "resume", lambda: controller.resume(args.reason, args.max_rounds, args.resend_undelivered))
         if controller.state["status"] in ("BLOCKED", "PAUSED", "AWAITING_OWNER_REVIEW") and \
                 args.command not in ("archive", "cancel"):
             raise UsageError(f"enrollment is {controller.state['status']}: {controller.state.get('status_reason')}; "
