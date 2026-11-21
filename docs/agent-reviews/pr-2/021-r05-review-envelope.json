@@ -1,0 +1,116 @@
+{
+  "B": "7358a159057acaedf25c4f530618845e07dc0448",
+  "H": "bc4b30043bc952e204fb76d0dfc423055d99c117",
+  "M": "2e8f58127ea0fb096d6197c030880292d8231639",
+  "checkpoint_id": "final",
+  "checkpoint_type": "final",
+  "fatal": false,
+  "invocation": {
+    "completed": true,
+    "duration_s": 60.8,
+    "errors": [],
+    "exit_code": 0,
+    "failed": false,
+    "observed": {
+      "approval_policy": "never",
+      "cli_version": "0.170.0",
+      "network": "restricted",
+      "observed_effort": "high",
+      "observed_model": "gpt-6.2-astra",
+      "plan_type": "pro",
+      "rollout_found": true,
+      "sandbox": "read-only",
+      "source": "Codex session rollout (CLI-recorded thread settings; not model-authored)",
+      "subagent_suspected": false,
+      "turn_efforts": [
+        "high"
+      ],
+      "turn_models": [
+        "gpt-6.2-astra"
+      ],
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 222976,
+        "input_tokens": 295996,
+        "output_tokens": 1673,
+        "reasoning_output_tokens": 88,
+        "total_tokens": 297669
+      }
+    },
+    "requested": {
+      "effort": "high",
+      "model": "gpt-6.2-astra",
+      "sandbox": "read-only"
+    },
+    "thread_id": "01a1fd26-7255-7522-8373-45ff07113064",
+    "timed_out": false
+  },
+  "mission": {
+    "id": "list-command",
+    "sha256": "11e46e96cf01c495c81c03b917b1d9f549f260028ca8587929c25ccb68eb4726"
+  },
+  "ok": true,
+  "path": "~\\.agent-review\\state\\devproc-claude-list-command-20261121013957-b56a\\rounds\\r05\\envelope-1.json",
+  "pr": 2,
+  "project_sha256": "c7c0f2de947d34bfbcdc0930ecb0d14ffda525794a0aaf9289e463ec434d1623",
+  "protocol": "agent-review.v1",
+  "publication": "r05-review",
+  "published": [
+    {
+      "comment_id": 7059721047,
+      "of": 1,
+      "part": 1,
+      "url": "https://github.com/howardreith/development-process/pull/2#issuecomment-7059721047"
+    }
+  ],
+  "raw_result_if_rejected": null,
+  "reasons": [],
+  "repository": "howardreith/development-process",
+  "request_id": "devproc-claude-list-command-20261121013957-b56a-r05-572c36",
+  "response_sha256": "787074b324805647de141442467da8aff356646f5112ca08115c1140ba2f0253",
+  "result": {
+    "candidate_commit": "bc4b30043bc952e204fb76d0dfc423055d99c117",
+    "checkpoint_id": "final",
+    "checkpoint_type": "final",
+    "decision": "ready_for_owner_review",
+    "decision_rationale": "The candidate meets all five requirements on the Windows development host. The recorded remote branch head, reviewed snapshot, and passing unit gate identify the same commit. All 14 list-command tests passed, including the cases for a held writer lock, an empty registry, and damaged entries alongside a healthy enrollment.",
+    "evidence_assessment": {
+      "executed_verification": [
+        "Verified the snapshot HEAD with Git. The CLI-recorded developer transcript shows that the remote claude/list-command branch pointed to the same commit before the gate ran.",
+        "The pinned controller ran verify --gate unit on the candidate and recorded exit 0 with the worktree unchanged. The log SHA-256 matches the receipt. The suite ran 205 tests, with only the opt-in live-model smoke skipped.",
+        "The passing fixture tests checked exact output fields, enrollment ordering, an unchanged filesystem snapshot while the writer lock was held, damaged-entry diagnostics, and refusal when a populated registry could not be enumerated.",
+        "Git showed that the two commits after the round-four candidate added only 17 review records under docs/agent-reviews/pr-2/."
+      ],
+      "inspected": [
+        "The fixed mission, repository instructions, operating guide, protocol, full feature diff, and surrounding registry, state-read, and CLI dispatch code.",
+        "The developer report, CLI-recorded transcript, prior findings ledger, and candidate-bound unit receipt and log. The ledger has no pending findings."
+      ],
+      "limitations": [
+        "Runtime observations come from the recorded Windows gate. This independent review used read-only inspection.",
+        "Path inspection and file opening are separate operations. A concurrent link replacement can change the path between them. A positively mapped network drive was untested, and the implementation does not detect POSIX network mounts."
+      ],
+      "required_gaps": [],
+      "source_inspection_only": [
+        "The list command reads claims and state directly, without entering controller locking, writing, Git, or GitHub code. New claims retain the existing dir field and add an absolute state_dir for listing from other working directories.",
+        "The README places list beside status and documents the output fields, damaged-entry diagnostics, and registry refusal behavior."
+      ]
+    },
+    "findings": [],
+    "prior_finding_assessments": [],
+    "request_id": "devproc-claude-list-command-20261121013957-b56a-r05-572c36",
+    "round": 5,
+    "schema_version": "agent-review.review.v1",
+    "summary": {
+      "delivered_behavior": "An owner can run list without an enrollment ID to see a sorted JSON array of registered enrollments and their status, phase, PR number, and update time. A damaged entry remains visible with status unknown and a diagnostic. An empty registry prints [], while an unreadable registry produces an explicit error.",
+      "pending_later_phase_work": [],
+      "remaining_owner_review": [
+        "Review the controller\u2019s final handoff on draft PR #2 and decide whether to merge and install the candidate."
+      ],
+      "scope_reviewed": "The complete list-command mission, including behavior tests, documentation, compatibility with existing claim readers, and required validation on the pushed candidate.",
+      "unresolved_questions": []
+    }
+  },
+  "round": 5,
+  "validated_at": "2026-11-21T08:09:38Z",
+  "workflow_fingerprint": "62a95391e45de46e1d79da8bcbc4856742eb80cda5e617c1148f43e5fc325c8a"
+}
