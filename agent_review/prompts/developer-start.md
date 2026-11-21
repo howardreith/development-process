@@ -42,7 +42,7 @@ $plan_notes
   the exact candidate you report. Re-run gates after any further commit.
   Direct `git push`, `gh`, merges, rebases, resets, tags, force pushes and
   history rewrites are not available to you and are outside this assignment.
-- Never edit `tools/agent_review/`, `$transcript_dir/`, `.claude/`, `AGENTS.md`
+- Never edit `$transcript_dir/`, `.claude/`, `AGENTS.md`, `CLAUDE.md`
   or the validation policy, and never weaken validation, remove a required
   behavior, or rewrite the mission to obtain a clean review. A material
   adaptation the mission does not authorize is an owner decision: report it
