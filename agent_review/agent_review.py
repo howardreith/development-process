@@ -41,7 +41,7 @@ EXIT_OK, EXIT_BLOCKED, EXIT_PAUSED, EXIT_USAGE = 0, 2, 3, 4
 # workflow change that must be re-activated.
 POLICY = {
     "developer": {"model": "opus", "effort": "high", "allowed_model_pattern": "^claude-opus-"},
-    "reviewer": {"model": "gpt-6.2-astra", "effort": "high"},
+    "reviewer": {"model": "gpt-6.2-astra", "effort": "max"},
 }
 STATUS_START, STATUS_END = "<!-- agent-review:status:start -->", "<!-- agent-review:status:end -->"
 VERDICT_KEY_RE = re.compile(r"^(r\d+-review|final-status-[0-9a-f]{10})$")

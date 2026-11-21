@@ -44,7 +44,7 @@
     "executable": "codex",
     "codex_home": "~/.codex",
     "model": "gpt-6.2-astra",
-    "effort": "high",
+    "effort": "max",
     "timeout_minutes": 60,
     "extra_config": [
       "windows.sandbox=\"elevated\""

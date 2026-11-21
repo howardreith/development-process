@@ -22,7 +22,7 @@ Read `agent_review/README.md` (operating guide) and
   repository, GitHub simulated). The smoke also runs directly with
   `AGENT_REVIEW_LIVE=1 python -m unittest agent_review/test_live_smoke.py -v`.
 - Owner model policy (`POLICY` in `agent_review.py`: Claude `opus`/high
-  developer, Codex `gpt-6.2-astra`/high reviewer) changes only by an explicit
+  developer, Codex `gpt-6.2-astra`/max reviewer) changes only by an explicit
   owner decision.
 - Never weaken a safeguard to make a test or a review pass; fix the cause.
 
