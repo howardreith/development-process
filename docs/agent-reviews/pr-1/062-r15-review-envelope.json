@@ -1,0 +1,122 @@
+{
+  "B": "79ab7af62729c2e329f267796780ce36fdffd07c",
+  "H": "e49086f724eaf7f935aa4325f6c40cf9929c6dd6",
+  "M": "79ab7af62729c2e329f267796780ce36fdffd07c",
+  "checkpoint_id": "setup-final",
+  "checkpoint_type": "final",
+  "fatal": false,
+  "invocation": {
+    "completed": true,
+    "duration_s": 120.2,
+    "errors": [],
+    "exit_code": 0,
+    "failed": false,
+    "observed": {
+      "approval_policy": "never",
+      "cli_version": "0.170.0",
+      "network": "restricted",
+      "observed_effort": "high",
+      "observed_model": "gpt-6.2-astra",
+      "plan_type": "pro",
+      "rollout_found": true,
+      "sandbox": "read-only",
+      "source": "Codex session rollout (CLI-recorded thread settings; not model-authored)",
+      "subagent_suspected": false,
+      "turn_efforts": [
+        "high"
+      ],
+      "turn_models": [
+        "gpt-6.2-astra"
+      ],
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 542336,
+        "input_tokens": 597747,
+        "output_tokens": 3202,
+        "reasoning_output_tokens": 330,
+        "total_tokens": 600949
+      }
+    },
+    "requested": {
+      "effort": "high",
+      "model": "gpt-6.2-astra",
+      "sandbox": "read-only"
+    },
+    "thread_id": "01a1fda9-a824-7f63-8b54-d651df705b81",
+    "timed_out": false
+  },
+  "mission": {
+    "id": "agent-review-setup",
+    "sha256": "0ae972cfa83996ee666761bc6e59ed6b9eec8e8fceda957b09ba00055c1e3779"
+  },
+  "ok": true,
+  "path": "~\\.agent-review\\state\\devproc-claude-agent-review-controller-20261120192057-9024\\rounds\\r15\\envelope-1.json",
+  "pr": 1,
+  "project_sha256": "5964fbf40cb92df141703ffe770080bd15dc3b867ecdf11afa46151292404d91",
+  "protocol": "agent-review.v1",
+  "publication": "r15-review",
+  "published": [
+    {
+      "comment_id": 7061323131,
+      "of": 1,
+      "part": 1,
+      "url": "https://github.com/howardreith/development-process/pull/1#issuecomment-7061323131"
+    }
+  ],
+  "raw_result_if_rejected": null,
+  "reasons": [],
+  "repository": "howardreith/development-process",
+  "request_id": "devproc-claude-agent-review-controller-20261120192057-9024-r15-50e28e",
+  "response_sha256": "03b0b65150d33bd9727f29cdaad2fa5f1dbf7a695d0bb8a2bb0a89fc75c3514c",
+  "result": {
+    "candidate_commit": "e49086f724eaf7f935aa4325f6c40cf9929c6dd6",
+    "checkpoint_id": "setup-final",
+    "checkpoint_type": "final",
+    "decision": "ready_for_owner_review",
+    "decision_rationale": "The recorded GitHub readback closes R13-F2, the sole pending finding. It connects the live pilot\u2019s accepted review to its final handoff comment and draft PR status. The required unit gate and both supplemental gates passed on this exact setup candidate. No blocking finding remains.",
+    "evidence_assessment": {
+      "executed_verification": [
+        "Verified the snapshot HEAD and mission digest. All three gate log hashes matched their controller receipts. Each receipt names e49086f724eaf7f935aa4325f6c40cf9929c6dd6 and records exit code 0 with the worktree unchanged.",
+        "The unit gate ran 194 tests with one opt-in smoke test skipped. The separate live-smoke gate ran real Opus and Astra processes on a fixture repository and reached AWAITING_OWNER_REVIEW with simulated GitHub.",
+        "The permissions gate observed the headless developer deny a user-level allowance while permitting its enrollment helper and Git inspection. The control launch granted the user-level allowance.",
+        "Recomputed the final handoff comment\u2019s SHA-256 and matched its publication marker. Git confirmed that the pilot\u2019s reviewed source bc4b300 is an ancestor of archive head b89fa6c and that the difference consists of four added records under docs/agent-reviews/pr-2/."
+      ],
+      "inspected": [
+        "The mission and owner addenda, protocol, setup checkpoint contract, feature diff, prior findings ledger, and developer report.",
+        "The workflow guide, permission profiles, Black Tentacles plan and start sequence, WF01\u2013WF12 acceptance report, committed PR #2 readback, and archived round-five review envelope."
+      ],
+      "limitations": [
+        "Gate execution was assessed from controller receipts and logs. The GitHub fields describe the recorded readback at 2026-11-21T10:23:05Z. This read-only review made no live GitHub request."
+      ],
+      "required_gaps": [],
+      "source_inspection_only": [
+        "The change since round 14 is confined to the WF11 evidence reference and its readback artifact.",
+        "The operating guide documents installation, launch, recovery, costs, limits, and disable procedures. The Black Tentacles plan retains BT01\u2013BT36, the Phases 0\u20131 and Phase 4 reviews, and the native motion and restoration evidence requirements."
+      ]
+    },
+    "findings": [],
+    "prior_finding_assessments": [
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R13-F2",
+        "rationale": "WF11 now links directly to handoff comment 7059723699. The recorded readback shows PR #2 open and draft, with an empty review-request list and head b89fa6c. Its status section and handoff comment both name reviewed source bc4b300 and archive b89fa6c. Those identities agree with the archived Astra review and Git history."
+      }
+    ],
+    "request_id": "devproc-claude-agent-review-controller-20261120192057-9024-r15-50e28e",
+    "round": 15,
+    "schema_version": "agent-review.review.v1",
+    "summary": {
+      "delivered_behavior": "The setup supports candidate-bound validation, independent Astra review, corrective Opus commits, and a recorded draft-PR handoff. Live pilot PR #2 demonstrates the correction cycle through final handoff.",
+      "pending_later_phase_work": [],
+      "remaining_owner_review": [
+        "Decide whether to merge setup PR #1 and install its reviewed controller version for new enrollments.",
+        "Decide when to start the separately prepared Black Tentacles mission."
+      ],
+      "scope_reviewed": "Final acceptance of the reusable controller and workflow documentation, permission and model settings, live pilot evidence, and Black Tentacles binding.",
+      "unresolved_questions": []
+    }
+  },
+  "round": 15,
+  "validated_at": "2026-11-21T10:33:56Z",
+  "workflow_fingerprint": "62a95391e45de46e1d79da8bcbc4856742eb80cda5e617c1148f43e5fc325c8a"
+}

@@ -1,0 +1,192 @@
+{
+  "B": "79ab7af62729c2e329f267796780ce36fdffd07c",
+  "H": "c67a6f72985d45f94db543ee6bb2018f2c1b6a99",
+  "M": "79ab7af62729c2e329f267796780ce36fdffd07c",
+  "checkpoint_id": "controller-core",
+  "checkpoint_type": "intermediate",
+  "fatal": false,
+  "invocation": {
+    "completed": true,
+    "duration_s": 246.5,
+    "errors": [],
+    "exit_code": 0,
+    "failed": false,
+    "observed": {
+      "approval_policy": "never",
+      "cli_version": "0.170.0",
+      "network": "restricted",
+      "observed_effort": "high",
+      "observed_model": "gpt-6.2-astra",
+      "plan_type": "pro",
+      "rollout_found": true,
+      "sandbox": "read-only",
+      "source": "Codex session rollout (CLI-recorded thread settings; not model-authored)",
+      "subagent_suspected": false,
+      "turn_efforts": [
+        "high"
+      ],
+      "turn_models": [
+        "gpt-6.2-astra"
+      ],
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 1821056,
+        "input_tokens": 1966856,
+        "output_tokens": 7646,
+        "reasoning_output_tokens": 2112,
+        "total_tokens": 1974502
+      }
+    },
+    "requested": {
+      "effort": "high",
+      "model": "gpt-6.2-astra",
+      "sandbox": "read-only"
+    },
+    "thread_id": "01a1fcc2-8900-7971-b5df-2b53099f2bd8",
+    "timed_out": false
+  },
+  "mission": {
+    "id": "agent-review-setup",
+    "sha256": "0ae972cfa83996ee666761bc6e59ed6b9eec8e8fceda957b09ba00055c1e3779"
+  },
+  "ok": true,
+  "path": "~\\.agent-review\\state\\devproc-claude-agent-review-controller-20261120192057-9024\\rounds\\r11\\envelope-1.json",
+  "pr": 1,
+  "project_sha256": "5964fbf40cb92df141703ffe770080bd15dc3b867ecdf11afa46151292404d91",
+  "protocol": "agent-review.v1",
+  "publication": "r11-review",
+  "published": [
+    {
+      "comment_id": 7058570054,
+      "of": 1,
+      "part": 1,
+      "url": "https://github.com/howardreith/development-process/pull/1#issuecomment-7058570054"
+    }
+  ],
+  "raw_result_if_rejected": null,
+  "reasons": [],
+  "repository": "howardreith/development-process",
+  "request_id": "devproc-claude-agent-review-controller-20261120192057-9024-r11-d811fe",
+  "response_sha256": "3f3d689a5e5d49598b4af22b7419d0a4d0d0854f898af839c1951c8c6a1af638",
+  "result": {
+    "candidate_commit": "c67a6f72985d45f94db543ee6bb2018f2c1b6a99",
+    "checkpoint_id": "controller-core",
+    "checkpoint_type": "intermediate",
+    "decision": "changes_required",
+    "decision_rationale": "All three candidate-bound gates passed. Two supported paths still need correction. The documented `single` plan can reach handoff without this repository\u2019s required `unit` receipt, and developer preflight can report a successful Opus check despite a conflicting model in the invocation transcript.",
+    "evidence_assessment": {
+      "executed_verification": [
+        "Verified the detached HEAD, merge base and mission digest against the request. The SHA-256 of each supplied gate log matched its receipt. All three receipts name the full candidate commit, record exit code 0 and report an unchanged worktree.",
+        "The unit gate ran 189 tests with one live test skipped. The log records passing regressions for conflicting headless transcript models, retained correctness obligations, stale candidates, publication, locks, budgets, archive checks and checkpoint advancement.",
+        "The permissions gate recorded two real Claude launches. The isolated launch denied the ambient status command and ran the enrolled helper and Git inspection command. The control launch allowed the ambient command.",
+        "The separate live smoke reached AWAITING_OWNER_REVIEW on a temporary Git repository with real model invocations and simulated GitHub. Its developer pushed fixture commit 9842b0145b, and the fixture\u2019s explicitly required unit gate passed on that commit."
+      ],
+      "inspected": [
+        "Fixed request, mission and owner addenda, repository instructions, protocol, feature diff, round-11 changes, developer report and five pending ledger entries.",
+        "Controller admission, provenance, publication, locking, stop/resume, gate and archive paths, versioned schemas, prompts, permission settings, shipped plans, project configuration and behavior fixtures."
+      ],
+      "limitations": [
+        "The review was read-only. Execution claims come from the controller receipts and their matching logs. The foreground session\u2019s whole tool transcript was withheld.",
+        "The live fixture supplied its own plan with `required_gates` set to `unit` and simulated GitHub. It does not exercise the shipped `single` plan or establish a real GitHub handoff."
+      ],
+      "required_gaps": [
+        "Show that a `single` enrollment for development-process enforces its required unit gate on H.",
+        "Show that developer preflight rejects conflicting stream and transcript model observations."
+      ],
+      "source_inspection_only": [
+        "Traced the missing gate from `single.json` through enrollment, developer prompting, report admission and final readiness.",
+        "Compared developer preflight with headless report admission. Only report admission checks the current invocation\u2019s transcript model list.",
+        "Verified the reviewer-side correctness-deferral guard in source. The new deferral regression directly exercises developer report admission."
+      ]
+    },
+    "findings": [
+      {
+        "acceptance_ids": [
+          "WF04",
+          "WF08"
+        ],
+        "actual": "`single.json` omits `required_gates`, and `plan_for_mission` changes only the mission identity and title. `missing_gates` therefore checks an empty list, including when `gate_status` contains a failed `unit` run. The developer prompt also says the checkpoint has no required gates. A report that omits the failure and a passing review can reach handoff.",
+        "blocking_rationale": "This permits false readiness on the documented enrollment path with one developer and a fixed controller version. AGENTS.md explicitly requires `unit` for this repository.",
+        "blocks_readiness": true,
+        "category": "defect",
+        "expected": "Report admission and final readiness require a passing `unit` receipt for the reviewed H. The `permissions` and `live-smoke` gates retain their supplemental status.",
+        "id": "R11-F1",
+        "location": {
+          "file": "agent_review/agent_review.py",
+          "line": 2306
+        },
+        "priority": "P1",
+        "requested_correction": "Bind the repository\u2019s required gate set when resolving the generic plan, or clearly refuse an enrollment that omits it. Use the same resolved set for the developer prompt, report admission and handoff.",
+        "requested_evidence": "Exercise the shipped `single` plan with the development-process gate policy in a temporary Git repository. Show that a missing receipt and a failed `unit` receipt each prevent advancement, and that a passing receipt on H permits it with the supplemental gates unrun.",
+        "title": "The generic plan drops the repository\u2019s required unit gate",
+        "trigger": "Enroll a controller change with `--project development-process --plan single`, the generic workflow documented in the operating guide."
+      },
+      {
+        "acceptance_ids": [
+          "WF01",
+          "WF05"
+        ],
+        "actual": "`ClaudeDeveloper.run` now returns `transcript_models`. Preflight omits that field from both its observed model record and its `ok` predicate. With an Opus stream, high effort and an otherwise successful response, preflight can certify the invocation despite contradictory transcript evidence.",
+        "blocking_rationale": "The preflight command supplies the owner\u2019s model-selection evidence. Its success result can certify a launch that the production developer admission check correctly rejects.",
+        "blocks_readiness": true,
+        "category": "defect",
+        "expected": "Preflight records the available main-thread model observations and reports failure when any conflict with the pinned Opus policy.",
+        "id": "R11-F2",
+        "location": {
+          "file": "agent_review/agent_review.py",
+          "line": 3789
+        },
+        "priority": "P2",
+        "requested_correction": "Use the same developer model check for preflight and report admission, and include the invocation-local transcript models in the recorded provenance.",
+        "requested_evidence": "Exercise preflight through a simulated Claude boundary with an Opus stream, high effort and a conflicting transcript model. Verify that the preflight output retains the conflict and fails. Keep a passing case with consistent observations.",
+        "title": "Developer preflight ignores a conflicting transcript model",
+        "trigger": "The preflight invocation\u2019s stream identifies Opus while its current-session transcript records another main-thread model."
+      }
+    ],
+    "prior_finding_assessments": [
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R10-F1",
+        "rationale": "Headless report admission now checks the current invocation\u2019s transcript models alongside the stream observations. The candidate regression supplied a conflicting model and observed a stop before report admission. R11-F2 concerns the separate preflight command."
+      },
+      {
+        "assessment": "rebuttal_accepted",
+        "finding_id": "R10-F2",
+        "rationale": "The fatal attempt and BLOCKED reason are saved together before control returns to the status publisher. A crash in that interval can leave the PR notice absent, but local status explains the stop and further dispatch requires owner resume. That outcome satisfies addendum 3\u2019s safe-pause condition."
+      },
+      {
+        "assessment": "rebuttal_accepted",
+        "finding_id": "R6-F1",
+        "rationale": "The remaining trigger requires a marker-only supplement committed by a predecessor version. Addendum 3 excludes predecessor migration and continuous reconciliation of superseded fragments. The same-version supplement path records the original part number and GitHub reference."
+      },
+      {
+        "assessment": "rebuttal_accepted",
+        "finding_id": "R6-F3",
+        "rationale": "The disputed observation concerns migration of a predecessor receipt. The supported fixed-version path records gate definition, argument identity and run time. The candidate suite exercised current-format damage, same-argument recovery and a gate completing during inspection."
+      },
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R8-F3",
+        "rationale": "Both deferral checks now consult the retained correctness obligation. The unit run confirmed refusal of a developer deferral for a defect restated as polish, and the final-pass regression confirmed that the open obligation still prevents readiness."
+      }
+    ],
+    "request_id": "devproc-claude-agent-review-controller-20261120192057-9024-r11-d811fe",
+    "round": 11,
+    "schema_version": "agent-review.review.v1",
+    "summary": {
+      "delivered_behavior": "The candidate enforces conflicting-model rejection at headless report admission and preserves actionable correctness findings through restatement and attempted deferral. Its real-model fixture completed validation, review and archive handoff.",
+      "pending_later_phase_work": [
+        "Setup-final covers installation, operating documentation, effective permissions, the Black Tentacles binding and the setup acceptance report.",
+        "The owner\u2019s addendum also calls for a small unattended task with the actual models and a real GitHub draft PR through final handoff."
+      ],
+      "remaining_owner_review": [
+        "Final acceptance of the completed workflow and any decision to merge or release remain with the owner."
+      ],
+      "scope_reviewed": "Intermediate controller-core behavior under the first-release conditions, including the five pending findings and the normal generic enrollment and preflight entry points.",
+      "unresolved_questions": []
+    }
+  },
+  "round": 11,
+  "validated_at": "2026-11-21T06:23:36Z",
+  "workflow_fingerprint": "92ecc4622e4c51687a70587b78be7924d102629874df9f71ed12b8d6d8e7d21d"
+}
