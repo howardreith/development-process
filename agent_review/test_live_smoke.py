@@ -20,6 +20,11 @@ import time
 import unittest
 from pathlib import Path
 
+if __name__ == "__main__" and "--gate" in sys.argv:  # run as the project's `live-smoke` gate
+    sys.argv.remove("--gate")
+    os.environ["AGENT_REVIEW_LIVE"] = "1"
+    os.environ["AGENT_REVIEW_LIVE_PRINT"] = "1"
+
 import agent_review as ar
 from test_agent_review import Env, git
 
@@ -98,14 +103,28 @@ class LiveHeadlessSmoke(unittest.TestCase):
                    "findings": ctl.state.get("findings"),
                    "simulated_github_headings": env.gh.headings(),
                    "files_on_branch": git(env.work, "ls-tree", "-r", "--name-only", "HEAD").splitlines()}
+        # Enrolled helper operations performed by the headless developer under the production permission profile:
+        # the controller-written gate receipts its `verify` helper produced, and the CLI-recorded tool transcript.
+        evidence = env.dir / "evidence"
+        summary["helper_gate_receipts"] = [{"file": p.name, **ar.read_json(p)} for p in sorted(evidence.glob("gate-*.json"))]
+        summary["developer_tool_transcript"] = ctl.developer.tool_transcript(ctl.state["developer"]["session_id"],
+                                                                             ctl.state["created_at"])[-20000:]
+        final_h = (ctl.state.get("ready_review") or {}).get("H")
         out = os.environ.get("AGENT_REVIEW_LIVE_OUT")
         if out:
             Path(out).mkdir(parents=True, exist_ok=True)
             Path(out, "live-smoke-summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
             for comment in env.gh.comments_list:
                 Path(out, f"comment-{comment['id']}.md").write_text(comment["body"], encoding="utf-8")
-        print(json.dumps({k: summary[k] for k in ("outcome", "duration_s", "simulated_github_headings")}, indent=2))
+        if os.environ.get("AGENT_REVIEW_LIVE_PRINT"):
+            print(json.dumps({k: v for k, v in summary.items() if k != "findings"}, indent=2))  # the gate's log
+        else:
+            print(json.dumps({k: summary[k] for k in ("outcome", "duration_s", "simulated_github_headings")}, indent=2))
         self.assertEqual("AWAITING_OWNER_REVIEW", outcome)
+        self.assertTrue(any(r.get("passed") and r.get("candidate") == final_h for r in summary["helper_gate_receipts"]),
+                        "the headless developer's verify helper produced a passing receipt for the reviewed candidate")
+        self.assertIn("agent_review.py push --enrollment", summary["developer_tool_transcript"])
+        self.assertFalse([d for e in summary["developer_log"] for d in e["permission_denials"]])
         self.assertTrue(all(m.startswith("claude-opus-") for e in summary["developer_log"] for m in e["main_models"]))
         self.assertIn("calc.py", summary["files_on_branch"])
 

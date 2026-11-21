@@ -88,6 +88,15 @@
       ],
       "timeout_minutes": 20,
       "description": "Real headless Claude launches: production profile denies a user-level allowance and runs the enrolled helper; a control launch without setting-source isolation allows it."
+    },
+    "live-smoke": {
+      "argv": [
+        "python",
+        "agent_review/test_live_smoke.py",
+        "--gate"
+      ],
+      "timeout_minutes": 20,
+      "description": "Real headless Claude Opus developer and real Codex Astra reviewer on a fixture repo (GitHub simulated). The log includes the developer's own push and verify helper results under the production permission profile."
     }
   }
 }

@@ -613,14 +613,7 @@ class CodexReviewer:
         if not thread_id or not UUID_LIKE_RE.match(thread_id):
             return info
         matches = [m for m in (self.home / "sessions").rglob(f"rollout-*-{thread_id}.jsonl")]
-        verified = []
-        for match in matches:
-            try:
-                first = json.loads(match.read_text(encoding="utf-8", errors="replace").splitlines()[0])
-            except (ValueError, IndexError):
-                continue
-            if first.get("type") == "session_meta" and (first.get("payload") or {}).get("id") == thread_id:
-                verified.append(match)
+        verified = [m for m in matches if (_rollout_header(m) or {}).get("id") == thread_id]
         if len(verified) != 1:
             info["provenance_problem"] = f"{len(verified)} rollouts verifiably belong to thread {thread_id}"
             return info
@@ -629,12 +622,21 @@ class CodexReviewer:
         for other in (self.home / "sessions").rglob("rollout-*.jsonl"):  # delegated agents record their own thread
             if other == rollout or (since and other.stat().st_mtime < since):
                 continue
-            try:
-                meta = json.loads(other.read_text(encoding="utf-8", errors="replace").splitlines()[0])
-            except (ValueError, IndexError):
-                continue
-            if meta.get("type") == "session_meta" and self._names_parent(meta.get("payload"), thread_id):
+            header = _rollout_header(other)
+            if header is not None and self._names_parent(header, thread_id):
                 info["subagent_suspected"] = True
+        def problem(why):
+            info["provenance_problem"] = why
+
+        def obj_at(container, key):
+            """A nested object, or {} with a recorded problem when present but not an object."""
+            value = container.get(key)
+            if value is None:
+                return {}
+            if not isinstance(value, dict):
+                problem(f"the rollout's {key} is not an object")
+                return {}
+            return value
         for line in rollout.read_text(encoding="utf-8", errors="replace").splitlines():
             if not line.strip():
                 continue
@@ -642,29 +644,32 @@ class CodexReviewer:
                 obj = json.loads(line)
             except ValueError:
                 obj = None
-            if not isinstance(obj, dict) or not isinstance(obj.get("type"), str) or \
-                    not isinstance(obj.get("payload", {}), (dict, type(None))):
-                info["provenance_problem"] = "the rollout contains malformed records"
+            if not isinstance(obj, dict) or not isinstance(obj.get("type"), str):
+                problem("the rollout contains malformed records")
                 continue
-            kind, payload = obj.get("type"), obj.get("payload") or {}
+            kind, payload = obj["type"], obj.get("payload")
+            if kind in ("session_meta", "turn_context", "event_msg", "response_item") and not isinstance(payload, dict):
+                problem(f"a {kind} record has no object payload")
+                continue
+            payload = payload if isinstance(payload, dict) else {}
             ptype = payload.get("type")
-            if kind == "session_meta" and payload.get("id") != thread_id:
-                info["provenance_problem"] = "the rollout's session metadata names more than one thread"
             if kind == "session_meta":
+                if payload.get("id") != thread_id:
+                    problem("the rollout's session metadata names more than one thread")
                 info["cli_version"] = payload.get("cli_version")
             elif kind == "turn_context":
                 info["turn_models"].append(payload.get("model"))
                 info["turn_efforts"].append(payload.get("effort"))
-                info.setdefault("turn_sandboxes", []).append((payload.get("sandbox_policy") or {}).get("type") or "<missing>")
+                info.setdefault("turn_sandboxes", []).append(obj_at(payload, "sandbox_policy").get("type") or "<missing>")
             elif ptype == "thread_settings_applied":
-                settings = payload.get("thread_settings", {})
+                settings = obj_at(payload, "thread_settings")
                 info["observed_model"] = settings.get("model")
                 info["observed_effort"] = settings.get("reasoning_effort")
                 info.setdefault("approvals_seen", []).append(settings.get("approval_policy") or "<missing>")
-                info.setdefault("networks_seen", []).append((settings.get("permission_profile") or {}).get("network") or "<missing>")
+                info.setdefault("networks_seen", []).append(obj_at(settings, "permission_profile").get("network") or "<missing>")
             elif ptype == "token_count":
-                info["usage"] = (payload.get("info") or {}).get("total_token_usage")
-                info["plan_type"] = (payload.get("rate_limits") or {}).get("plan_type")
+                info["usage"] = obj_at(payload, "info").get("total_token_usage")
+                info["plan_type"] = obj_at(payload, "rate_limits").get("plan_type")
             elif kind == "response_item" and ptype in ("function_call", "custom_tool_call"):
                 if str(payload.get("name", "")).split(".")[-1] in DELEGATION_TOOLS:
                     info["subagent_suspected"] = True  # a recorded delegation dispatch
@@ -676,6 +681,18 @@ class CodexReviewer:
         info["turn_models"] = sorted({m or "<missing>" for m in info["turn_models"]})
         info["turn_efforts"] = sorted({e or "<missing>" for e in info["turn_efforts"]})
         return info
+
+
+def _rollout_header(path):
+    """The session_meta payload on a rollout's first line, or None if it is missing or malformed."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            first = json.loads(handle.readline())
+    except (ValueError, OSError):
+        return None
+    if isinstance(first, dict) and first.get("type") == "session_meta" and isinstance(first.get("payload"), dict):
+        return first["payload"]
+    return None
 
 
 def parse_codex_events(events_path):
@@ -777,14 +794,17 @@ class ClaudeDeveloper:
     def session_exists(self, session_id) -> bool:
         return bool(self._transcripts(session_id))
 
-    def session_provenance(self, session_id):
-        """CLI-recorded models (main thread) and effort settings for a session transcript."""
+    def session_provenance(self, session_id, since=None):
+        """CLI-recorded models (main thread) and effort settings for a session transcript; with since (an ISO
+        prefix), only records of the current invocation count."""
         models, efforts, paths = set(), set(), self._transcripts(session_id)
         for path in paths:
             for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
                 try:
                     obj = json.loads(line)
                 except ValueError:
+                    continue
+                if since and str(obj.get("timestamp") or "") < since:
                     continue
                 if obj.get("type") == "assistant" and not obj.get("isSidechain"):
                     for key in ("effort", "perTurnEffort"):
@@ -853,6 +873,8 @@ class ClaudeDeveloper:
         """Run one invocation. Soft deadline: cooperative stop request. After the grace
         period the developer is terminated only if no runtime transaction is active."""
         started = time.monotonic()
+        # transcript records of THIS invocation (1s margin; transcript stamps carry milliseconds)
+        launched_at = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%S")
         deadline_exceeded = terminated = False
         with open(log_path, "w", encoding="utf-8") as out, open(stderr_path, "w", encoding="utf-8") as err:
             flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
@@ -880,7 +902,7 @@ class ClaudeDeveloper:
                 except KeyboardInterrupt:
                     continue  # the child owns its transaction; use `stop` to pause at the boundary
         parsed = self.parse(log_path)
-        prov = self.session_provenance(session_id)
+        prov = self.session_provenance(session_id, since=launched_at)
         parsed.update({"exit_code": proc.returncode, "deadline_exceeded": deadline_exceeded, "terminated": terminated,
                        "duration_s": round(time.monotonic() - started, 1), "observed_effort": prov["efforts"]})
         return parsed
@@ -1061,7 +1083,7 @@ class Controller:
     @property
     def developer(self):
         if self._developer is None:
-            self._developer = ClaudeDeveloper(self.cfg["developer"], self.dir / "developer-settings.json",
+            self._developer = ClaudeDeveloper(self.cfg["developer"], self.settings_path,
                                               self.wf / REPORT_SCHEMA_FILE, schema_text=self.files[REPORT_SCHEMA_FILE])
             self._developer.helper_token = self.state["developer"].get("helper_token")
         return self._developer
@@ -1121,19 +1143,18 @@ class Controller:
         problem = self.mission_problem()
         if problem:
             raise Stop("BLOCKED", problem)
-        settings = self.dir / "developer-settings.json"
+        settings = self.settings_path
         if self.state.get("developer_settings_sha256") and (
                 not settings.exists() or sha256_file(settings) != self.state["developer_settings_sha256"]):
             raise Stop("BLOCKED", "the enrollment's developer permission file is missing or changed")
         if self.state.get("developer_settings_sha256") and self.state["workflow"].get("root") != str(self.wf):
-            # same behavioral version from another installed package (e.g. a config-only install): recompose the
+            # same behavioral version from another installed package (e.g. a config-only install): rebind the
             # permission file so helper commands given to the developer and their allowances name the same package
-            atomic_write_json(settings, compose_developer_settings(self.cfg, self.wf, self.state["enrollment_id"],
-                                                                     self.state["repo_root"]))
-            self.state["developer_settings_sha256"] = sha256_file(settings)
+            self.bind_developer_settings(compose_developer_settings(self.cfg, self.wf, self.state["enrollment_id"],
+                                                                    self.state["repo_root"]))
             self.state["workflow"]["root"] = str(self.wf)
-            self.state.setdefault("notes", []).append(f"{now_iso()} permissions recomposed for package {self.wf}")
-            self.save()
+            self.state.setdefault("notes", []).append(f"{now_iso()} permissions rebound for package {self.wf}")
+            self.save()  # file selection, digest and package root change together
         return pr
 
     def mission_problem(self):
@@ -1724,6 +1745,7 @@ class Controller:
                 "pr": self.state["pr"]["number"], "H": rnd["H"], "B": rnd["B"], "M": rnd["M"],
                 "mission": {"id": self.state["plan"]["mission_id"], "sha256": self.state["mission"]["sha256"]},
                 "workflow_fingerprint": self.state["workflow"]["fingerprint"],
+                "project_sha256": project_digest(self.cfg),
                 "validated_at": now_iso(), "invocation": {"requested": requested, "observed": prov, **info},
                 "response_sha256": sha256_bytes(raw) if raw else None, "result": result if not reasons else None,
                 "raw_result_if_rejected": raw.decode("utf-8", "replace")[:4000] if reasons else None}
@@ -1812,7 +1834,7 @@ class Controller:
         path = Path(rnd["envelope_path"])
         raw = path.read_bytes() if path.is_file() else None
         envelope = json.loads(raw) if raw is not None and sha256_bytes(raw) == rnd.get("envelope_sha256") else None
-        if envelope is None or envelope.get("workflow_fingerprint") != self.state["workflow"]["fingerprint"]:
+        if envelope is None or envelope.get("workflow_fingerprint") != self.state["workflow"]["fingerprint"] or                 envelope.get("project_sha256") not in (None, project_digest(self.cfg)):
             # bytes authenticated before parsing; unreadable, altered or other-version results take one transition
             self.retire_verdict(rnd, "its preserved result is missing, altered or from another workflow version",
                                 persist_with=lambda: (rnd.update(status="invalidated"),
@@ -2054,32 +2076,40 @@ class Controller:
     # -- headless developer loop ---------------------------------------------------------
     def allowed_commands(self):
         """Human-readable list of the shell command prefixes the developer's permission file allows."""
-        path = self.dir / "developer-settings.json"
+        path = self.settings_path
         rules = read_json(path)["permissions"]["allow"] if path.exists() else []
         prefixes = sorted({m.group(1).rstrip("*").rstrip() for r in rules
                            for m in [re.match(r"^(?:Bash|PowerShell)\((.*)\)$", r)] if m})
         return "\n".join(f"  - `{p}`" for p in prefixes) or "  - (none)"
 
     def gate_receipts(self, commit, gate=None):
-        """Controller-written gate receipts for a commit (newest last)."""
+        """Receipts for a commit as (path, data, identity). The identity (gate, definition id, argument-list id,
+        stamp) is parsed from the controller-written file name, so it survives damage to the receipt body. Names
+        without it (earlier versions) have unknowable scope."""
         folder = self.dir / "evidence"
         out = []
         marker = f"-{commit[:12]}-"
         for path in sorted(folder.glob("gate-*.json")) if folder.exists() else []:
             if marker not in path.name:
-                continue  # receipts are named gate-<gate>-<candidate12>-<stamp>.json by the controller
+                continue
             named_gate = path.name[5:path.name.index(marker)]
+            rest = path.stem[path.stem.index(marker) + len(marker):]
+            m = RECEIPT_NAME_RE.match(rest)
+            identity = {"gate": named_gate, "definition": m.group(1) if m else None, "argv": m.group(2) if m else None,
+                        "stamp": m.group(3) if m else rest.rsplit("-", 1)[-1]}
             try:
                 data = read_json(path)
             except (ValueError, OSError):
                 data = None
-            if not isinstance(data, dict) or data.get("schema") != "agent-review.gate-receipt.v1" or \
-                    data.get("candidate") != commit or data.get("gate") != named_gate or "argv" not in data:
-                argv = data.get("argv") if isinstance(data, dict) and isinstance(data.get("argv"), list) else None
+            valid = isinstance(data, dict) and data.get("schema") == "agent-review.gate-receipt.v1" and \
+                data.get("candidate") == commit and data.get("gate") == named_gate and \
+                isinstance(data.get("argv"), list) and m is not None and argv_id(data["argv"]) == identity["argv"] \
+                and data.get("recorded_at") == identity["stamp"]
+            if not valid:
                 data = {"schema": "agent-review.gate-receipt.v1", "candidate": commit, "damaged": True,
-                        "gate": named_gate, "argv": argv, "recorded_at": "~damaged"}  # fails closed
-            if gate is None or data.get("gate") == gate:
-                out.append((path, data))
+                        "gate": named_gate, "argv": None, "recorded_at": identity["stamp"]}
+            if gate is None or named_gate == gate:
+                out.append((path, data, identity))
         return out
 
     def receipt_problems(self, path, data, commit):
@@ -2099,30 +2129,29 @@ class Controller:
         return problems
 
     def gate_status(self, commit):
-        """{gate: (passed, [latest receipt paths])}. Runs are ordered by the stamp in their controller-written file
-        names. For each gate and exact argument list the newest run supersedes older ones. A damaged receipt fails
-        until a newer valid run of the same argument list exists; if its argument list cannot be read, every
-        argument list of that gate must have a newer valid run."""
-        def stamp(path):
-            return path.stem.rsplit("-", 1)[-1]
-        ordered = sorted(self.gate_receipts(commit), key=lambda item: stamp(item[0]))
-        latest, damage = {}, []
-        for path, data in ordered:
-            argv = data.get("argv")
-            argv_key = json.dumps(argv) if isinstance(argv, list) else None
-            if data.get("damaged") or data.get("recorded_at") != stamp(path) or argv_key is None:
-                damage.append((data["gate"], argv_key, stamp(path)))  # fails closed for the run it represents
+        """{gate: (passed, [latest receipt paths])}. Only runs of the gate's current definition count; runs of a
+        replaced definition are history. Within it, the newest run of each argument list supersedes older ones. A
+        damaged run fails its gate until a newer valid run of the same argument list exists; a damaged run whose
+        identity is unknowable (an earlier naming scheme) fails the gate for this commit."""
+        gates = self.cfg.get("gates") or {}
+        latest, damage, status = {}, [], {}
+        for path, data, ident in sorted(self.gate_receipts(commit), key=lambda item: item[2]["stamp"]):
+            gate = gates.get(ident["gate"])
+            if ident["definition"] is None:
+                damage.append((ident["gate"], None, ident["stamp"]))
                 continue
-            latest[(data["gate"], argv_key)] = (path, data)
-        status = {}
-        for (gate, _), (path, data) in latest.items():
+            if not gate or ident["definition"] != gate_definition_id(gate):
+                continue  # evidence for a replaced (or undeclared) definition: history only
+            if data.get("damaged"):
+                damage.append((ident["gate"], ident["argv"], ident["stamp"]))
+                continue
+            latest[(ident["gate"], ident["argv"])] = (path, data, ident["stamp"])
+        for (gate, _), (path, data, _) in latest.items():
             ok, paths = status.get(gate, (True, []))
             status[gate] = (ok and not self.receipt_problems(path, data, commit), paths + [path])
-        for gate, argv_key, when in damage:
-            runs = {k[1]: stamp(v[0]) for k, v in latest.items() if k[0] == gate}
-            covered = (runs.get(argv_key, "") > when) if argv_key is not None else \
-                (bool(runs) and all(t > when for t in runs.values()))
-            if not covered:
+        for gate, argv, when in damage:
+            newer = latest.get((gate, argv))
+            if argv is None or not newer or newer[2] <= when:
                 status[gate] = (False, status.get(gate, (False, []))[1])
         return status
 
@@ -2151,7 +2180,7 @@ class Controller:
             code, output = None, f"timed out after {exc.timeout}s"
         clean_after = self.git.head() == head and self.git.clean()
         stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        base = self.dir / "evidence" / f"gate-{gate_id}-{head[:12]}-{stamp}"
+        base = self.dir / "evidence" / (f"gate-{gate_id}-{head[:12]}-d{gate_definition_id(gate)}-a{argv_id(argv)}-{stamp}")
         text, _ = sanitize(output, strict=False)
         write_text(base.with_suffix(".log"), text)
         receipt = {"schema": "agent-review.gate-receipt.v1", "gate": gate_id, "argv": argv, "candidate": head,
@@ -2291,6 +2320,23 @@ class Controller:
             problems.append("the GitHub login is not the project's expected actor")
         return problems
 
+    @property
+    def settings_path(self):
+        return self.dir / self.state.get("developer_settings_file", "developer-settings.json")
+
+    def bind_developer_settings(self, composed):
+        """Write the permission file under a content-addressed name, then select it in one state save: an
+        interruption leaves the previous, intact file selected (never a half-switched binding)."""
+        text = json.dumps(composed, indent=2) + "\n"
+        name = f"developer-settings-{sha256_text(text)[:16]}.json"
+        path = self.dir / name
+        if not path.exists():
+            write_text(path.with_suffix(".tmp"), text)
+            os.replace(path.with_suffix(".tmp"), path)
+        self.state.update(developer_settings_file=name, developer_settings_sha256=sha256_file(path))
+        if getattr(self, "_developer", None) is not None:
+            self._developer.settings_path = path
+
     def assert_claims(self):
         """This enrollment must still hold both the host branch claim and the worktree's own marker."""
         for claim in (registry_path(self.cfg["repository"], self.state["branch"]),
@@ -2374,23 +2420,23 @@ class Controller:
                 {"replaced_at": now_iso(), "sha256": sha256_text(json.dumps(self.cfg, sort_keys=True)),
                  "by_sha256": sha256_text(json.dumps(new_cfg, sort_keys=True))})
             self.state["project"] = self.cfg = new_cfg
+        last = self.state.get("project_history", [{}])[-1] if refresh_project else {}
+        project_changed = bool(refresh_project) and last.get("sha256") != last.get("by_sha256")
         self.snapshot_fp, _, self.files = load_workflow(self.wf)  # this process continues under the new version
         new = self.snapshot_fp
         old = self.state["workflow"]["fingerprint"]
         self.state["workflow"] = {"fingerprint": new, "root": str(self.wf), "activated_at": now_iso(), "previous": old}
         invalidated = []
         active = self.active()
-        if active and active["status"] == "validated" and new != old:
+        if active and active["status"] == "validated" and (new != old or project_changed):
             active["status"] = "invalidated"
             self.state["active_round"] = None
             invalidated.append(f"round {active['round']} result")
             self.retire_verdict(active, "a new workflow version was activated before it was accepted")
         check_policy(self.cfg)
-        settings = self.dir / "developer-settings.json"
-        atomic_write_json(settings, compose_developer_settings(self.cfg, self.wf, self.state["enrollment_id"],
-                                                                 self.state["repo_root"]))
-        self.state["developer_settings_sha256"] = sha256_file(settings)  # permissions follow the activated version
-        if self.state.get("ready_review") and new != old:
+        self.bind_developer_settings(compose_developer_settings(self.cfg, self.wf, self.state["enrollment_id"],
+                                                                self.state["repo_root"]))  # follows the activation
+        if self.state.get("ready_review") and (new != old or project_changed):
             self.state.setdefault("superseded_ready", []).append({**self.state["ready_review"], "why": "workflow activation"})
             if self.state.get("status") == "AWAITING_OWNER_REVIEW" or self.state.get("handoff"):
                 self.state.setdefault("superseded_handoffs", []).append({**(self.state.get("handoff") or {}),
@@ -2400,7 +2446,7 @@ class Controller:
             self.state["ready_review"] = None
             invalidated.append("ready result")
             self.state["phase"] = "review"  # same candidate and report: a fresh review under the new rules
-        if new != old and any(k.startswith("final-status-") and VERDICT_KEY_RE.match(k) and p["state"] != "superseded"
+        if (new != old or project_changed) and any(k.startswith("final-status-") and VERDICT_KEY_RE.match(k) and p["state"] != "superseded"
                               for k, p in self.state.get("publications", {}).items()):
             # every receipt from the previous version stops being current; these public updates are durable
             self.queue_public_op("retire_receipts", why="A new workflow version was activated; the candidate will "
@@ -2441,9 +2487,15 @@ class Controller:
                 self.save()
                 return "AWAITING_OWNER_REVIEW (the handoff is still current)"
             self.reopen(moved)
+            reopened = True
+        else:
+            reopened = False
         if self.state["phase"] == "cancelled":
             raise UsageError("enrollment was cancelled")
         limit = int(max_rounds or self.limits["max_review_rounds_per_checkpoint"])
+        if self.state["phase"] in ("develop", "review") and self.budget_exhausted(limit) and reopened:
+            raise Stop("BLOCKED", f"handoff superseded and the review-round budget for {self.checkpoint['id']} is "
+                                  "exhausted; resume with a larger --max-rounds to continue")
         if self.state["phase"] in ("develop", "review") and self.budget_exhausted(limit):
             raise UsageError(f"the review-round budget for {self.checkpoint['id']} is exhausted "
                              f"({self.state['rounds_completed'].get(self.checkpoint['id'], 0)}/{limit}); pass a larger --max-rounds")
@@ -2497,6 +2549,8 @@ class Controller:
         for pub in sorted(self.state.get("publications", {}).values(), key=lambda p: p["seq"]):
             if pub["key"] in archived_keys or pub["key"].startswith("final-"):
                 continue
+            if pub["state"] == "superseded" and any(p.get("posting_since") and not p.get("comment_id") for p in pub["parts"]):
+                self.visible_parts(pub["key"], pub)  # resolve uncertain deliveries before recording what was public
             carried = [p for p in pub["parts"] if p.get("comment_id")]  # parts that actually reached GitHub
             if pub["state"] == "posted":
                 carried = pub["parts"]
@@ -2730,7 +2784,8 @@ class Controller:
             if not key.startswith("final-status-") or not VERDICT_KEY_RE.match(key) or pub["state"] == "superseded" \
                     or key == keep:
                 continue
-            if pub["state"] == "posted" or self.visible_parts(key, pub):
+            uncertain = any(part.get("posting_since") and not part.get("comment_id") for part in pub["parts"])
+            if pub["state"] == "posted" or self.visible_parts(key, pub) or uncertain:  # may still appear
                 self.queue(f"{key}-retired", f"### Workflow — correction — the owner-review handoff above is not "
                                              f"current\n\n{why}\n\n_Automated workflow status; not a human review._\n")
             pub["state"] = "superseded"
@@ -2748,7 +2803,8 @@ class Controller:
             return
         total = len(normal["parts"]) if normal else 0
         visible = total if normal and normal["state"] == "posted" else (self.visible_parts(key, normal) if normal else 0)
-        if visible:
+        uncertain = bool(normal) and any(p.get("posting_since") and not p.get("comment_id") for p in normal["parts"])
+        if visible or uncertain:  # an uncertain POST may still appear: it is corrected in advance
             self.queue(f"{key}-superseded", f"### Workflow — correction — round {n} review is not a current verdict"
                                             f"\n\nThe review posted (in whole or in part) for `{short(rnd['H'])}` will "
                                             f"not be accepted: {why}. It is preserved for the record.\n\n"
@@ -2870,8 +2926,8 @@ class Controller:
             if not named or named["state"] != "posted":
                 missing.append(include_receipt + " (the handoff receipt is absent or not current)")
         for key, pub in self.state.get("publications", {}).items():
-            if key.startswith("final-") and key != include_receipt:
-                continue
+            if key.startswith("final-status-") and VERDICT_KEY_RE.match(key) and key != include_receipt:
+                continue  # other receipts (current or retired); their corrections below are checked
             if pub["state"] == "superseded" and key != include_receipt:
                 continue
             if pub["state"] != "posted":
@@ -3014,6 +3070,23 @@ def _trusted(root: Path, folder: str, name_or_path: str) -> Path:
     if len(found) != 1:
         raise UsageError(f"{folder[:-1]} '{name_or_path}' must exist in exactly one of {[str(b) for b in bases]}")
     return found[0]
+
+
+def project_digest(cfg):
+    """Identity of the pinned project configuration a review was produced under."""
+    return sha256_text(json.dumps(cfg, sort_keys=True))
+
+
+def gate_definition_id(gate):
+    """Identity of a gate's declared command (independent of the receipt body)."""
+    return sha256_text(json.dumps(gate["argv"]))[:10]
+
+
+def argv_id(argv):
+    return sha256_text(json.dumps(list(argv)))[:10]
+
+
+RECEIPT_NAME_RE = re.compile(r"^d([0-9a-f]{10})-a([0-9a-f]{10})-(\d{8}T\d{12}Z)$")
 
 
 def compose_developer_settings(cfg, root: Path, enrollment_id: str, repo_root=None):
@@ -3337,7 +3410,8 @@ def _tool_outcomes(log_path, denied_ids):
                 content = item.get("content")
                 text = content if isinstance(content, str) else json.dumps(content)
                 results[item.get("tool_use_id")] = (bool(item.get("is_error")), text)
-    return [(command, "denied" if use_id in denied_ids else ("ran" if use_id in results else "no_result"))
+    return [(command, "denied" if use_id in denied_ids else
+             ("no_result" if use_id not in results else ("error" if results[use_id][0] else "ran")))
             for use_id, command in uses]
 
 
@@ -3373,8 +3447,8 @@ def permission_isolation_probe(cfg, root, work):
     rule = _user_status_allowance(cfg)
     if not rule:
         return {"ok": None, "skipped": "no user-level `status` allowance exists to probe; isolation not observed"}
-    ambient = rule[len("Bash("):-len(" *)")] + f" --enrollment {PROBE_ENROLLMENT}"  # read-only
-    helper = f"python {Path(root).resolve().as_posix()}/agent_review.py verify --enrollment {PROBE_ENROLLMENT} --gate probe"
+    ambient = rule[len("Bash("):-len(" *)")] + " --help"  # permitted by the user rule; succeeds when it runs
+    helper = f"python {Path(root).resolve().as_posix()}/agent_review.py verify --enrollment {PROBE_ENROLLMENT} --help"
     composed_cmd = "git status --short"
     repo = work / "probe-repo"
     repo.mkdir(parents=True)
