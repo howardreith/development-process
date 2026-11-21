@@ -20,6 +20,7 @@ import subprocess
 import sys
 import stat
 import tempfile
+import time
 import uuid
 import unittest
 from pathlib import Path
@@ -292,7 +293,14 @@ class Env:
         def _writable(func, path, _exc):
             os.chmod(path, stat.S_IWRITE)  # git marks object files read-only on Windows
             func(path)
-        shutil.rmtree(self.root, onexc=_writable)
+        for attempt in range(20):  # a killed controller's orphaned git child can hold the directory briefly
+            try:
+                shutil.rmtree(self.root, onexc=_writable)
+                break
+            except PermissionError:
+                if attempt == 19:
+                    raise
+                time.sleep(0.5)
 
 
 class Base(unittest.TestCase):
@@ -501,23 +509,6 @@ class ArchiveRecoveryTests(Base):
         names = [p.name for p in (env.work / "docs/agent-reviews/pr-7").iterdir()]
         self.assertEqual(len(names), len({n[4:] for n in names}))  # no record archived twice
 
-    def test_crash_after_writing_records_commits_them_on_restart(self):
-        env = self.env
-
-        class Crashing(ar.Controller):
-            def complete_archive(self, pending):
-                raise KeyboardInterrupt("simulated crash after the records were written")
-        ctl = env.controller(Crashing)
-        self.to_finalize(ctl)
-        with self.assertRaises(KeyboardInterrupt):
-            ctl.finalize()
-        self.assertFalse(ar.Git(env.work).clean())
-        restarted = env.controller()
-        self.assertEqual("AWAITING_OWNER_REVIEW", restarted.finalize())
-        self.assertTrue(ar.Git(env.work).clean())
-        self.assertIsNone(restarted.state["archive_pending"])
-
-
 class StaleCandidateTests(Base):
     def test_head_moving_during_review_makes_result_historical(self):
         """WF04: a moved material head cannot reuse the result."""
@@ -630,6 +621,9 @@ class InvalidReviewTests(unittest.TestCase):
         "mismatched request id": ([{"decision": "checkpoint_passed", "override": {"request_id": "forged"}}] * 3, "does not match", 3),
         "final decision on intermediate": ([{"decision": "ready_for_owner_review"}] * 3, "not valid for a intermediate", 3),
         "pass with blocking finding": ([{"decision": "checkpoint_passed", "findings": [finding("R1-F1")]}] * 3, "passing decision", 3),
+        "blank inspected entry": ([{"decision": "checkpoint_passed", "override": {"evidence_assessment": {
+            "inspected": ["  "], "executed_verification": [], "source_inspection_only": [], "required_gaps": [],
+            "limitations": []}}}] * 3, "blank entry", 3),
         "duplicate JSON keys": ([{"raw": '{"decision": "checkpoint_passed", "decision": "blocked"}'}] * 3, "duplicate JSON keys", 3),
         "blank rationale": ([{"decision": "checkpoint_passed", "override": {"decision_rationale": "  "}}] * 3, "is blank", 3),
         "pass without inspected evidence": ([{"decision": "checkpoint_passed", "override": {"evidence_assessment": {
@@ -1259,35 +1253,6 @@ class RoundTwoRegressionTests(Base):
         ctl.publish_dispositions(r2)
         self.assertEqual(2, count())
 
-    def test_archive_recovers_partial_writes_and_an_unrecorded_commit(self):
-        """R1-F12."""
-        env = self.env
-
-        class Crashing(ar.Controller):
-            def complete_archive(self, pending):
-                raise KeyboardInterrupt("simulated crash")
-        ctl = env.controller(Crashing)
-        self.to_finalize(ctl)
-        with self.assertRaises(KeyboardInterrupt):
-            ctl.finalize()
-        pending = ar.read_json(env.dir / "state.json")["archive_pending"]
-        (env.work / pending["files"][0]["rel"]).unlink()  # crash mid-write: one record missing
-        self.assertEqual("AWAITING_OWNER_REVIEW", env.controller().finalize())
-
-        env2 = Env("foreground")
-        self.addCleanup(env2.cleanup)
-        ctl2 = env2.controller(Crashing)
-        env2.reviewer.script += [{"decision": "checkpoint_passed"}, {"decision": "ready_for_owner_review"}]
-        for checkpoint in ("phase-1", "final"):
-            ctl2.accept_report(report(env2, checkpoint))
-            ctl2.transition("review", "t")
-            ctl2.review_round()
-        with self.assertRaises(KeyboardInterrupt):
-            ctl2.finalize()
-        git(env2.work, "add", "-A")
-        git(env2.work, "commit", "--quiet", "-m", "archive commit made just before the crash")
-        self.assertEqual("AWAITING_OWNER_REVIEW", env2.controller().finalize())
-
     def test_stop_outcome_is_saved_with_the_round(self):
         """R1-F11."""
         env = self.env
@@ -1594,25 +1559,6 @@ class RoundFourRegressionTests(Base):
         with self.assertRaises(ar.Stop):
             ctl.publish("r02-request", "### heading\nother")
 
-    def test_partial_archive_commit_is_not_adopted(self):
-        """R1-F12."""
-        env = self.env
-
-        class Crashing(ar.Controller):
-            def complete_archive(self, pending):
-                raise KeyboardInterrupt("simulated crash")
-        ctl = env.controller(Crashing)
-        self.to_finalize(ctl)
-        with self.assertRaises(KeyboardInterrupt):
-            ctl.finalize()
-        pending = ar.read_json(env.dir / "state.json")["archive_pending"]
-        first = pending["files"][0]["rel"]
-        git(env.work, "add", first)
-        git(env.work, "commit", "--quiet", "-m", "only part of the intended records")
-        with self.assertRaises(ar.Stop) as stop:
-            env.controller().finalize()
-        self.assertIn("branch moved", stop.exception.reason)
-
     def test_missing_handoff_receipt_supersedes_the_handoff(self):
         """R1-F22."""
         env = self.env
@@ -1688,8 +1634,8 @@ sys.exit(1)
 """
 
 
-class DevProcRoundOneTests(Base):
-    """Regressions for the development-process round-1 review findings."""
+class CrashFixture:
+    """Kill a real controller subprocess at a deterministic git-hook point during finalize (F20)."""
 
     def crash_finalize_at(self, env, hook_name):
         """Run finalize in a real controller subprocess and kill it from a git hook (F20)."""
@@ -1705,6 +1651,10 @@ class DevProcRoundOneTests(Base):
                               capture_output=True, text=True, timeout=300)
         hook.unlink()
         self.assertNotEqual(0, proc.returncode)  # the controller was killed mid-archive
+
+
+class DevProcRoundOneTests(CrashFixture, Base):
+    """Regressions for the development-process round-1 review findings."""
 
     def test_archive_crash_before_commit_recovers_from_intent(self):
         """F20 + F12 (pre-commit kill): records written, no commit; one record lost; restart completes exactly."""
@@ -1896,10 +1846,11 @@ class DevProcRoundOneTests(Base):
         req = {"model": "gpt-6.2-astra", "effort": "high"}
         good = {"rollout_found": True, "observed_model": "gpt-6.2-astra", "observed_effort": "high",
                 "turn_models": ["gpt-6.2-astra"], "turn_efforts": ["high"], "sandbox": "read-only",
-                "approval_policy": "never", "subagent_suspected": False}
+                "approval_policy": "never", "network": "restricted", "subagent_suspected": False}
         info = {"completed": True, "failed": False}
         self.assertEqual(([], False), ar.invocation_problems(info, good, req))
-        for change in ({"turn_models": []}, {"turn_efforts": []}, {"sandbox": None}, {"approval_policy": None}):
+        for change in ({"turn_models": []}, {"turn_efforts": []}, {"sandbox": None}, {"approval_policy": None},
+                       {"network": None}, {"network": "enabled"}, {"sandbox": "<conflicting:read-only,workspace-write>"}):
             with self.subTest(change):
                 self.assertTrue(ar.invocation_problems(info, {**good, **change}, req)[0])
         self.assertTrue(ar.invocation_problems({"completed": False}, good, req)[0])
@@ -2043,6 +1994,287 @@ class DevProcRoundOneTests(Base):
         again = ar.Controller(folder, github=env.gh, reviewer=env.reviewer, developer=env.developer,
                               sleep=lambda s: None, workflow_root=env.wf)
         again.verify_transcripts(git(env.work, "rev-parse", "HEAD"))  # genuine records are not foreign
+
+
+class DevProcRoundTwoTests(CrashFixture, Base):
+    """Regressions for the development-process round-2 review findings (reuses the crash fixture)."""
+
+    def test_partial_archive_commit_is_not_adopted(self):
+        """F20 port: a commit holding only part of the intended records (made after a real crash) is refused."""
+        env = self.env
+        ctl = env.controller()
+        self.to_finalize(ctl)
+        self.crash_finalize_at(env, "pre-commit")
+        pending = ar.read_json(env.dir / "state.json")["archive_pending"]
+        git(env.work, "reset", "--quiet")  # the killed controller had staged every record; commit only one
+        git(env.work, "add", pending["files"][0]["rel"])
+        git(env.work, "commit", "--quiet", "-m", "only part of the intended records")
+        with self.assertRaises(ar.Stop) as stop:
+            env.controller().finalize()
+        self.assertIn("branch moved", stop.exception.reason)
+
+    def test_stale_handoff_receipt_is_corrected_when_abandoned(self):
+        """F1: a visible 'awaiting owner review' receipt is corrected when its handoff is abandoned."""
+        env = self.env
+        ctl = env.controller()
+        self.to_finalize(ctl)
+        self.assertEqual("AWAITING_OWNER_REVIEW", ctl.finalize())
+        ctl.state.update(phase="finalize", status="ACTIVE")  # e.g. a restarted finalize
+        env.commit("feature.txt", "late\n", "material change")
+        env.push()
+        with self.assertRaises(ar.Stop):
+            ctl.finalize()
+        self.assertIn("the owner-review handoff above is not current", env.gh.comments_list[-1]["body"])
+        self.assertTrue(ar.VERDICT_KEY_RE.match("r100-review"))
+
+    def test_damaged_receipts_fail_closed_and_passes_recheck_gates(self):
+        """F2."""
+        gates = {"unit": {"argv": [sys.executable, "-c", "print('ok')"]}}
+        plan = {"schema_version": "agent-review.plan.v1", "mission_id": "fixture", "checkpoints": [
+            {"id": "phase-1", "type": "intermediate", "scope": "s", "exit_conditions": ["e"], "required_gates": ["unit"]},
+            {"id": "final", "type": "final", "scope": "s", "exit_conditions": ["e"]}]}
+        env = Env("foreground", plan=plan, cfg_overrides={"gates": gates})
+        self.addCleanup(env.cleanup)
+        ctl = env.controller()
+        head = git(env.work, "rev-parse", "HEAD")
+        first = ctl.run_gate("unit")
+        self.assertEqual([], ctl.missing_gates(head))
+        damaged = ctl.dir / "evidence" / f"gate-unit-{head[:12]}-99999999T999999999999Z.json"
+        damaged.write_text("{truncated", encoding="utf-8")
+        self.assertEqual(["unit"], ctl.missing_gates(head))  # an unreadable newer receipt cannot revive the old pass
+        damaged.unlink()
+        env.reviewer.script = [{"decision": "checkpoint_passed"}]
+        self.assertIsNone(ctl.accept_report(report(env, "phase-1")))
+        (ctl.dir / "evidence" / first["log"]).write_text("edited after acceptance\n", encoding="utf-8")
+        ctl.transition("review", "t")
+        with self.assertRaises(ar.Stop) as stop:
+            ctl.review_round()
+        self.assertIn("gate evidence", stop.exception.reason)
+        self.assertEqual(0, ctl.state["checkpoint_index"])
+
+    def test_install_interlocks_new_writers_and_owns_what_it_replaces(self):
+        """F3, R2-F3."""
+        env = self.env
+        ctl = env.controller()
+        with ar.Lock(ar.host_dir() / "install.lock", "install"):
+            with self.assertRaises(ar.UsageError):  # a writer cannot start while an install runs
+                with ctl.lock("run"):
+                    pass
+        with ctl.lock("run"):
+            pass  # free again once the install finished
+        foreign = env.root / "not-an-install"
+        foreign.mkdir()
+        (foreign / "notes.txt").write_text("keep me\n", encoding="utf-8")
+        with self.assertRaises(ar.UsageError):
+            ar.install(foreign, env.wf)
+        self.assertTrue((foreign / "notes.txt").exists())
+        dest = env.root / "inst"
+        ar.install(dest, env.wf)
+        (dest / "extra.txt").write_text("unowned\n", encoding="utf-8")
+        with self.assertRaises(ar.UsageError):
+            ar.install(dest, env.wf)
+        (dest / "extra.txt").unlink()
+        retired = dest.with_name(dest.name + ".retired-20200101000000000000")
+        os.replace(dest, retired)  # an install that stopped between its two renames
+        ar.install(dest, env.wf)
+        self.assertTrue((dest / "MANIFEST.json").exists())
+        self.assertFalse(list(env.root.glob("inst.*")))
+
+    def test_cancel_waits_for_running_helpers(self):
+        """F4."""
+        ctl = self.env.controller()
+        with ctl.helper_lock("verify"):
+            with self.assertRaises(ar.Stop) as stop:
+                self.env.controller().cancel("x")
+        self.assertIn("helper is running", stop.exception.reason)
+
+    def test_helpers_are_bound_to_the_calling_developer(self):
+        """F5."""
+        env = self.env
+        ctl = env.controller()
+        self.assertEqual([], ctl.helper_authority_problems())
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "another-session"
+        self.assertTrue(any("not the enrolled foreground" in p for p in ctl.helper_authority_problems()))
+        os.environ["CLAUDE_CODE_SESSION_ID"] = FOREGROUND_SESSION
+        ctl.state["mode"] = "headless"
+        self.assertTrue(any("headless developer" in p for p in ctl.helper_authority_problems()))
+        os.environ["AGENT_REVIEW_HELPER_TOKEN"] = ctl.state["developer"]["helper_token"]
+        self.addCleanup(os.environ.pop, "AGENT_REVIEW_HELPER_TOKEN", None)
+        self.assertEqual([], ctl.helper_authority_problems())
+        self.assertEqual(ctl.state["developer"]["helper_token"], ar.ClaudeDeveloper(
+            {"executable": sys.executable, "model": "opus", "effort": "high"}, Path("s"), Path("x")).env().get(
+            "AGENT_REVIEW_HELPER_TOKEN", ctl.state["developer"]["helper_token"]))
+
+    def test_event_sequence_outcome_is_the_last_turn(self):
+        """F6."""
+        path = self.env.root / "events.jsonl"
+        cases = {"completed": (['{"type":"thread.started","thread_id":"t"}', '{"type":"turn.completed"}'], True),
+                 "completed then unfinished": (['{"type":"turn.completed"}', '{"type":"turn.started"}'], False),
+                 "malformed": (['{"type":"turn.completed"}', '{oops'], False),
+                 "failed": (['{"type":"turn.started"}', '{"type":"turn.failed"}'], False)}
+        for label, (lines, completed) in cases.items():
+            with self.subTest(label):
+                path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                self.assertEqual(completed, ar.parse_codex_events(path)["completed"])
+
+    def test_activation_retires_unsent_verdicts_and_public_handoff(self):
+        """F11."""
+        env = self.env
+        env.reviewer.script = [{"decision": "checkpoint_passed"}]
+        ctl = env.controller()
+        ctl.accept_report(report(env, "phase-1"))
+        ctl.transition("review", "t")
+        real_post, calls = env.gh.post_comment, {"n": 0}
+
+        def post(number, body_file):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise RuntimeError("simulated outage")
+            return real_post(number, body_file)
+        env.gh.post_comment = post
+        with self.assertRaises(ar.Stop):
+            ctl.review_round()  # verdict validated and queued, not sent
+        env.gh.post_comment = real_post
+        (env.wf / "prompts" / "reviewer.md").write_text("new rules\n", encoding="utf-8")
+        fresh = env.controller()
+        fresh.activate()
+        self.assertEqual("superseded", fresh.state["publications"]["r01-review"]["state"])
+        self.assertFalse([k for k in fresh.missing_publications() if k.startswith("r01-review")])
+
+    def test_ready_record_keeps_the_reviewed_target_tip(self):
+        """F14."""
+        env = self.env
+        ctl = env.controller()
+        self.to_finalize(ctl)
+        rnd = ctl.state["rounds"][-1]
+        self.assertEqual(rnd["B"], ctl.state["ready_review"]["B"])
+
+    def test_resume_respects_an_exhausted_round_budget(self):
+        """F15."""
+        env = Env("foreground", max_rounds=1)
+        self.addCleanup(env.cleanup)
+        env.reviewer.script = [{"decision": "changes_required", "findings": [finding("R1-F1")]}]
+        ctl = env.controller()
+        ctl.accept_report(report(env, "phase-1"))
+        ctl.transition("review", "t")
+        with self.assertRaises(ar.Stop):
+            ctl.review_round()
+        with self.assertRaises(ar.UsageError):
+            ctl.resume("try again")
+        self.assertEqual("BLOCKED", ar.read_json(env.dir / "state.json")["status"])
+        self.assertIn("ACTIVE", ctl.resume("owner extends the budget", max_rounds=2))
+
+    def test_resume_reconciles_a_live_reviewer_before_resetting(self):
+        """F16."""
+        env = self.env
+        ctl = env.controller()
+        ctl.accept_report(report(env, "phase-1"))
+        candidate = ctl.capture_candidate()
+        ctl.state["rounds"].append({"round": 1, "request_id": "x-r01-abc", "checkpoint_id": "phase-1",
+                                    "checkpoint_type": "intermediate", **candidate, "pending_findings": [],
+                                    "report": ctl.state["last_report"], "created_at": ar.now_iso(), "status": "reviewing",
+                                    "attempts": [{"n": 1, "started": ar.now_iso(), "pid": os.getpid()}], "attempt_seq": 1})
+        ctl.state.update(active_round=1, phase="review", status="BLOCKED", status_reason="usage limit")
+        with self.assertRaises(ar.Stop) as stop:
+            ctl.resume("try again")
+        self.assertIn("still running", stop.exception.reason)
+        self.assertEqual(1, len(ctl.state["rounds"][0]["attempts"]))  # not reset away
+
+    def test_push_scans_commit_messages_and_never_follows_tags(self):
+        """F17, R2-F4."""
+        env = Env("foreground", cfg_overrides={"push_command": None})
+        self.addCleanup(env.cleanup)
+        ctl = env.controller()
+        path = env.work / "a.txt"
+        path.write_text("a\n", encoding="utf-8")
+        git(env.work, "add", "a.txt")
+        git(env.work, "commit", "--quiet", "-m", f"add with token ghp_{'d' * 36}")
+        with self.assertRaises(ar.UsageError):
+            ar.guarded_push(ctl.state, ctl.cfg)
+        git(env.work, "reset", "--quiet", "--hard", "HEAD~1")
+        env.commit("b.txt", "b\n", "clean commit")
+        git(env.work, "config", "push.followTags", "true")
+        git(env.work, "tag", "-a", "v9.9.9", "-m", "annotated")
+        ar.guarded_push(ctl.state, ctl.cfg)
+        self.assertEqual("", git(env.origin, "tag", "--list"))
+
+    def test_literal_delegation_text_is_not_a_call(self):
+        """F18."""
+        with tempfile.TemporaryDirectory() as home:
+            rollout = Path(home) / "sessions" / "rollout-x-thread1.jsonl"
+            rollout.parent.mkdir(parents=True)
+            rev = ar.CodexReviewer({"executable": sys.executable, "codex_home": home, "model": "m", "effort": "high"})
+            item = {"type": "custom_tool_call", "name": "exec",
+                    "input": "await tools.exec_command({cmd: \"rg 'tools.collaboration.spawn_agent(' src\"})"}
+            rollout.write_text(json.dumps({"type": "response_item", "payload": item}) + "\n", encoding="utf-8")
+            self.assertFalse(rev.provenance("thread1")["subagent_suspected"])
+
+    def test_missing_earlier_records_block_re_enrollment(self):
+        """F19."""
+        env = self.env
+        ctl = env.controller()
+        self.to_finalize(ctl)
+        self.assertEqual("AWAITING_OWNER_REVIEW", ctl.finalize())
+        ctl.cancel("start over")
+        first = sorted(ctl.state["archived"])[0]
+        git(env.work, "rm", "--quiet", first)
+        git(env.work, "commit", "--quiet", "-m", "lose a record")
+        with self.assertRaises(ar.UsageError) as refused:
+            ar.enroll(env.args(), github=env.gh, root=env.wf)
+        self.assertIn("integrity", str(refused.exception))
+
+    def test_partially_visible_review_is_retired_not_marked_posted(self):
+        """R2-F1."""
+        env = self.env
+        env.reviewer.script = [{"decision": "checkpoint_passed"}]
+        ctl = env.controller()
+        original = ar.COMMENT_LIMIT
+        ar.COMMENT_LIMIT = 900  # force a multi-part review
+        self.addCleanup(setattr, ar, "COMMENT_LIMIT", original)
+        state = {"parts": 0}
+
+        def crash_after_first_part(record):
+            if "agent-review:v1" in record["body"] and "key=r01-review part=1/" in record["body"]:
+                env.gh.on_post = None
+                raise KeyboardInterrupt("simulated crash after one of several parts")
+        env.gh.on_post = crash_after_first_part
+        ctl.accept_report(report(env, "phase-1"))
+        ctl.transition("review", "t")
+        with self.assertRaises(KeyboardInterrupt):
+            ctl.review_round()
+        env.commit("feature.txt", "moved\n", "push")
+        env.push()
+        restarted = env.controller()
+        with self.assertRaises(ar.Stop):
+            restarted.review_round()
+        self.assertEqual("superseded", restarted.state["publications"]["r01-review"]["state"])
+        self.assertFalse(restarted.missing_publications())
+        self.assertIn("Workflow — correction", env.gh.headings()[-1])
+
+    def test_reviewer_inbox_carries_complete_prior_findings(self):
+        """R2-F2."""
+        env = self.env
+        env.reviewer.script = [{"decision": "changes_required", "findings": [finding("R1-F1")]},
+                               {"decision": "checkpoint_passed", "assessments": [("R1-F1", "fix_verified")]}]
+        ctl = env.controller()
+        self.submit(ctl, "phase-1")
+        sha = env.commit("feature.txt", "fix\n", "fix")
+        env.push()
+        self.submit(ctl, "phase-1", [fixed("R1-F1", sha)])
+        prior = ar.read_json(ctl.dir / "rounds" / "r02" / "prior-findings.json")["ledger"]["R1-F1"]
+        self.assertEqual("e", prior["finding"]["expected"])
+        self.assertEqual("c", prior["finding"]["requested_correction"])
+        self.assertEqual(1, prior["finding_round"])
+
+    def test_resume_of_a_completed_enrollment_rechecks_the_handoff(self):
+        """R2-F6."""
+        env = self.env
+        ctl = env.controller()
+        self.to_finalize(ctl)
+        self.assertEqual("AWAITING_OWNER_REVIEW", ctl.finalize())
+        ctl.state.update(status="PAUSED", status_reason="operational failure during resume")  # transient error
+        self.assertIn("AWAITING_OWNER_REVIEW", ctl.resume("retry"))
+        self.assertEqual(("AWAITING_OWNER_REVIEW", "done"), (ctl.state["status"], ctl.state["phase"]))
 
 
 class ToolTranscriptTests(unittest.TestCase):

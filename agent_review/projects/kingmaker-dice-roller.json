@@ -30,9 +30,7 @@
         "PowerShell(.\\scripts\\Validate-Repository.ps1)",
         "Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Validate-Repository.ps1*)",
         "Bash(dotnet build *)",
-        "PowerShell(dotnet build *)",
-        "Bash(python tools/*)",
-        "PowerShell(python tools/*)"
+        "PowerShell(dotnet build *)"
       ],
       "deny": [
         "PowerShell(.\\scripts\\Install.ps1*)",
