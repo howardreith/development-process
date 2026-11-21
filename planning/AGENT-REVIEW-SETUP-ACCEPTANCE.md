@@ -46,8 +46,8 @@ simulations.
 
 | Row | Result | Evidence |
 |---|---|---|
-| WF01 | Pass (real) | Every developer invocation and review round records requested and observed provenance from CLI and API metadata, not from model statements. Live task: 4 developer invocations were `claude-opus-5-5` with transcript effort `high`, and 4 Astra rounds were `gpt-6.2-astra`/`high`, read-only, approval `never`, network `restricted`. Mismatches block (wrong-model tests, shared `developer_model_problem`). |
-| WF02 | Pass (real) | development-process PR #1 received 12 review requests and 12 independent Astra results, each for its fixed candidate (H/B/M in every request). Live PR #2 received 4. |
+| WF01 | Pass (real) | Every developer invocation and review round records requested and observed provenance from CLI and API metadata, not from model statements. Live task: 4 developer invocations were `claude-opus-5-5` with transcript effort `high`, and 5 Astra rounds were `gpt-6.2-astra`/`high`, read-only, approval `never`, network `restricted`. Mismatches block (wrong-model tests, shared `developer_model_problem`). |
+| WF02 | Pass (real) | development-process PR #1 received 12 review requests and 12 independent Astra results, each for its fixed candidate (H/B/M in every request). Live PR #2 received 5. |
 | WF03 | Pass (real) | Real finding cycles. On PR #1, findings were fixed, rebutted (three rebuttals accepted under addendum 3) and rechecked; controller-core passed in round 12. On live PR #2, the unattended headless developer received 6 genuine findings, posted dispositions with corrective commits, and the reviewer verified all six by round 4. No defect was introduced deliberately. |
 | WF04 | Pass (fixture) | Stale or moved H, B or M, archive-only successors and a changed review contract all invalidate reuse (StaleCandidateTests, request-contract tests, live-branch-head readiness). |
 | WF05 | Pass (fixture) | Wrong model, malformed or truncated output, a failed process, missing fields, duplicate JSON members and conflicting provenance cannot produce readiness (InvalidReviewTests, provenance tests). |
@@ -56,7 +56,7 @@ simulations.
 | WF08 | Pass (real, fixture) | The no-progress stop fired visibly on PR #1 and on live PR #2. Exhausted budgets, unresolved correctness findings and missing or failed required gates block with a visible status. |
 | WF09 | Pass (fixture, real) | Transcript-only archive commits preserve readiness only under the inventory and hash check. Live PR #2 archived its records as transcript-only commits after the reviewed candidate. |
 | WF10 | Pass (fixture) | Wrong repository, PR, actor or marker is refused before dispatch. Comment text is never executed. Helpers require enrollment authority under a lock. Headless permissions are isolated (the `permissions` gate shows real launches denying a user-level allowance). |
-| WF11 | See below | Live PR #2 final handoff. |
+| WF11 | Pass (real) | Live PR #2 ended AWAITING_OWNER_REVIEW: a draft with no requested reviewers, a handoff receipt naming reviewed source `bc4b300` and transcript-only archive `b89fa6c`, and a PR status section. The effective permissions and the exact launch, resume and stop commands are in `agent_review/README.md`. |
 | WF12 | Pass (real, fixture) | On PR #1, controller-core (intermediate) passed and advanced to setup-final without owner input. Fixture: HeadlessCycleTests. |
 
 ### Live task (development-process PR #2)
@@ -68,7 +68,7 @@ unattended, and was enrolled with the installed controller.
 - Development: 4 Claude Opus/high invocations in one session (about 15 min
   each). The developer's own `push` and `verify --gate unit` helpers ran, and a
   passing unit receipt is bound to each of the 4 candidates.
-- Review: 4 Astra rounds published on the PR with dispositions between them.
+- Review: 5 Astra rounds published on the PR, with dispositions between them.
   6 defects were found and verified fixed: malformed registry entries,
   damaged state, relative state roots, link and network-path inspection,
   cross-enrollment state, and an unreadable registry.
@@ -82,6 +82,10 @@ unattended, and was enrolled with the installed controller.
   The pause was safe. The fix waits a bounded time for the PR view when the
   branch itself is already at the archive head (FirstReleaseTests
   `test_handoff_waits_for_a_lagging_pr_view`).
+- Handoff: the fixed version was activated between runs, so the same work was
+  reviewed again under it (round 5: `ready_for_owner_review`, 5 of 5 rounds
+  used). Finalize then completed: AWAITING_OWNER_REVIEW, reviewed source
+  `bc4b300`, archive `b89fa6c`.
 
 ### Supported limitations (addendum 3)
 
