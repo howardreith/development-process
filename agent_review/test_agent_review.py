@@ -3855,6 +3855,74 @@ class FirstReleaseTests(Base):
         self.assertIn("not an allowed", stop.exception.reason)
 
 
+class EnrollmentOwnershipTests(Base):
+    """R13-F1: enrollment ownership must not depend on the caller's directory, and a claim whose prior state cannot
+    be established is never replaced."""
+
+    def claims(self):
+        env = self.env
+        reg = ar.registry_path("owner/repo", env.branch)
+        marker = Path(git(env.work, "rev-parse", "--absolute-git-dir")) / "agent-review-enrollment.json"
+        return {path: path.read_bytes() for path in (reg, marker)}
+
+    def test_relative_state_root_is_resolved_and_a_second_enrollment_elsewhere_is_refused(self):
+        env = self.env
+        state = ar.read_json(env.dir / "state.json")
+        state["status"] = "CANCELLED"  # release the fixture's own enrollment
+        ar.atomic_write_json(env.dir / "state.json", state)
+        first, second = env.root / "first-cwd", env.root / "second-cwd"
+        first.mkdir()
+        second.mkdir()
+        saved = os.getcwd()
+        self.addCleanup(os.chdir, saved)
+        os.chdir(first)
+        folder, state = ar.enroll(env.args(state_root="relative-state"), github=env.gh, root=env.wf)
+        self.assertTrue(folder.is_absolute())
+        self.assertEqual((first / "relative-state").resolve(), folder.parent)
+        before = self.claims()
+        for data in before.values():
+            self.assertTrue(Path(json.loads(data)["dir"]).is_absolute())
+        os.chdir(second)  # e.g. status run from the developer worktree
+        self.assertEqual(folder, ar.find_enrollment(state["enrollment_id"]))
+        self.assertTrue((ar.find_enrollment(state["enrollment_id"]) / "state.json").is_file())
+        with self.assertRaises(ar.UsageError) as refused:
+            ar.enroll(env.args(state_root="relative-state"), github=env.gh, root=env.wf)
+        self.assertIn("active enrollment", str(refused.exception))
+        self.assertEqual(before, self.claims())  # both original claims intact
+        self.assertFalse((second / "relative-state").exists() and any((second / "relative-state").iterdir()))
+
+    def test_claim_whose_prior_state_cannot_be_established_is_not_replaced(self):
+        env = self.env
+        before = self.claims()
+        state_file = env.dir / "state.json"
+        hidden = env.root / "hidden-state.json"
+        state_file.rename(hidden)  # absolute claim, prior state unavailable (the developer may still be running)
+        with self.assertRaises(ar.UsageError) as refused:
+            ar.enroll(env.args(state_root=str(env.root / "elsewhere")), github=env.gh, root=env.wf)
+        self.assertIn("cannot be verified", str(refused.exception))
+        self.assertIn("missing", str(refused.exception))
+        self.assertEqual(before, self.claims())
+        self.assertFalse((env.root / "elsewhere").exists() and any((env.root / "elsewhere").iterdir()))
+        reg = next(iter(before))
+        for label, text in (("unreadable state", "{not json"), ("foreign state", '{"enrollment_id": "other"}')):
+            with self.subTest(label):
+                state_file.write_text(text, encoding="utf-8")
+                with self.assertRaises(ar.UsageError) as refused:
+                    ar.enroll(env.args(state_root=str(env.root / "elsewhere")), github=env.gh, root=env.wf)
+                self.assertIn("cannot be verified", str(refused.exception))
+                self.assertEqual(before, self.claims())
+        hidden.replace(state_file)
+        for label, claim in (("relative claim", dict(json.loads(before[reg]), dir="relative-state/x")),
+                             ("malformed claim", ["not", "a", "claim"])):
+            with self.subTest(label):
+                ar.atomic_write_json(reg, claim)
+                with self.assertRaises(ar.UsageError) as refused:
+                    ar.enroll(env.args(state_root=str(env.root / "elsewhere")), github=env.gh, root=env.wf)
+                self.assertIn("cannot be verified", str(refused.exception))
+        reg.write_bytes(before[reg])
+        self.assertEqual(before, self.claims())
+
+
 class ToolTranscriptTests(unittest.TestCase):
     def test_extracts_recorded_commands_and_outputs_since_a_time(self):
         """Executed-validation evidence for the read-only reviewer, from the CLI-recorded session log."""

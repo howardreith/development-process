@@ -46,7 +46,7 @@ simulations.
 
 | Row | Result | Evidence |
 |---|---|---|
-| WF01 | Pass (real) | Every developer invocation and review round records requested and observed provenance from CLI and API metadata, not from model statements. Live task: 4 developer invocations were `claude-opus-5-5` with transcript effort `high`, and 5 Astra rounds were `gpt-6.2-astra`/`high`, read-only, approval `never`, network `restricted`. Mismatches block (wrong-model tests, shared `developer_model_problem`). |
+| WF01 | Pass (real) | Every developer invocation and review round records requested and observed provenance from CLI and API metadata, not from model statements. Live task: all 5 developer invocations were `claude-opus-5-5` with transcript effort `high`, and all 5 Astra rounds were `gpt-6.2-astra`/`high`, read-only, approval `never`, network `restricted`. Mismatches block (wrong-model tests, shared `developer_model_problem`). |
 | WF02 | Pass (real) | development-process PR #1 received 12 review requests and 12 independent Astra results, each for its fixed candidate (H/B/M in every request). Live PR #2 received 5. |
 | WF03 | Pass (real) | Real finding cycles. On PR #1, findings were fixed, rebutted (three rebuttals accepted under addendum 3) and rechecked; controller-core passed in round 12. On live PR #2, the unattended headless developer received 6 genuine findings, posted dispositions with corrective commits, and the reviewer verified all six by round 4. No defect was introduced deliberately. |
 | WF04 | Pass (fixture) | Stale or moved H, B or M, archive-only successors and a changed review contract all invalidate reuse (StaleCandidateTests, request-contract tests, live-branch-head readiness). |
@@ -65,9 +65,21 @@ Mission `planning/LIST-COMMAND-MISSION.md`: a read-only `list` command. It used
 the plan `list-command` with the `unit` gate required, ran headless and
 unattended, and was enrolled with the installed controller.
 
-- Development: 4 Claude Opus/high invocations in one session (about 15 min
-  each). The developer's own `push` and `verify --gate unit` helpers ran, and a
-  passing unit receipt is bound to each of the 4 candidates.
+- Development: 5 Claude Opus/high invocations in one session (about 15 min
+  each for the implementation work). The developer's own `push` and
+  `verify --gate unit` helpers ran, and a passing unit receipt is bound to each
+  of the 5 reviewed candidates:
+
+  | Round | Candidate H | What it was | Decision |
+  |---|---|---|---|
+  | 1 | `af2d176` | Implementation | `changes_required` |
+  | 2 | `b0df762` | Corrections (R1-F1..F4) | `changes_required` |
+  | 3 | `b66d172` | Corrections (R1-F3, R1-F4, R2-F1) | `changes_required` |
+  | 4 | `c391eff` | Corrections (R1-F4, R3-F1) | `ready_for_owner_review` |
+  | 5 | `bc4b300` | Transcript-only successor of `c391eff` (adds only archive records); the fifth invocation submitted a fresh report and unit run for it after the activation described below | `ready_for_owner_review` |
+
+  The implementation work therefore consists of four candidates from four
+  invocations; the fifth invocation changed no source.
 - Review: 5 Astra rounds published on the PR, with dispositions between them.
   6 defects were found and verified fixed: malformed registry entries,
   damaged state, relative state roots, link and network-path inspection,
@@ -87,11 +99,33 @@ unattended, and was enrolled with the installed controller.
   used). Finalize then completed: AWAITING_OWNER_REVIEW, reviewed source
   `bc4b300`, archive `b89fa6c`.
 
+**Handoff readback (2026-11-21, read from GitHub and the enrollment state).**
+`gh pr view 2` reports an open draft, no requested reviewers, head
+`b89fa6c72dd56de945b255d3320e19059bd30065`. The handoff status comment
+(`key=final-status-b89fa6c72d`, posted 2026-11-21T08:09:52Z) names reviewed
+source H `bc4b30043bc952e204fb76d0dfc423055d99c117` (round 5, Codex
+`gpt-6.2-astra`/`high`), archive A `b89fa6c…`, merge base
+`2e8f58127ea0…`, reviewed target tip `7358a159057a…`, the observed developer
+session (init `claude-opus-5-5`, effort `high`), and no open non-blocking
+items. `git diff --stat bc4b300 b89fa6c` shows only four added transcript files
+under `docs/agent-reviews/pr-2/` (264 lines). `status --remote` reports
+AWAITING_OWNER_REVIEW, `handoff_current: true`, no pending publications, and no
+running developer.
+
+**Integration status.** PR #2 is stacked on the PR #1 branch, which has moved
+since PR #2 branched; GitHub reports it as conflicting. A three-way merge is
+clean for the controller and tests and has one README conflict, where PR #1's
+Black Tentacles section and PR #2's `list` documentation were added at the same
+place (both are kept). The owner's sequence: land PR #1, retarget PR #2 to
+`main`, merge `main` into it, resolve the README, run the required validation on
+the combined candidate and review the integration change.
+
 ### Supported limitations (addendum 3)
 
 See `agent_review/README.md`, section "First-release scope and limitations".
 One controller and one developer per worktree, run sequentially. Controller
 version and project config stay fixed during a run. Safe pauses with owner
 recovery instead of seamless recovery. No migration of predecessor state
-formats. Costs: Claude reports list-price estimates on subscription auth (for
+formats. A claim whose enrollment state cannot be read is refused instead of
+replaced (round 13, R13-F1). Costs: Claude reports list-price estimates on subscription auth (for
 example about $4.27 for one live-task invocation); Codex reports tokens only.

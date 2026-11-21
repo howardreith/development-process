@@ -233,6 +233,7 @@ Deferred or not supported in this release. These are refused or paused rather th
 | Upgrading the controller or refreshing project config during an active run | Not supported during a run. `activate` is an explicit owner action; it invalidates in-progress review results and requires a fresh review |
 | Migrating experimental predecessor state formats | Not supported; an incompatible state version is refused (`unsupported enrollment state version`) |
 | Automatic recovery from ambiguous publication (a POST whose outcome is unknown) | Pauses; the owner checks the PR and resumes with `--resend-undelivered` |
+| Replacing an ownership claim whose enrollment state is missing, unreadable, foreign or recorded as a relative path | Refused (ownership needs inspection). If that enrollment is truly gone and no developer from it is running, remove the claim file by hand. State roots are resolved to absolute paths at enrollment |
 | Merge, release, tagging, requesting reviewers | Never performed |
 
 Working on the controller itself: review it with a fixed installed version. Run that enrollment's commands
@@ -281,15 +282,42 @@ timeout. A review of the ~3,000-line controller took 5–6 minutes and about
 
 ```powershell
 python C:/Dev/development-process/agent_review/agent_review.py install --dest C:/Dev/agent-review
-python $ar activate --enrollment <id>   # for each running enrollment, after reviewing the change
+python $ar activate --enrollment <id>   # per enrollment, between runs, after reviewing the change
 ```
 
-`install` refuses while any controller holds a lock. To disable: `stop` or
-`cancel` running enrollments, delete or rename `C:\Dev\agent-review\`, and
-remove the allowances from `~/.claude-personal/settings.json`. State in
-`~/.agent-review\` and claims in `C:\ProgramData\agent-review\` can then be
-deleted. No GitHub settings, tokens, Actions or webhooks exist to revoke;
-Codex configuration was never edited.
+**Install and activate.** `install` adds a new immutable version under
+`C:\Dev\agent-review\versions\` and points `current.json` at it. Existing
+versions are never modified or removed, so it does not wait for running
+controllers: a running controller and its helpers keep the code they loaded,
+and each enrollment stays pinned to its version. Under the new version an
+enrollment pauses until you `activate` it. Activation is an explicit owner
+decision between runs; results validated under the old version are reviewed
+again.
+
+**Pause (keep everything for later).** `stop` only writes a stop request and
+returns at once. The controller pauses at its next safe boundary, and an active
+developer invocation first finishes its own work and any runtime restoration.
+Wait until `status` shows a status other than `ACTIVE`, `developer_running`
+false and `lock_holder` null. Keep the installed version and the state, then
+continue with `resume`.
+
+**Permanent disable.** Do not delete anything right after `stop`.
+1. `stop` each running enrollment and wait for the paused state above. For a
+   project with `runtime_lock_paths`, also wait until those lock files are gone
+   (the runtime was restored).
+2. `cancel --reason …` each remaining enrollment (ACTIVE, PAUSED, BLOCKED or
+   AWAITING_OWNER_REVIEW). Cancel itself refuses, leaving the enrollment PAUSED,
+   while a developer, a push/verify helper or a runtime transaction is still
+   live. Repeat it until it reports `CANCELLED`, which releases both ownership
+   claims.
+3. Only then delete or rename `C:\Dev\agent-review\`, remove the allowances
+   from `~/.claude-personal/settings.json`, and delete the state in
+   `~/.agent-review\` and the host files in `C:\ProgramData\agent-review\`.
+
+No GitHub settings, tokens, Actions or webhooks exist to revoke, and the Codex
+configuration was never edited. A claim whose enrollment state is missing or
+unreadable blocks a new enrollment of that branch until you inspect it (see
+"First-release scope and limitations").
 
 ## Tests
 
