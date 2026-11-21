@@ -166,6 +166,7 @@ git -C C:/Dev/<repo> worktree add -b claude/<feature> <worktree> origin/<default
 # commit the mission file (or a first change) and push it
 python $ar enroll  --project <name> --worktree <worktree> --plan single --mission <MISSION.md> --mode headless
 python $ar run     --enrollment <id>      # develop → verify → review → correct → … → owner handoff
+python $ar list                          # every enrollment on this machine (read-only)
 python $ar status  --enrollment <id> [--remote]
 python $ar stop    --enrollment <id> --reason "..."
 python $ar resume  --enrollment <id> --reason "what changed" [--max-rounds N]
@@ -175,6 +176,17 @@ python $ar cancel  --enrollment <id> --reason "..."
 Plans with intermediate checkpoints and `required_gates` go in `plans/` (or
 `~/.agent-review/plans/`). Exit codes: 0 done/awaiting owner, 2 BLOCKED,
 3 PAUSED, 4 refused.
+
+`list` prints a JSON array with one object per claim in the host registry
+(`%ProgramData%\agent-review\registry`), sorted by enrollment ID: `enrollment`,
+`repository`, `branch`, and from that enrollment's `state.json` `status`,
+`phase`, `pr` (number or null) and `updated_at`. It is strictly read-only: no
+locks, no writes and no network or GitHub calls, so it is safe while
+controllers run. A claim whose state file (or the claim itself) is missing or
+unreadable is still listed, with `status` `"unknown"` and an `error` field
+saying why; one damaged enrollment never fails the listing. Cancelled
+enrollments release their claim and are not listed. Use `status --enrollment
+<id>` for the full detail of one enrollment.
 
 `stop` writes a `STOP` file; the developer finishes or restores its current
 transaction, commits, pushes and returns `paused`. At the soft deadline (8 h)

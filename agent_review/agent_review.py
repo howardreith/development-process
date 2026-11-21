@@ -4042,6 +4042,45 @@ def find_enrollment(value):
     raise UsageError(f"enrollment {value} is not registered under {folder}")
 
 
+def list_enrollments():
+    """Every enrollment claim in the host registry with its state summary, sorted by enrollment ID. Strictly
+    read-only: no locks, no writes (not even creating the registry folder), no network or GitHub calls. A damaged
+    claim or state file is reported (status "unknown" with an error) instead of failing the whole listing."""
+    folder = host_dir() / "registry"
+    rows = []
+    for entry in sorted(folder.glob("*.json")) if folder.is_dir() else []:
+        row = {"enrollment": None, "repository": None, "branch": None,
+               "status": "unknown", "phase": None, "pr": None, "updated_at": None}
+        try:
+            claim = read_json(entry)
+            if not isinstance(claim, dict):
+                raise ValueError("claim is not a JSON object")
+        except (OSError, ValueError) as exc:
+            rows.append({**row, "error": f"claim {entry.name} is unreadable: {exc}"})
+            continue
+        row.update(enrollment=claim.get("enrollment_id"), repository=claim.get("repository"),
+                   branch=claim.get("branch"))
+        if not claim.get("dir"):
+            rows.append({**row, "error": f"claim {entry.name} names no enrollment directory"})
+            continue
+        state_path = Path(claim["dir"]) / "state.json"
+        try:
+            state = read_json(state_path)
+            if not isinstance(state, dict):
+                raise ValueError("state is not a JSON object")
+        except FileNotFoundError:
+            rows.append({**row, "error": f"state file is missing: {state_path}"})
+            continue
+        except (OSError, ValueError) as exc:
+            rows.append({**row, "error": f"state file is unreadable: {state_path}: {exc}"})
+            continue
+        pr = state.get("pr")
+        row.update(status=state.get("status", "unknown"), phase=state.get("phase"),
+                   pr=pr.get("number") if isinstance(pr, dict) else None, updated_at=state.get("updated_at"))
+        rows.append(row)
+    return sorted(rows, key=lambda r: (not isinstance(r["enrollment"], str), str(r["enrollment"] or "")))
+
+
 COMMAND_STATUSES = {"run": {"ACTIVE"}, "review": {"ACTIVE"}, "finalize": {"ACTIVE"},
                     "archive": {"ACTIVE", "PAUSED", "BLOCKED", "AWAITING_OWNER_REVIEW"},
                     "resume": {"ACTIVE", "PAUSED", "BLOCKED", "AWAITING_OWNER_REVIEW"},
@@ -4111,6 +4150,7 @@ def main(argv=None):
     p = sub.add_parser("check-project", help="validate a project config against its repository and GitHub")
     p.add_argument("--project", required=True)
     p.add_argument("--repo", required=True)
+    sub.add_parser("list", help="read-only: every enrollment registered on this machine, with its status")
     p = sub.add_parser("enroll", help="enroll a branch, draft PR, mission and plan")
     p.add_argument("--project", required=True)
     p.add_argument("--worktree", required=True)
@@ -4202,6 +4242,9 @@ def main(argv=None):
             problems, facts = check_project(load_project(args.project), args.repo)
             print(json.dumps({"project": args.project, "problems": problems, **facts}, indent=2))
             return EXIT_OK if not problems else EXIT_BLOCKED
+        if args.command == "list":
+            print(json.dumps(list_enrollments(), indent=2))
+            return EXIT_OK
         if args.command == "enroll":
             folder, state = enroll(args)
             print(json.dumps({"enrollment": state["enrollment_id"], "dir": str(folder), "pr": state["pr"]["url"],

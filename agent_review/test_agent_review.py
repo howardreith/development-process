@@ -3835,6 +3835,88 @@ class FirstReleaseTests(Base):
         self.assertIn("not an allowed", stop.exception.reason)
 
 
+def tree_snapshot(root):
+    """Every file and directory under root with its size and modification time: any write shows up as a change."""
+    return {str(p.relative_to(root)): (p.is_dir(), p.stat().st_size if p.is_file() else 0, p.stat().st_mtime_ns)
+            for p in sorted(Path(root).rglob("*"))}
+
+
+@contextlib.contextmanager
+def forbid_processes_and_network(test):
+    """Tripwire, not a simulated response: fails the test if the code under test starts any process (git, gh) or
+    opens a network connection. Nothing is answered on the code's behalf."""
+    from unittest import mock
+
+    def refuse(what):
+        def _refuse(*args, **kwargs):
+            test.fail(f"read-only command attempted {what}: {args[:1]}")
+        return _refuse
+    with mock.patch.object(subprocess, "Popen", side_effect=refuse("a process")), \
+            mock.patch.object(socket.socket, "connect", refuse("a network connection")), \
+            mock.patch.object(socket, "create_connection", side_effect=refuse("a network connection")):
+        yield
+
+
+class ListCommandTests(Base):
+    """Mission: read-only `list` of every enrollment claim in the host registry."""
+
+    def run_list(self):
+        with forbid_processes_and_network(self), contextlib.redirect_stdout(io.StringIO()) as out:
+            code = ar.main(["list"])
+        self.assertEqual(ar.EXIT_OK, code)
+        return out.getvalue()
+
+    def test_lists_an_enrollment_with_its_fields_without_locks_or_writes(self):
+        env = self.env
+        ctl = env.controller()
+        ctl.save()  # stamps updated_at, as every controller transition does
+        self.assertTrue(ctl.state["updated_at"])
+        claim = ar.registry_path("owner/repo", env.branch)
+        self.assertTrue(claim.exists())
+        with ctl.lock("run"):  # the owning controller holds its writer lock: list neither waits nor is refused
+            before = tree_snapshot(env.root)
+            rows = json.loads(self.run_list())
+            self.assertEqual(before, tree_snapshot(env.root))  # nothing written, no lock or holder files
+        self.assertEqual([{"enrollment": ctl.state["enrollment_id"], "repository": "owner/repo",
+                           "branch": env.branch, "status": "ACTIVE", "phase": ctl.state["phase"], "pr": 7,
+                           "updated_at": ctl.state["updated_at"]}], rows)
+        self.assertEqual(ctl.state["status"], rows[0]["status"])
+
+    def test_empty_registry_prints_an_empty_array(self):
+        env = self.env
+        ctl = env.controller()
+        ctl.verify_inputs()
+        self.assertEqual("CANCELLED", ctl.cancel("owner decision"))  # releases the only claim
+        self.assertEqual([], list((ar.host_dir() / "registry").glob("*.json")))
+        self.assertEqual("[]", self.run_list().strip())
+        from unittest import mock
+        absent = env.root / "fresh-host"  # a machine where nothing was ever enrolled
+        with mock.patch.dict(os.environ, {"AGENT_REVIEW_HOST_DIR": str(absent)}):
+            self.assertEqual("[]", self.run_list().strip())
+        self.assertFalse(absent.exists())  # list does not even create the registry folder
+
+    def test_damaged_enrollments_are_reported_unknown_without_failing(self):
+        env = self.env
+        ctl = env.controller()
+        enrollment = ctl.state["enrollment_id"]
+        (env.dir / "state.json").write_text("{ not json", encoding="utf-8")  # damaged state file
+        registry = ar.host_dir() / "registry"
+        ar.atomic_write_json(registry / "other.json", {"enrollment_id": "a-missing-state", "dir": str(env.root / "gone"),
+                                                        "repository": "owner/other", "branch": "claude/x"})
+        (registry / "zz-broken.json").write_text("garbage", encoding="utf-8")  # damaged claim itself
+        rows = json.loads(self.run_list())
+        self.assertEqual(["a-missing-state", enrollment, None], [r["enrollment"] for r in rows])  # sorted by ID
+        missing, damaged, broken = rows
+        self.assertEqual(("unknown", "owner/other", "claude/x", None, None),
+                         (missing["status"], missing["repository"], missing["branch"], missing["pr"], missing["phase"]))
+        self.assertIn("missing", missing["error"])
+        self.assertIn(str(env.root / "gone"), missing["error"])
+        self.assertEqual(("unknown", "owner/repo", env.branch), (damaged["status"], damaged["repository"], damaged["branch"]))
+        self.assertIn("unreadable", damaged["error"])
+        self.assertEqual("unknown", broken["status"])
+        self.assertIn("zz-broken.json", broken["error"])
+
+
 class ToolTranscriptTests(unittest.TestCase):
     def test_extracts_recorded_commands_and_outputs_since_a_time(self):
         """Executed-validation evidence for the read-only reviewer, from the CLI-recorded session log."""
