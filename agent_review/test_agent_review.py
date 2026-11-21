@@ -3811,6 +3811,26 @@ class FirstReleaseTests(Base):
         del ctl.cfg["required_gates"]  # default: every declared gate is required
         self.assertEqual(["extra", "unit"], ctl.required_gates())
 
+    def test_handoff_waits_for_a_lagging_pr_view(self):
+        """Live task (PR #2): right after the archive push, GitHub's PR view still showed the previous head and
+        finalize blocked on every attempt. When the branch itself is already at the archive head, readiness waits a
+        bounded time for the PR view; a PR view that never catches up still blocks."""
+        env = self.env
+        ctl = env.controller()
+        self.to_finalize(ctl)
+        stale = git(env.work, "rev-parse", "HEAD")
+        real_pr, calls = env.gh.pr, {"n": 0}
+
+        def lagging_pr(number):
+            data = real_pr(number)
+            calls["n"] += 1
+            if calls["n"] <= 3:
+                data["headRefOid"] = stale  # the previous head, as GitHub reported it for a few seconds
+            return data
+        env.gh.pr = lagging_pr
+        self.assertEqual("AWAITING_OWNER_REVIEW", ctl.finalize())
+        self.assertGreater(calls["n"], 3)
+
     def test_preflight_uses_the_same_developer_model_check(self):
         """R11-F2."""
         cfg = {"developer": {"allowed_model_pattern": "^claude-opus-", "model": "opus"}}

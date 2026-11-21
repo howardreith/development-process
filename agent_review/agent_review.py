@@ -2909,6 +2909,13 @@ class Controller:
         if not ok:
             reasons.append("material change after the reviewed candidate: " + "; ".join(why))
         pr = self.pr_view()
+        if pr["headRefOid"] != archive_head and self.git.remote_head(self.state["branch"]) == archive_head:
+            # the branch is already at A: GitHub's PR view lags a push by seconds; wait a bounded time for it
+            for _ in range(int(self.limits.get("pr_view_wait_attempts", 12))):
+                self.sleep(self.limits.get("pr_view_wait_seconds", 5))
+                pr = self.pr_view()
+                if pr["headRefOid"] == archive_head:
+                    break
         if pr["headRefOid"] != archive_head:
             reasons.append(f"PR head {short(pr['headRefOid'])} is not {short(archive_head)}")
         unresolved = sorted(k for k, p in self.state.get("publications", {}).items()

@@ -176,6 +176,29 @@ Plans with intermediate checkpoints and `required_gates` go in `plans/` (or
 `~/.agent-review/plans/`). Exit codes: 0 done/awaiting owner, 2 BLOCKED,
 3 PAUSED, 4 refused.
 
+### Prepared mission: Black Tentacles (not started)
+
+The `black-tentacles` plan keeps the mission
+(`C:\Dev\KingmakerGunslingerLab\BLACK-TENTACLES-MISSION.md`, hash-pinned at
+enrollment) as the contract. It reviews automatically after Phases 0–1
+(intermediate) and at the complete Phase 4 candidate (final), and both require
+the `focused` gate. The exact start sequence is in the tabletop repository's
+`docs/AGENT-REVIEW-WORKFLOW.md` (draft PR #194):
+
+```powershell
+$ar   = 'C:/Dev/agent-review/agent_review.py'
+$repo = 'C:/Dev/KingmakerGunslingerLab/repo/KingmakerGunslinger'
+$wt   = 'C:/Dev/KingmakerGunslingerLab/worktrees/black-tentacles'
+git -C $repo fetch origin
+git -C $repo worktree add -b codex/black-tentacles $wt origin/master
+Copy-Item C:/Dev/KingmakerGunslingerLab/BLACK-TENTACLES-MISSION.md "$wt/planning/BLACK-TENTACLES-MISSION.md"
+git -C $wt add planning/BLACK-TENTACLES-MISSION.md
+git -C $wt commit -m "Add Black Tentacles mission contract"
+Push-Location $wt; powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:/Dev/KingmakerGunslingerLab/codex-policy/Push-KingmakerGunslinger.ps1; Pop-Location
+python $ar enroll --project kingmaker-gunslinger --worktree $wt --plan black-tentacles --mission C:/Dev/KingmakerGunslingerLab/BLACK-TENTACLES-MISSION.md --mode headless --title "[draft] Black Tentacles"
+python $ar run --enrollment <id printed by enroll>
+```
+
 `stop` writes a `STOP` file; the developer finishes or restores its current
 transaction, commits, pushes and returns `paused`. At the soft deadline (8 h)
 the controller requests that stop itself; after the grace period (1 h) it
