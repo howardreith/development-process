@@ -1,0 +1,85 @@
+{
+  "schema_version": "agent-review.project.v1",
+  "project_id": "theatre",
+  "repository": "howardreith/theatre-game",
+  "allowed_remote_urls": [
+    "https://github.com/howardreith/theatre-game.git",
+    "git@github.com:howardreith/theatre-game.git"
+  ],
+  "default_target_branch": "main",
+  "branch_pattern": "^claude/[a-z0-9][a-z0-9._/-]*$",
+  "expected_actor": "howardreith",
+  "transcript_dir": "docs/agent-reviews",
+  "instructions": [
+    "AGENTS.md",
+    "CLAUDE.md"
+  ],
+  "developer": {
+    "executable": "%USERPROFILE%/.local/bin/claude.exe",
+    "config_dir": "%USERPROFILE%/.claude-personal",
+    "model": "opus",
+    "effort": "high",
+    "allowed_model_pattern": "^claude-opus-",
+    "soft_deadline_minutes": 480,
+    "grace_minutes": 60,
+    "permissions": {
+      "allow": [
+        "PowerShell(.\\scripts\\theatre.ps1 validate*)",
+        "PowerShell(.\\scripts\\theatre.ps1 test*)",
+        "PowerShell(.\\scripts\\theatre.ps1 doctor*)",
+        "Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/theatre.ps1 validate*)",
+        "Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/theatre.ps1 test*)"
+      ],
+      "deny": [
+        "PowerShell(.\\scripts\\theatre.ps1 export*)"
+      ]
+    }
+  },
+  "reviewer": {
+    "executable": "codex",
+    "codex_home": "~/.codex",
+    "model": "gpt-6.2-astra",
+    "effort": "high",
+    "timeout_minutes": 60,
+    "extra_config": [
+      "windows.sandbox=\"elevated\""
+    ],
+    "disabled_features": [
+      "multi_agent",
+      "apps",
+      "plugins",
+      "image_generation",
+      "computer_use",
+      "browser_use",
+      "in_app_browser",
+      "hooks",
+      "memories"
+    ]
+  },
+  "limits": {
+    "max_review_rounds_per_checkpoint": 5,
+    "max_review_attempts_per_round": 3,
+    "max_developer_invocations": 30,
+    "no_progress_rounds": 3,
+    "publication_attempts": 4,
+    "retry_backoff_seconds": [
+      30,
+      120
+    ]
+  },
+  "runtime_lock_paths": [],
+  "gates": {
+    "validate": {
+      "argv": [
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "scripts/theatre.ps1",
+        "validate"
+      ],
+      "timeout_minutes": 30
+    }
+  }
+}

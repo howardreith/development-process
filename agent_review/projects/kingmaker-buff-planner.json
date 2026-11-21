@@ -1,0 +1,124 @@
+{
+  "schema_version": "agent-review.project.v1",
+  "project_id": "kbp",
+  "repository": "howardreith/KingmakerBuffPlanner",
+  "allowed_remote_urls": [
+    "https://github.com/howardreith/KingmakerBuffPlanner.git",
+    "git@github.com:howardreith/KingmakerBuffPlanner.git"
+  ],
+  "default_target_branch": "main",
+  "branch_pattern": "^codex/kingmaker-buff-planner([-/][a-z0-9][a-z0-9._/-]*)?$",
+  "expected_actor": "howardreith",
+  "push_command": [
+    "powershell.exe",
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    "C:/Dev/KingmakerBuffPlannerLab/codex-policy/Push-KingmakerBuffPlanner.ps1",
+    "-RepositoryRoot",
+    "{repo_root}"
+  ],
+  "transcript_dir": "docs/agent-reviews",
+  "instructions": [
+    "AGENTS.md",
+    "docs/VALIDATION-POLICY.md"
+  ],
+  "developer": {
+    "executable": "%USERPROFILE%/.local/bin/claude.exe",
+    "config_dir": "%USERPROFILE%/.claude-personal",
+    "model": "opus",
+    "effort": "high",
+    "allowed_model_pattern": "^claude-opus-",
+    "soft_deadline_minutes": 480,
+    "grace_minutes": 60,
+    "permissions": {
+      "allow": [
+        "PowerShell(.\\scripts\\Test-Development.ps1 *)",
+        "PowerShell(.\\scripts\\Test-Development.ps1)",
+        "Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Test-Development.ps1*)",
+        "PowerShell(.\\scripts\\Test-RuntimeLauncherArguments.ps1 *)",
+        "PowerShell(.\\scripts\\Test-RuntimeLauncherArguments.ps1)",
+        "Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Test-RuntimeLauncherArguments.ps1*)",
+        "PowerShell(.\\scripts\\Test-RuntimeLauncherFileArguments.ps1 *)",
+        "PowerShell(.\\scripts\\Test-RuntimeLauncherFileArguments.ps1)",
+        "Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Test-RuntimeLauncherFileArguments.ps1*)",
+        "PowerShell(.\\scripts\\Invoke-KingmakerRuntimeTest.ps1 *)",
+        "PowerShell(.\\scripts\\Invoke-KingmakerRuntimeTest.ps1)",
+        "Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Invoke-KingmakerRuntimeTest.ps1*)",
+        "Bash(dotnet build *)",
+        "PowerShell(dotnet build *)",
+        "Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:/Dev/KingmakerBuffPlannerLab/codex-policy/Push-KingmakerBuffPlanner.ps1*)",
+        "PowerShell(powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:/Dev/KingmakerBuffPlannerLab/codex-policy/Push-KingmakerBuffPlanner.ps1*)"
+      ],
+      "deny": [
+        "PowerShell(.\\scripts\\Deploy-Local.ps1*)",
+        "Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Deploy-Local.ps1*)",
+        "PowerShell(.\\scripts\\Install-Local.ps1*)",
+        "Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Install-Local.ps1*)",
+        "PowerShell(.\\scripts\\Restore-InstallLocal.ps1*)",
+        "Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Restore-InstallLocal.ps1*)",
+        "PowerShell(.\\scripts\\Restore-Local.ps1*)",
+        "Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Restore-Local.ps1*)",
+        "PowerShell(.\\scripts\\Publish-Release.ps1*)",
+        "Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/Publish-Release.ps1*)",
+        "Edit(./docs/VALIDATION-POLICY.md)",
+        "Write(./docs/VALIDATION-POLICY.md)"
+      ]
+    }
+  },
+  "reviewer": {
+    "executable": "codex",
+    "codex_home": "~/.codex",
+    "model": "gpt-6.2-astra",
+    "effort": "high",
+    "timeout_minutes": 60,
+    "extra_config": [
+      "windows.sandbox=\"elevated\""
+    ],
+    "disabled_features": [
+      "multi_agent",
+      "apps",
+      "plugins",
+      "image_generation",
+      "computer_use",
+      "browser_use",
+      "in_app_browser",
+      "hooks",
+      "memories"
+    ]
+  },
+  "limits": {
+    "max_review_rounds_per_checkpoint": 5,
+    "max_review_attempts_per_round": 3,
+    "max_developer_invocations": 30,
+    "no_progress_rounds": 3,
+    "publication_attempts": 4,
+    "retry_backoff_seconds": [
+      30,
+      120
+    ]
+  },
+  "runtime_lock_paths": [
+    "C:/Dev/KingmakerGunslingerLab/compatibility-state/compatibility.lock",
+    "C:/Dev/KingmakerBuffPlannerLab/runtime-state/deployment.lock",
+    "C:/Dev/KingmakerBuffPlannerLab/runtime-fixture-state/fixture.lock",
+    "C:/Dev/KingmakerMemoryLeakResearchLab/runtime-state/kmld-runtime.lock",
+    "C:/Dev/KingmakerMountedCombatLab/runtime-state/active-transaction.lock",
+    "C:/Dev/KingmakerSkipCinematicLab/runtime-state/runtime.lock"
+  ],
+  "gates": {
+    "focused": {
+      "argv": [
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "scripts/Test-Development.ps1"
+      ],
+      "extra_args_pattern": "-Only [A-Za-z0-9._-]+",
+      "timeout_minutes": 30
+    }
+  }
+}

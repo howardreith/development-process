@@ -1,0 +1,445 @@
+{
+  "B": "79ab7af62729c2e329f267796780ce36fdffd07c",
+  "H": "7a636d0744869151f0bf1268e7faee15763be876",
+  "M": "79ab7af62729c2e329f267796780ce36fdffd07c",
+  "checkpoint_id": "controller-core",
+  "checkpoint_type": "intermediate",
+  "fatal": false,
+  "invocation": {
+    "completed": true,
+    "duration_s": 350.9,
+    "exit_code": 0,
+    "failed": false,
+    "observed": {
+      "approval_policy": "never",
+      "cli_version": "0.170.0",
+      "network": "restricted",
+      "observed_effort": "high",
+      "observed_model": "gpt-6.2-astra",
+      "plan_type": "pro",
+      "rollout_found": true,
+      "sandbox": "read-only",
+      "source": "Codex session rollout (CLI-recorded thread settings; not model-authored)",
+      "subagent_suspected": false,
+      "turn_efforts": [
+        "high"
+      ],
+      "turn_models": [
+        "gpt-6.2-astra"
+      ],
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 2498560,
+        "input_tokens": 2637339,
+        "output_tokens": 12310,
+        "reasoning_output_tokens": 4556,
+        "total_tokens": 2649649
+      }
+    },
+    "requested": {
+      "effort": "high",
+      "model": "gpt-6.2-astra",
+      "sandbox": "read-only"
+    },
+    "thread_id": "01a1fbfd-2497-7de2-a3da-cdff84acca8c",
+    "timed_out": false
+  },
+  "mission": {
+    "id": "agent-review-setup",
+    "sha256": "0ae972cfa83996ee666761bc6e59ed6b9eec8e8fceda957b09ba00055c1e3779"
+  },
+  "ok": true,
+  "path": "~\\.agent-review\\state\\devproc-claude-agent-review-controller-20261120192057-9024\\rounds\\r05\\envelope-1.json",
+  "pr": 1,
+  "protocol": "agent-review.v1",
+  "publication": "r05-review",
+  "published": [
+    {
+      "comment_id": 7056189785,
+      "of": 1,
+      "part": 1,
+      "url": "https://github.com/howardreith/development-process/pull/1#issuecomment-7056189785"
+    }
+  ],
+  "raw_result_if_rejected": null,
+  "reasons": [],
+  "repository": "howardreith/development-process",
+  "request_id": "devproc-claude-agent-review-controller-20261120192057-9024-r05-5e18c8",
+  "response_sha256": "6c131c6130649fa0506cdd92b14cddeee3b4b2e96bd827ee8da49da3512c0b03",
+  "result": {
+    "candidate_commit": "7a636d0744869151f0bf1268e7faee15763be876",
+    "checkpoint_id": "controller-core",
+    "checkpoint_type": "intermediate",
+    "decision": "changes_required",
+    "decision_rationale": "The candidate-bound unit gate passed, but several recovery paths still violate the checkpoint contract. A passing run for one gate argument can conceal damaged evidence for another, uncertain delivery can produce a duplicate POST, and a replacement review can pass while the damaged predecessor permanently blocks final archival. The supplied evidence also does not establish the reported live permission decisions.",
+    "evidence_assessment": {
+      "executed_verification": [
+        "Confirmed the detached HEAD, merge base and mission digest against the request. The supplied feature.diff and the complete Git diff from M to H have the same Git object hash.",
+        "Confirmed the controller's unit receipt for H against the supplied log. SHA-256 e6bb9f3cec33791c7e83d31c11ab0a0509122ea198770e4843385d5fa49beb65 matches. The suite reported 140 tests in 258.461 seconds, exit 0, with one live-model test skipped. The receipt records an unchanged worktree.",
+        "The log records passing fixture tests for moved heads, rejected reviews, publication recovery, locking, round limits, archive commits and intermediate advancement. The fixture uses real temporary Git repositories and simulated model and GitHub responses."
+      ],
+      "inspected": [
+        "Mission, owner addenda, repository instructions, operating guide, protocol, full feature diff, checkpoint plan, developer report, prior ledger and supplied evidence directory.",
+        "Controller transitions for dispatch, provenance, gate selection, publication, retirement, archive, handoff, resume and installation. Reviewed the associated schemas, prompts, permission configuration and regression tests."
+      ],
+      "limitations": [
+        "Review was read-only. I inspected the controller-run gate and its recorded output. I did not rerun tests, invoke models or contact GitHub.",
+        "The foreground transcript points only to the unit receipt. The preflight session IDs and live smoke run 14 appear in the developer report, without corresponding execution output in the supplied evidence."
+      ],
+      "required_gaps": [
+        "Candidate-bound, CLI-recorded permission outcomes for the production and control launches, including a successful enrolled helper operation.",
+        "Behavior verification for the failure and recovery paths identified in the blocking findings, through the last affected transition."
+      ],
+      "source_inspection_only": [
+        "The findings about mixed gate arguments, malformed rollout records, expired uncertain sends, damaged historical envelopes, package-path changes and resumed handoffs follow from the candidate source. The passing log does not exercise those complete sequences."
+      ]
+    },
+    "findings": [
+      {
+        "acceptance_ids": [
+          "WF04",
+          "WF06"
+        ],
+        "actual": "The new lookup detects an absent entry or a non-posted state. A posted entry with an empty parts list passes the subsequent loop without authenticating any remote comment. A list missing one part likewise checks only the parts that survived.",
+        "blocking_rationale": "Remote status and resume can still confirm a handoff without its complete receipt.",
+        "blocks_readiness": true,
+        "category": "defect",
+        "expected": "A current handoff requires a nonempty, complete set of authenticated parts for its named receipt.",
+        "id": "R1-F1",
+        "location": {
+          "file": "agent_review/agent_review.py",
+          "line": 2794
+        },
+        "priority": "P1",
+        "requested_correction": "Validate the named receipt's part inventory and marker numbering before authenticating each part against the PR.",
+        "requested_evidence": "Complete a fixture handoff, retain the posted receipt entry, remove its part data, and verify that remote status and resume both detect the incomplete receipt.",
+        "title": "A posted receipt with missing parts still certifies a handoff",
+        "trigger": "The publication map retains the named receipt in posted state but loses its part inventory."
+      },
+      {
+        "acceptance_ids": [
+          "WF05",
+          "WF08",
+          "WF12"
+        ],
+        "actual": "gate_status records damage by gate name, then clears its effect when any argument list for that gate has a newer receipt. For example, filter A can pass, have a later failed receipt lose its recorded_at, and appear passing again after filter B passes. The older A pass remains in latest.",
+        "blocking_rationale": "A required focused validation can be counted as passing without rerunning the affected scope.",
+        "blocks_readiness": true,
+        "category": "defect",
+        "expected": "Recovery must replace damaged evidence for the affected argument list. A different filter cannot establish that the first filter passed.",
+        "id": "R1-F2",
+        "location": {
+          "file": "agent_review/agent_review.py",
+          "line": 2087
+        },
+        "priority": "P1",
+        "requested_correction": "Retain the argument identity for damaged runs when it is recoverable. For unreadable receipts, preserve enough independent run identity to determine which validation must be repeated.",
+        "requested_evidence": "Use two permitted argument lists on H. Damage the later failed A receipt, pass B, and verify that acceptance remains blocked until A passes again.",
+        "title": "A different gate argument can clear damaged evidence",
+        "trigger": "A project uses the same required gate with multiple filters on one candidate."
+      },
+      {
+        "acceptance_ids": [
+          "WF05",
+          "WF08"
+        ],
+        "actual": "The rollout parser catches JSON decoding failures but assumes decoded records are objects. A JSON null or array reaches obj.get and raises AttributeError outside the bounded validation path. An object with no type is silently ignored, and a second session_meta carrying a conflicting ID is never compared with the first. Otherwise valid observations can still yield a passing provenance result in those latter cases.",
+        "blocking_rationale": "Malformed provenance can either escape the retry mechanism or be accepted as evidence for a review.",
+        "blocks_readiness": true,
+        "category": "defect",
+        "expected": "The selected rollout must have one consistent identity and structurally valid records. Malformed records must produce a recorded failed attempt.",
+        "id": "R1-F6",
+        "location": {
+          "file": "agent_review/agent_review.py",
+          "line": 633
+        },
+        "priority": "P1",
+        "requested_correction": "Validate record and payload types before accessing them, enforce consistent session metadata throughout the selected rollout, and return provenance problems through normal attempt validation.",
+        "requested_evidence": "Exercise a scalar record, a typeless object and conflicting session metadata in an otherwise valid rollout. Verify bounded rejection, unchanged round count and no passing publication.",
+        "title": "Structurally malformed rollout records escape provenance validation",
+        "trigger": "A reviewer rollout contains valid JSON that is malformed as a rollout record."
+      },
+      {
+        "acceptance_ids": [
+          "WF06",
+          "WF09"
+        ],
+        "actual": "visible_parts records recovered comment IDs and URLs in the publication entries. archive writes the envelope's published field from rnd.get('published'), which is assigned only after the ordinary full verdict send returns. Following a crash during a multipart send, that field can be null for both the retired and historical archive entries even though their publication maps contain the links.",
+        "blocking_rationale": "The committed envelope cannot identify the PR comments that actually carried the recovered review, as the protocol requires.",
+        "blocks_readiness": true,
+        "category": "defect",
+        "expected": "Each archived rendering should identify the published parts of that rendering, including the historical replacement.",
+        "id": "R2-F1",
+        "location": {
+          "file": "agent_review/agent_review.py",
+          "line": 2458
+        },
+        "priority": "P2",
+        "requested_correction": "Build the archived publication references from the authenticated parts of the publication being archived. Distinguish the original partial send from the complete historical send.",
+        "requested_evidence": "Interrupt a multipart verdict, retire it, complete the later handoff and read the committed envelopes. Match their comment IDs and URLs to the actual original and historical fixture comments.",
+        "title": "Recovered verdicts lose their publication references in the archive",
+        "trigger": "A verdict becomes visible in whole or in part before finish_round saves rnd.published."
+      },
+      {
+        "acceptance_ids": [
+          "WF10"
+        ],
+        "actual": "The foreground evidence contains only the unit receipt and log. The log confirms permission composition and argument tests and explicitly skips live smoke. The reported production and control outcomes are developer-authored. In addition, the probe counts an attempted command with no recorded denial as allowed without checking that the control invocation completed or that the tool returned a result.",
+        "blocking_rationale": "Effective headless isolation and continued helper access remain unverified on the candidate.",
+        "blocks_readiness": true,
+        "category": "evidence_gap",
+        "expected": "The reviewer should receive a sanitized, candidate-bound observation showing the ambient-only permission decision and a successful enrolled helper operation.",
+        "id": "R3-F3",
+        "location": {
+          "file": "agent_review/agent_review.py",
+          "line": 3307
+        },
+        "priority": "P1",
+        "requested_correction": "Expose the focused live observation through the reviewer inputs. Have the probe distinguish completed tool decisions from a launch that ended after emitting a tool-use request.",
+        "requested_evidence": "Supply H, CLI version, launch profile, production denial, control tool result and successful enrolled helper result in controller- or CLI-recorded output. A sanitized excerpt or gate receipt is sufficient.",
+        "title": "The reported live permission decisions are absent from the review evidence",
+        "trigger": "The reviewer assesses the claimed production/control experiment and live smoke run 14."
+      },
+      {
+        "acceptance_ids": [
+          "WF05",
+          "WF06",
+          "WF09"
+        ],
+        "actual": "finish_round now detects the damaged envelope and obtains a replacement review. Later, archive includes the superseded visible verdict, looks up the same invalidated round, and demands that its damaged envelope match the original digest. It stops on every retry. The new regression ends immediately after the replacement checkpoint passes.",
+        "blocking_rationale": "The documented recovery can advance a checkpoint but cannot complete the mission handoff.",
+        "blocks_readiness": true,
+        "category": "defect",
+        "expected": "Recovery should preserve the authenticated public material, record the envelope loss and allow a fresh valid review to reach an archived handoff.",
+        "id": "R3-F4",
+        "location": {
+          "file": "agent_review/agent_review.py",
+          "line": 2456
+        },
+        "priority": "P1",
+        "requested_correction": "Handle invalidated historical envelopes explicitly during archive. Preserve authenticated outgoing bodies, the expected digest and the correction without treating damaged bytes as an accepted envelope. Continue to require intact envelopes for accepted reviews.",
+        "requested_evidence": "Extend the truncated-envelope regression through a final review, archive push and AWAITING_OWNER_REVIEW. Inspect the committed historical record and the fresh accepted envelope.",
+        "title": "A retired damaged envelope still blocks the final archive",
+        "trigger": "A posted verdict's preserved envelope is truncated before acknowledgment, then a fresh review succeeds."
+      },
+      {
+        "acceptance_ids": [
+          "WF06"
+        ],
+        "actual": "Once posting_since is 600 seconds old, send clears it and allows another POST after one absent listing. The elapsed interval can consist entirely of downtime. A second POST response naming the expected actor is immediately acknowledged. A later uniqueness check can detect the duplicate but cannot prevent it.",
+        "blocking_rationale": "The controller can publish two substantive comments for one request or verdict after a restart.",
+        "blocks_readiness": true,
+        "category": "defect",
+        "expected": "An uncertain send should reconcile to the stored comment or pause with its uncertainty preserved.",
+        "id": "R4-F4",
+        "location": {
+          "file": "agent_review/agent_review.py",
+          "line": 1260
+        },
+        "priority": "P1",
+        "requested_correction": "Use the bounded window to limit automatic reconciliation. If delivery is still ambiguous at expiry, preserve the send intent and pause. Require positive resolution before another POST.",
+        "requested_evidence": "Lose a stored POST response, restart after the window with a stale listing, and verify exactly one remote comment. Then expose the stored marker and confirm recovery without a second POST.",
+        "title": "Expiry of the uncertain-send timer authorizes a duplicate POST",
+        "trigger": "GitHub stores a POST, its response is lost, and the first listing after the reconciliation window still omits it."
+      },
+      {
+        "acceptance_ids": [
+          "WF07",
+          "WF10",
+          "WF12"
+        ],
+        "actual": "A plan- or config-only install changes the immutable package directory while preserving the behavioral fingerprint. An existing enrollment's permission file allows helpers at the old absolute path. A later launch through current.json passes fingerprint validation but builds the developer's push and verify commands from the new self.wf path. Those commands do not match its pinned allowances.",
+        "blocking_rationale": "A routine configuration-only installation can strand an otherwise valid headless enrollment on its next checkpoint.",
+        "blocks_readiness": true,
+        "category": "defect",
+        "expected": "An existing enrollment should continue to receive helper commands matching its activated permission file across package-only upgrades.",
+        "id": "R5-F1",
+        "location": {
+          "file": "agent_review/agent_review.py",
+          "line": 2147
+        },
+        "priority": "P1",
+        "requested_correction": "Resolve helper commands and permissions from the same activated package, or reconcile their paths together before dispatch.",
+        "requested_evidence": "Enroll under package A, install package B with only a plan change, and resume the original enrollment through the launcher. Verify that its advertised helper commands are allowed and usable and that new enrollments use B.",
+        "title": "A package-only upgrade changes helper commands for existing enrollments",
+        "trigger": "A headless enrollment resumes through the launcher after an install with a new package digest and the same behavioral fingerprint."
+      },
+      {
+        "acceptance_ids": [
+          "WF04",
+          "WF07",
+          "WF08"
+        ],
+        "actual": "resume calls reopen before checking the round budget. reopen saves phase develop with handoff cleared, while status can still be AWAITING_OWNER_REVIEW. If the budget check refuses continuation, that inconsistent state persists. On the next resume the completed-handoff branch runs again and reopen attempts to unpack the null handoff.",
+        "blocking_rationale": "An exhausted enrollment can report owner readiness after its handoff was retired, and a subsequent authorized extension can fail during recovery.",
+        "blocks_readiness": true,
+        "category": "defect",
+        "expected": "Reopening a superseded handoff should durably move the enrollment into a coherent active or budget-blocked state before returning.",
+        "id": "R5-F2",
+        "location": {
+          "file": "agent_review/agent_review.py",
+          "line": 2383
+        },
+        "priority": "P1",
+        "requested_correction": "Persist retirement, the new phase and the corresponding status together. Make the budget-extension path resumable after the old handoff has already been cleared.",
+        "requested_evidence": "Finish on the last permitted round, move the head, resume without an extension, then resume with a larger limit. Check status after each call and verify that development can continue on the new candidate.",
+        "title": "Reopening at the round cap leaves a cleared handoff marked ready",
+        "trigger": "A completed final handoff becomes stale after the checkpoint consumed its round budget."
+      },
+      {
+        "acceptance_ids": [
+          "WF04",
+          "WF06",
+          "WF09"
+        ],
+        "actual": "If the receipt at A is posted and the subsequent PR body edit fails, guarded can publish a PAUSED status. On resume, archive commits that status, producing A2. finalize publishes a new receipt for A2 without retiring the receipt for A. missing_publications skips the older final-status key, so both receipts can remain visible as current.",
+        "blocking_rationale": "The public handoff can name two different archive heads with no correction identifying the superseded one.",
+        "blocks_readiness": true,
+        "category": "defect",
+        "expected": "When recovery changes the handoff archive head, the controller should retire any visible receipt for the earlier head before declaring the new handoff current.",
+        "id": "R5-F3",
+        "location": {
+          "file": "agent_review/agent_review.py",
+          "line": 2766
+        },
+        "priority": "P1",
+        "requested_correction": "Reconcile active final receipts against the archive head selected on resume and persist a correction for any superseded receipt.",
+        "requested_evidence": "Fail the body edit after the receipt POST, allow publication of the pause status, then resume through the command boundary. Verify a correction for A and exactly one current handoff at A2.",
+        "title": "Finalization recovery can leave an older handoff receipt current",
+        "trigger": "Finalization pauses after posting a receipt, and archiving the pause record advances the branch before the retry."
+      },
+      {
+        "acceptance_ids": [
+          "WF05",
+          "WF08"
+        ],
+        "actual": "develop_step checks observed effort only when the list is nonempty. An empty observation proceeds to accept_report. The foreground and preflight paths already require the observed effort to equal the configured value, and the supplied setup material identifies the transcript as the available source.",
+        "blocking_rationale": "A headless checkpoint can be attributed to Opus high after the controller lost the evidence needed to establish its effort.",
+        "blocks_readiness": true,
+        "category": "defect",
+        "expected": "When the supported CLI exposes effort in its transcript, a headless launch with missing provenance should stop before its report is accepted.",
+        "id": "R5-F4",
+        "location": {
+          "file": "agent_review/agent_review.py",
+          "line": 2215
+        },
+        "priority": "P1",
+        "requested_correction": "Require affirmative effort evidence for the headless developer and report a precise provenance failure if the transcript cannot establish it.",
+        "requested_evidence": "Return an otherwise successful headless invocation with no recorded effort. Verify that no checkpoint request is dispatched, then exercise the same path with observed high effort.",
+        "title": "Headless report acceptance permits missing effort provenance",
+        "trigger": "A headless invocation returns a structured report but its transcript has no readable effort observation."
+      }
+    ],
+    "prior_finding_assessments": [
+      {
+        "assessment": "fix_rejected",
+        "finding_id": "R1-F1",
+        "rationale": "The explicit lookup closes the absent-key case. A posted receipt with missing parts still passes without establishing complete delivery."
+      },
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R1-F18",
+        "rationale": "The fallback now parses structured parent or fork metadata across session directories. The passing fixture distinguishes an unrelated text mention from a child recorded on the next date."
+      },
+      {
+        "assessment": "fix_rejected",
+        "finding_id": "R1-F2",
+        "rationale": "Filename ordering and the post-publication gate check cover the supplied single-argument regressions. Recovery still lets a different argument list clear damage for the same gate."
+      },
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R1-F3",
+        "rationale": "Installation refuses a flat MANIFEST layout before modifying it. The destructive migration path is gone and the fixture confirms preservation on refusal."
+      },
+      {
+        "assessment": "fix_rejected",
+        "finding_id": "R1-F6",
+        "rationale": "UUID checks, completion-before-thread rejection and unique matching rollout selection address the reported attribution errors. Structurally malformed JSON records still escape the required attempt handling."
+      },
+      {
+        "assessment": "fix_rejected",
+        "finding_id": "R2-F1",
+        "rationale": "Archiving now preserves the text of visible superseded parts. The archive still loses their corresponding comment links when acknowledgment was interrupted."
+      },
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R2-F2",
+        "rationale": "Legacy recovery selects the exact ledger round and authenticates that envelope's bytes. The two-round fixture confirms damage to the latest statement cannot revive older wording."
+      },
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R2-F3",
+        "rationale": "The installer checks the layout and launcher before replacement and refuses flat copies. The logged fixtures preserve unrelated files and reject an unowned versions entry."
+      },
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R3-F1",
+        "rationale": "The regression now exercises archive with an existing record 999 and distinguishable round-10 and round-100 envelopes. It checks the resulting numbering and contents."
+      },
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R3-F2",
+        "rationale": "Each comment POST goes through the actor and open-draft PR checks, including on retry. Draft creation refreshes the actor under the enrollment lock. The closed and non-draft fixtures produced no comment."
+      },
+      {
+        "assessment": "fix_rejected",
+        "finding_id": "R3-F3",
+        "rationale": "The probe is present in source, but the supplied candidate evidence contains neither its CLI-recorded decisions nor the reported live helper result."
+      },
+      {
+        "assessment": "fix_rejected",
+        "finding_id": "R3-F4",
+        "rationale": "Authentication now precedes parsing, and the test reaches a fresh passing review. Final archive still requires the invalidated envelope to match its original digest."
+      },
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R3-F5",
+        "rationale": "First insertion appends to the unmodified owner body. The logged regression covers trailing spaces, a tab and blank lines."
+      },
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R4-F1",
+        "rationale": "Shared readiness now compares A with the live branch head as well as the PR view. The fixture pushes a material commit from a second clone while the simulated PR still reports A."
+      },
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R4-F2",
+        "rationale": "Immutable package identity now covers shipped configs and plans, and reuse compares complete file hashes. A separate compatibility defect for existing enrollments is recorded in R5-F1."
+      },
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R4-F3",
+        "rationale": "The delta parser uses NUL-delimited paths and requires both positive inventory membership and a matching readable blob. The quoted-filename regression passed."
+      },
+      {
+        "assessment": "fix_rejected",
+        "finding_id": "R4-F4",
+        "rationale": "The timer prevents an immediate duplicate. After expiry the same ambiguous listing permits another POST. The test restores visibility before that decision point."
+      },
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R4-F5",
+        "rationale": "Guarded commands and activation reload eligibility and verify host and worktree claims under the writer lock. The stale-command fixture confirms dispatch is refused after cancellation."
+      }
+    ],
+    "request_id": "devproc-claude-agent-review-controller-20261120192057-9024-r05-5e18c8",
+    "round": 5,
+    "schema_version": "agent-review.review.v1",
+    "summary": {
+      "delivered_behavior": "The candidate strengthens live branch checks, preserves flat installations, gives shipped packages complete content identities, authenticates legacy finding text and archives visible superseded verdict text. The verified unit run covers the ordinary review cycle and multiple failure paths.",
+      "pending_later_phase_work": [
+        "At setup-final, complete the operating documentation, installation and permission handoff, Black Tentacles binding and setup acceptance report for WF01\u2013WF12."
+      ],
+      "remaining_owner_review": [
+        "The owner controls any extension of the configured checkpoint budget and the eventual merge or release decision."
+      ],
+      "scope_reviewed": "Intermediate controller-core checkpoint for draft PR #1 at the specified H, B and M. All 18 pending findings were assessed.",
+      "unresolved_questions": [
+        "Whether the reported live permission probe and helper smoke completed on H with the stated outcomes requires the missing execution record."
+      ]
+    }
+  },
+  "round": 5,
+  "validated_at": "2026-11-21T02:49:44Z",
+  "workflow_fingerprint": "4beb82f5a427a45f0861e0fd20bc05a28f1c96912eca38d02be2ffb88266971e"
+}

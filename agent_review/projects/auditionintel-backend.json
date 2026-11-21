@@ -1,0 +1,102 @@
+{
+  "schema_version": "agent-review.project.v1",
+  "project_id": "aib",
+  "repository": "LeitbyteLLC/AuditionIntelBackEnd",
+  "allowed_remote_urls": [
+    "https://github.com/LeitbyteLLC/AuditionIntelBackEnd.git",
+    "git@github.com:LeitbyteLLC/AuditionIntelBackEnd.git"
+  ],
+  "default_target_branch": "main",
+  "branch_pattern": "^claude/[a-z0-9][a-z0-9._/-]*$",
+  "expected_actor": "howardreith",
+  "transcript_dir": "docs/agent-reviews",
+  "instructions": [
+    "README.md"
+  ],
+  "developer": {
+    "executable": "%USERPROFILE%/.local/bin/claude.exe",
+    "config_dir": "%USERPROFILE%/.claude-personal",
+    "model": "opus",
+    "effort": "high",
+    "allowed_model_pattern": "^claude-opus-",
+    "soft_deadline_minutes": 480,
+    "grace_minutes": 60,
+    "permissions": {
+      "allow": [
+        "Bash(npm run test:unit*)",
+        "PowerShell(npm run test:unit*)",
+        "Bash(npm run test:core*)",
+        "PowerShell(npm run test:core*)",
+        "Bash(npm run lint*)",
+        "PowerShell(npm run lint*)",
+        "Bash(npm.cmd run test:unit*)",
+        "PowerShell(npm.cmd run test:unit*)",
+        "Bash(npm.cmd run lint*)",
+        "PowerShell(npm.cmd run lint*)"
+      ],
+      "deny": [
+        "Bash(npm publish*)",
+        "PowerShell(npm publish*)",
+        "Bash(npx prisma migrate deploy*)",
+        "PowerShell(npx prisma migrate deploy*)",
+        "PowerShell(.\\ops\\windows\\*)",
+        "Bash(powershell.exe * ops/windows/*)",
+        "Edit(./ops/production-release.json)",
+        "Write(./ops/production-release.json)",
+        "Edit(./.env*)",
+        "Write(./.env*)"
+      ]
+    }
+  },
+  "reviewer": {
+    "executable": "codex",
+    "codex_home": "~/.codex",
+    "model": "gpt-6.2-astra",
+    "effort": "high",
+    "timeout_minutes": 60,
+    "extra_config": [
+      "windows.sandbox=\"elevated\""
+    ],
+    "disabled_features": [
+      "multi_agent",
+      "apps",
+      "plugins",
+      "image_generation",
+      "computer_use",
+      "browser_use",
+      "in_app_browser",
+      "hooks",
+      "memories"
+    ]
+  },
+  "limits": {
+    "max_review_rounds_per_checkpoint": 5,
+    "max_review_attempts_per_round": 3,
+    "max_developer_invocations": 30,
+    "no_progress_rounds": 3,
+    "publication_attempts": 4,
+    "retry_backoff_seconds": [
+      30,
+      120
+    ]
+  },
+  "runtime_lock_paths": [],
+  "gates": {
+    "unit": {
+      "argv": [
+        "npm.cmd",
+        "run",
+        "test:unit"
+      ],
+      "timeout_minutes": 20
+    },
+    "lint": {
+      "argv": [
+        "npm.cmd",
+        "run",
+        "lint"
+      ],
+      "timeout_minutes": 10
+    }
+  }
+}

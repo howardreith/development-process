@@ -1,0 +1,51 @@
+<!-- agent-review:v1 enrollment=devproc-claude-agent-review-controller-20261120192057-9024 key=r04-dispositions-4a014142f9 part=1/1 sha256=4a014142f9b705b358a1458c8096d48b765de072f736392ad85a43ccc0d8df12 -->
+### Claude Opus — finding dispositions — round 4
+
+Candidate after corrections: `7a636d0744869151f0bf1268e7faee15763be876`
+
+- **R1-F1** — `fixed` — commits: `7a636d0744`
+  missing_publications looks up the named receipt explicitly first: absent or not posted is missing. Confirmation also requires each published marker to appear exactly once from the expected actor. Test: DevProcRoundFourTests.test_absent_named_receipt_is_missing.
+- **R1-F2** — `fixed` — commits: `7a636d0744`
+  gate_status orders runs by the stamp in the controller-written filename. A receipt whose recorded_at disagrees with its filename, or that is unreadable or identity-less, is damaged. It fails its gate only until a newer valid run exists, so damaged evidence can be replaced by rerunning. finish_round re-checks gates after publishing the verdict and immediately before acceptance; a failure posts a correction, supersedes the verdict, is not charged, and returns to development. Test: DevProcRoundFourTests.test_gate_order_comes_from_filenames_and_damage_is_recoverable, test_gate_invalidated_during_publication_is_not_accepted.
+- **R1-F3** — `fixed` — commits: `7a636d0744`
+  In-place flat migration was removed. install refuses a pre-versioning flat copy (MANIFEST.json at the top level) without touching it, and tells the owner to stop its enrollments and install fresh. Version-to-version installs only add immutable package directories and atomically update the pointer. (The single existing flat install on this machine was migrated in round 4 while no controller or helper ran.) Test: DevProcRoundTwoTests.test_install_owns_only_its_layout_and_never_touches_other_files (legacy case).
+- **R1-F6** — `fixed` — commits: `7a636d0744`
+  parse_codex_events treats a turn outcome before thread.started, or a thread.started without a well-formed UUID, as malformed. provenance validates the thread ID, requires exactly one rollout whose session_meta id equals the thread, and reports malformed records as provenance_problem. invocation_problems rejects that, so it goes through the bounded attempt path. Test: DevProcRoundFourTests.test_reviewer_outcome_and_rollout_identity_are_exact.
+- **R1-F18** — `fixed` — commits: `7a636d0744`
+  Child-session detection parses each other rollout's first-line session_meta. It flags delegation only when a parent- or fork-named key's value equals the thread ID. It searches every session folder and skips files last modified before the attempt started, minus 60 seconds. Test: DevProcRoundOneTests.test_delegation_detection_uses_tool_identity (a text mention is not a parent; a structured parent in another day's folder is).
+- **R2-F1** — `fixed` — commits: `7a636d0744`
+  retire_verdict loads the authenticated envelope itself when the caller has none, which covers the gate path. It queues the historical rendering for partial visibility, records visible_parts, and persists the invalidation in the same save. archive now includes superseded publications with exactly the parts that reached GitHub, under a 'Superseded record' banner, alongside the envelope. Test: DevProcRoundFourTests.test_fully_visible_retired_verdict_stays_on_the_record; DevProcRoundTwoTests.test_partially_visible_review_is_retired_not_marked_posted.
+- **R2-F2** — `fixed` — commits: `7a636d0744`
+  full_findings recovers a legacy entry only from the round named by its finding_round or last_round, and only when that envelope's bytes match the recorded digest. An older authentic statement is never substituted. Dispatch is refused while any pending finding lacks text. Test: DevProcRoundFourTests.test_recovery_uses_only_the_latest_statement; DevProcRoundThreeTests.test_unauthenticated_legacy_findings_block_dispatch.
+- **R2-F3** — `fixed` — commits: `7a636d0744`
+  install modifies only an empty directory or an owned installation. An owned installation needs exactly versions/, current.json and agent_review.py. The launcher must equal the current launcher or a known earlier one by digest. current.json must point at an installed version, and every versions/ child must be a manifest-bearing version or a staging directory. Anything else, including a cache directory, is refused untouched. Test: DevProcRoundTwoTests.test_install_owns_only_its_layout_and_never_touches_other_files (unrelated files, familiar names, legacy copy, foreign versions/ entry).
+- **R3-F1** — `fixed` — commits: `7a636d0744`
+  This regression exercises the production archive path. An existing committed record 999 is in the inventory, and rounds 10 and 100 have distinguishable envelopes. The archived files are numbered 1000 and up, and each envelope file contains only its own round's result. Test: DevProcRoundFourTests.test_archive_production_path_scales_past_99_rounds_and_999_records.
+- **R3-F2** — `fixed` — commits: `7a636d0744`
+  Every comment POST, including retries, re-reads the actor and the enrolled PR identity, open state and draft state (pr_view) immediately before writing. Enrollment refreshes the actor under its lock immediately before creating the draft PR. Test: DevProcRoundFourTests.test_comment_post_rechecks_the_target_pr; DevProcRoundThreeTests.test_actor_is_checked_at_each_mutation.
+- **R3-F3** — `fixed` — commits: `7a636d0744`
+  Observed with the real launch arguments, now a standing part of `preflight`: the owner's user-level allowance `Bash(python C:/Dev/agent-review/agent_review.py status *)` was used to probe `python C:/Dev/agent-review/agent_review.py status --enrollment agent-review-permission-probe`. Production launch (session ebc2e051-6701-40ce-a652-bb3dafb665c1): attempted ['python C:/Dev/agent-review/agent_review.py status --enrollment agent-review-permission-probe', 'git status --short'], denied ['python C:/Dev/agent-review/agent_review.py status --enrollment agent-review-permission-probe'], so the ambient-only rule was denied while the composed `git status` ran. Control launch without --setting-sources (session 298f7add-f4f1-4116-9048-e7ac7c3e5220): attempted ['python C:/Dev/agent-review/agent_review.py status --enrollment agent-review-permission-probe', 'git status --short'], denied [], so the same user rule allowed it. The denial is therefore caused by the isolation. Enrolled helpers succeeding under the production profile: live smoke run 14 (push and verify helpers, no permission denials). Live smoke run 13 exposed a PowerShell or Bash rule gap (git ls-remote); composition now mirrors every Bash rule for PowerShell. Test: DevProcRoundFourTests.test_shell_rules_are_mirrored_for_powershell.
+- **R3-F4** — `fixed` — commits: `7a636d0744`
+  finish_round reads the envelope bytes and authenticates them against the recorded digest before parsing. A missing, unreadable, truncated, altered or other-version envelope takes one transition: the verdict is retired and the round invalidated, persisted in a single save, and then the round is reviewed again. Test: DevProcRoundFourTests.test_truncated_envelope_retires_the_visible_verdict.
+- **R3-F5** — `fixed` — commits: `7a636d0744`
+  First insertion appends the separator and section to the unmodified body; trailing spaces, tabs and blank lines are kept. Test: DevProcRoundFourTests.test_first_status_insertion_keeps_trailing_owner_text.
+- **R4-F1** — `fixed` — commits: `7a636d0744`
+  readiness compares the live remote branch head (ls-remote) as well as the PR view. readiness is shared by finalize, after publication, remote status checks and handoff_superseded. Test: DevProcRoundFourTests.test_readiness_checks_the_live_branch_head.
+- **R4-F2** — `fixed` — commits: `7a636d0744`
+  Installed package directories are keyed by a digest of every shipped file, including projects, plans and README. A config- or plan-only change installs as a new immutable version. An existing directory is reused only if its file hashes equal the source. The behavioral fingerprint stays separate for activation. Test: DevProcRoundOneTests.test_install_is_versioned_and_never_disturbs_running_versions (a plan-only change produces a new package with the same fingerprint).
+- **R4-F3** — `fixed` — commits: `7a636d0744`
+  verify_transcript_delta reads `git diff --raw -z`, so paths are never display-quoted. It requires positive membership in the archived inventory and a successful blob read whose digest matches. Test: DevProcRoundFourTests.test_transcript_delta_needs_positive_inventory_membership.
+- **R4-F4** — `fixed` — commits: `7a636d0744`
+  Before each POST, send persists posting_since. While the marker stays absent from authenticated listings, it waits rather than re-posting, up to a bounded window (uncertain_send_window_seconds, default 600). Only after the marker has stayed absent for the whole window does it post again. Publication confirmation also requires exactly one copy of each marker. Test: DevProcRoundFourTests.test_lost_post_with_stale_listing_is_not_duplicated.
+- **R4-F5** — `fixed` — commits: `7a636d0744`
+  guarded and activate re-check command-specific status eligibility after taking the writer lock and reloading. They also re-check that the enrollment still holds both the host branch claim and the worktree marker, so a stale process is refused before any publication, archive write or dispatch. Test: DevProcRoundFourTests.test_stale_command_is_refused_after_cancellation.
+
+**Validation (developer-reported):**
+
+| Command | Required | Result | Duration | Scope and limits |
+|---|---|---|---|---|
+| verify --gate unit (controller-run behavior suite) | yes | pass | 258s | 140 behavior tests (1 live test skipped by design). |
+| python agent_review/agent_review.py preflight --project development-process | no | pass | about 4 min | Real Claude Opus and Astra calls; permission isolation probe with production and control launches. |
+| AGENT_REVIEW_LIVE=1 python -m unittest agent_review/test_live_smoke.py (run 14) | no | pass | 66s | Real models, simulated GitHub. |
+
+_Model-generated developer response (Claude opus / high), posted by the agent-review controller through the owner's GitHub account; not a human review._

@@ -1,0 +1,105 @@
+{
+  "schema_version": "agent-review.project.v1",
+  "project_id": "devproc",
+  "repository": "howardreith/development-process",
+  "allowed_remote_urls": [
+    "https://github.com/howardreith/development-process.git",
+    "git@github.com:howardreith/development-process.git"
+  ],
+  "default_target_branch": "main",
+  "branch_pattern": "^claude/[a-z0-9][a-z0-9._/-]*$",
+  "expected_actor": "howardreith",
+  "transcript_dir": "docs/agent-reviews",
+  "instructions": [
+    "AGENTS.md",
+    "docs/GITHUB-AGENT-REVIEW-PROTOCOL.md"
+  ],
+  "developer": {
+    "executable": "%USERPROFILE%/.local/bin/claude.exe",
+    "config_dir": "%USERPROFILE%/.claude-personal",
+    "model": "opus",
+    "effort": "high",
+    "allowed_model_pattern": "^claude-opus-",
+    "soft_deadline_minutes": 480,
+    "grace_minutes": 60,
+    "permissions": {
+      "allow": [
+        "Bash(python -m unittest *)",
+        "PowerShell(python -m unittest *)"
+      ],
+      "deny": []
+    }
+  },
+  "reviewer": {
+    "executable": "codex",
+    "codex_home": "~/.codex",
+    "model": "gpt-6.2-astra",
+    "effort": "high",
+    "timeout_minutes": 60,
+    "extra_config": [
+      "windows.sandbox=\"elevated\""
+    ],
+    "disabled_features": [
+      "multi_agent",
+      "apps",
+      "plugins",
+      "image_generation",
+      "computer_use",
+      "browser_use",
+      "in_app_browser",
+      "hooks",
+      "memories"
+    ]
+  },
+  "limits": {
+    "max_review_rounds_per_checkpoint": 5,
+    "max_review_attempts_per_round": 3,
+    "max_developer_invocations": 30,
+    "no_progress_rounds": 3,
+    "publication_attempts": 4,
+    "retry_backoff_seconds": [
+      30,
+      120
+    ]
+  },
+  "runtime_lock_paths": [],
+  "gates": {
+    "unit": {
+      "argv": [
+        "python",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "agent_review",
+        "-p",
+        "test_*.py",
+        "-v"
+      ],
+      "timeout_minutes": 20
+    },
+    "permissions": {
+      "argv": [
+        "python",
+        "agent_review/agent_review.py",
+        "probe-permissions",
+        "--project",
+        "development-process"
+      ],
+      "timeout_minutes": 20,
+      "description": "Real headless Claude launches: production profile denies a user-level allowance and runs the enrolled helper; a control launch without setting-source isolation allows it."
+    },
+    "live-smoke": {
+      "argv": [
+        "python",
+        "agent_review/test_live_smoke.py",
+        "--gate"
+      ],
+      "timeout_minutes": 20,
+      "description": "Real headless Claude Opus developer and real Codex Astra reviewer on a fixture repo (GitHub simulated). The log includes the developer's own push and verify helper results under the production permission profile."
+    }
+  },
+  "required_gates": [
+    "unit"
+  ]
+}
