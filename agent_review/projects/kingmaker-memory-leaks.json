@@ -1,0 +1,92 @@
+{
+  "schema_version": "agent-review.project.v1",
+  "project_id": "kmld",
+  "repository": "howardreith/KingmakerMemoryLeaksFix",
+  "allowed_remote_urls": [
+    "https://github.com/howardreith/KingmakerMemoryLeaksFix.git",
+    "git@github.com:howardreith/KingmakerMemoryLeaksFix.git"
+  ],
+  "default_target_branch": "main",
+  "branch_pattern": "^codex/[a-z0-9][a-z0-9._/-]*$",
+  "expected_actor": "howardreith",
+  "transcript_dir": "docs/agent-reviews",
+  "instructions": [
+    "AGENTS.md"
+  ],
+  "developer": {
+    "executable": "%USERPROFILE%/.local/bin/claude.exe",
+    "config_dir": "%USERPROFILE%/.claude-personal",
+    "model": "opus",
+    "effort": "high",
+    "allowed_model_pattern": "^claude-opus-",
+    "soft_deadline_minutes": 480,
+    "grace_minutes": 60,
+    "permissions": {
+      "allow": [
+        "Bash(python -I -m unittest *)",
+        "PowerShell(python -I -m unittest *)",
+        "Bash(pwsh -File tests/Test-KmldTools.ps1*)",
+        "PowerShell(pwsh -File tests/Test-KmldTools.ps1*)"
+      ],
+      "deny": []
+    }
+  },
+  "reviewer": {
+    "executable": "codex",
+    "codex_home": "~/.codex",
+    "model": "gpt-6.2-astra",
+    "effort": "high",
+    "timeout_minutes": 60,
+    "extra_config": [
+      "windows.sandbox=\"elevated\""
+    ],
+    "disabled_features": [
+      "multi_agent",
+      "apps",
+      "plugins",
+      "image_generation",
+      "computer_use",
+      "browser_use",
+      "in_app_browser",
+      "hooks",
+      "memories"
+    ]
+  },
+  "limits": {
+    "max_review_rounds_per_checkpoint": 5,
+    "max_review_attempts_per_round": 3,
+    "max_developer_invocations": 30,
+    "no_progress_rounds": 3,
+    "publication_attempts": 4,
+    "retry_backoff_seconds": [
+      30,
+      120
+    ]
+  },
+  "runtime_lock_paths": [
+    "C:/Dev/KingmakerGunslingerLab/compatibility-state/compatibility.lock",
+    "C:/Dev/KingmakerBuffPlannerLab/runtime-state/deployment.lock",
+    "C:/Dev/KingmakerBuffPlannerLab/runtime-fixture-state/fixture.lock",
+    "C:/Dev/KingmakerMemoryLeakResearchLab/runtime-state/kmld-runtime.lock",
+    "C:/Dev/KingmakerMountedCombatLab/runtime-state/active-transaction.lock",
+    "C:/Dev/KingmakerSkipCinematicLab/runtime-state/runtime.lock"
+  ],
+  "gates": {
+    "tests": {
+      "argv": [
+        "python",
+        "-I",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_*.py"
+      ],
+      "timeout_minutes": 20
+    }
+  },
+  "enrollment_allowed": false,
+  "enrollment_blocked_reason": "its AGENTS.md says 'Never push, tag, publish or open PRs' (diagnostics lab); the owner must change that instruction before this workflow may run there"
+}

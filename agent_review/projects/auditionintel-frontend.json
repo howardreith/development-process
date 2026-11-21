@@ -1,0 +1,74 @@
+{
+  "schema_version": "agent-review.project.v1",
+  "project_id": "aif",
+  "repository": "LeitbyteLLC/AuditionIntelFrontEnd",
+  "allowed_remote_urls": [
+    "https://github.com/LeitbyteLLC/AuditionIntelFrontEnd.git",
+    "git@github.com:LeitbyteLLC/AuditionIntelFrontEnd.git"
+  ],
+  "default_target_branch": "master",
+  "branch_pattern": "^claude/[a-z0-9][a-z0-9._/-]*$",
+  "expected_actor": "howardreith",
+  "transcript_dir": "docs/agent-reviews",
+  "instructions": [
+    "README.md"
+  ],
+  "developer": {
+    "executable": "%USERPROFILE%/.local/bin/claude.exe",
+    "config_dir": "%USERPROFILE%/.claude-personal",
+    "model": "opus",
+    "effort": "high",
+    "allowed_model_pattern": "^claude-opus-",
+    "soft_deadline_minutes": 480,
+    "grace_minutes": 60,
+    "permissions": {
+      "allow": [
+        "Bash(node tools/smoke-test.mjs*)",
+        "PowerShell(node tools/smoke-test.mjs*)"
+      ],
+      "deny": []
+    }
+  },
+  "reviewer": {
+    "executable": "codex",
+    "codex_home": "~/.codex",
+    "model": "gpt-6.2-astra",
+    "effort": "high",
+    "timeout_minutes": 60,
+    "extra_config": [
+      "windows.sandbox=\"elevated\""
+    ],
+    "disabled_features": [
+      "multi_agent",
+      "apps",
+      "plugins",
+      "image_generation",
+      "computer_use",
+      "browser_use",
+      "in_app_browser",
+      "hooks",
+      "memories"
+    ]
+  },
+  "limits": {
+    "max_review_rounds_per_checkpoint": 5,
+    "max_review_attempts_per_round": 3,
+    "max_developer_invocations": 30,
+    "no_progress_rounds": 3,
+    "publication_attempts": 4,
+    "retry_backoff_seconds": [
+      30,
+      120
+    ]
+  },
+  "runtime_lock_paths": [],
+  "gates": {
+    "smoke": {
+      "argv": [
+        "node",
+        "tools/smoke-test.mjs"
+      ],
+      "timeout_minutes": 10
+    }
+  }
+}

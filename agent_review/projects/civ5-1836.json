@@ -1,0 +1,87 @@
+{
+  "schema_version": "agent-review.project.v1",
+  "project_id": "civ5",
+  "repository": "howardreith/Civ5_1836",
+  "allowed_remote_urls": [
+    "https://github.com/howardreith/Civ5_1836.git",
+    "git@github.com:howardreith/Civ5_1836.git"
+  ],
+  "default_target_branch": "main",
+  "branch_pattern": "^claude/[a-z0-9][a-z0-9._/-]*$",
+  "expected_actor": "howardreith",
+  "transcript_dir": "docs/agent-reviews",
+  "instructions": [
+    "README.md",
+    "docs/DEVELOPMENT-SETUP.md"
+  ],
+  "developer": {
+    "executable": "%USERPROFILE%/.local/bin/claude.exe",
+    "config_dir": "%USERPROFILE%/.claude-personal",
+    "model": "opus",
+    "effort": "high",
+    "allowed_model_pattern": "^claude-opus-",
+    "soft_deadline_minutes": 480,
+    "grace_minutes": 60,
+    "permissions": {
+      "allow": [
+        "Bash(python -m unittest *)",
+        "PowerShell(python -m unittest *)",
+        "Bash(python tools/layout.py *)",
+        "PowerShell(python tools/layout.py *)",
+        "Bash(python tools/reports.py*)",
+        "PowerShell(python tools/reports.py*)"
+      ],
+      "deny": [
+        "Bash(python tools/package.py --install*)",
+        "PowerShell(python tools/package.py --install*)"
+      ]
+    }
+  },
+  "reviewer": {
+    "executable": "codex",
+    "codex_home": "~/.codex",
+    "model": "gpt-6.2-astra",
+    "effort": "high",
+    "timeout_minutes": 60,
+    "extra_config": [
+      "windows.sandbox=\"elevated\""
+    ],
+    "disabled_features": [
+      "multi_agent",
+      "apps",
+      "plugins",
+      "image_generation",
+      "computer_use",
+      "browser_use",
+      "in_app_browser",
+      "hooks",
+      "memories"
+    ]
+  },
+  "limits": {
+    "max_review_rounds_per_checkpoint": 5,
+    "max_review_attempts_per_round": 3,
+    "max_developer_invocations": 30,
+    "no_progress_rounds": 3,
+    "publication_attempts": 4,
+    "retry_backoff_seconds": [
+      30,
+      120
+    ]
+  },
+  "runtime_lock_paths": [],
+  "gates": {
+    "unit": {
+      "argv": [
+        "python",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-v"
+      ],
+      "timeout_minutes": 20
+    }
+  }
+}
