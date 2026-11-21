@@ -2994,6 +2994,23 @@ class DevProcRoundFiveTests(CrashFixture, Base):
             ctl.develop_step()
         self.assertIn("effort not affirmatively", stop.exception.reason)
 
+    def test_activation_can_refresh_the_pinned_project_config(self):
+        """A reviewed project change (e.g. a new gate) reaches a running enrollment only through activate."""
+        env = self.env
+        ctl = env.controller()
+        cfg = json.loads(json.dumps(ctl.cfg))
+        cfg["gates"] = {"extra": {"argv": [sys.executable, "-c", "print(1)"]}}
+        projects = env.wf / "projects"
+        projects.mkdir(exist_ok=True)
+        ar.atomic_write_json(projects / "fixture-refresh.json", cfg)
+        ctl.activate(refresh_project="fixture-refresh")
+        self.assertIn("extra", env.controller().cfg["gates"])
+        self.assertEqual(1, len(env.controller().state["project_history"]))
+        cfg["repository"] = "someone/else"
+        ar.atomic_write_json(projects / "fixture-refresh.json", cfg)
+        with self.assertRaises(ar.UsageError):
+            env.controller().activate(refresh_project="fixture-refresh")
+
     def test_probe_outcomes_come_from_cli_records(self):
         """R3-F3: decisions are read from tool_use/tool_result records and permission_denials ids."""
         log = self.env.root / "probe.jsonl"

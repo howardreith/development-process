@@ -2360,8 +2360,20 @@ class Controller:
             else:
                 raise UsageError(f"unknown phase {phase}")
 
-    def activate(self):
-        """Accept a reviewed workflow version. Results validated under the previous rules are not reused."""
+    def activate(self, refresh_project=None):
+        """Accept a reviewed workflow version. Results validated under the previous rules are not reused.
+        With refresh_project, the enrollment's pinned project configuration is replaced by the reviewed one from
+        this package (identity fields must not change); the replaced snapshot's digest is kept in history."""
+        if refresh_project:
+            new_cfg = load_project(refresh_project, self.wf)
+            frozen = [k for k in ("project_id", "repository", "expected_actor", "transcript_dir")
+                      if new_cfg.get(k) != self.cfg.get(k)]
+            if frozen:
+                raise UsageError(f"refreshing the project may not change its identity fields: {frozen}")
+            self.state.setdefault("project_history", []).append(
+                {"replaced_at": now_iso(), "sha256": sha256_text(json.dumps(self.cfg, sort_keys=True)),
+                 "by_sha256": sha256_text(json.dumps(new_cfg, sort_keys=True))})
+            self.state["project"] = self.cfg = new_cfg
         self.snapshot_fp, _, self.files = load_workflow(self.wf)  # this process continues under the new version
         new = self.snapshot_fp
         old = self.state["workflow"]["fingerprint"]
@@ -3746,6 +3758,8 @@ def main(argv=None):
         p.add_argument("--enrollment", required=True)
         if name == "review":
             p.add_argument("--report", required=True)
+        if name == "activate":
+            p.add_argument("--refresh-project", help="also replace the pinned project config with this reviewed one")
         if name == "stop":
             p.add_argument("--reason", default="owner request")
         if name == "cancel":
@@ -3832,7 +3846,7 @@ def main(argv=None):
                 if controller.state["status"] not in COMMAND_STATUSES["activate"]:
                     raise UsageError(f"enrollment is {controller.state['status']}; activate is not permitted")
                 controller.assert_claims()
-                result = controller.activate()
+                result = controller.activate(getattr(args, "refresh_project", None))
             print(json.dumps(result, indent=2))
             return EXIT_OK
         if args.command == "resume":
