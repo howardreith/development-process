@@ -180,6 +180,36 @@ recorded. Long missions resume the same Claude session across invocations
 (Claude Code compacts its context automatically); each invocation, gate
 receipt, round and publication is recorded.
 
+## First-release scope and limitations
+
+The supported workflow (owner addendum 3, `planning/AGENT-REVIEW-SETUP-OWNER-ADDENDUM-3.md`):
+
+- **One controller, one developer per worktree, sequential cycle.** The developer finishes a checkpoint
+  (commit, guarded push, required gates via `verify`) before review starts; the reviewer reviews exactly that
+  candidate commit H, and gate receipts are bound to H. Any later material change invalidates that evidence.
+- **Fixed controller version and project config during a run.** An enrollment pins the workflow fingerprint
+  and project snapshot. Progress is durable; restarting from a completed checkpoint (`resume`) is supported.
+- **Safe pause, not seamless recovery.** Ambiguous crashes, uncertain GitHub delivery, incompatible state or
+  configuration changes stop the enrollment (PAUSED/BLOCKED) with the work preserved and the reason in
+  `status`. Recovery is an owner decision: inspect, then `resume` (with `--resend-undelivered` only after
+  checking the PR) or `cancel`.
+- **History.** The draft PR is the live conversation record. The controller exports its own comments to
+  `docs/agent-reviews/pr-<n>/` as transcript-only commits that are separate from the reviewed feature commits.
+
+Deferred or not supported in this release. These are refused or paused rather than attempted:
+
+| Capability | Behavior in this release |
+| --- | --- |
+| Two writers (controllers or foreground sessions) on one branch | Refused by the host branch lock and worktree lock |
+| Upgrading the controller or refreshing project config during an active run | Not supported during a run. `activate` is an explicit owner action; it invalidates in-progress review results and requires a fresh review |
+| Migrating experimental predecessor state formats | Not supported; an incompatible state version is refused (`unsupported enrollment state version`) |
+| Automatic recovery from ambiguous publication (a POST whose outcome is unknown) | Pauses; the owner checks the PR and resumes with `--resend-undelivered` |
+| Merge, release, tagging, requesting reviewers | Never performed |
+
+Working on the controller itself: review it with a fixed installed version. Run that enrollment's commands
+through its pinned `versions/<package>/agent_review.py` path, and test candidates through the project's gates,
+which run the candidate's own code. Do not reinstall or activate the controlling version for every correction.
+
 ## Permissions
 
 | Surface | Effective permission |

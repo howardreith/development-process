@@ -14,8 +14,12 @@ Read `agent_review/README.md` (operating guide) and
   state, locks and archive commits. Stub only the model (Claude/Codex) and
   GitHub boundaries, with clearly labeled simulated responses. Never test
   source text.
-- Focused validation: `python -m unittest discover -s agent_review -p "test_*.py" -v`
-  (the `unit` gate). The real-model smoke runs only when explicitly selected:
+- Validation policy: the required gate is `unit`
+  (`python -m unittest discover -s agent_review -p "test_*.py" -v`). Two
+  supplemental gates use real models and are run for controller candidates
+  when their evidence is needed: `permissions` (headless permission isolation
+  probe) and `live-smoke` (real Opus developer and Astra reviewer on a fixture
+  repository, GitHub simulated). The smoke also runs directly with
   `AGENT_REVIEW_LIVE=1 python -m unittest agent_review/test_live_smoke.py -v`.
 - Owner model policy (`POLICY` in `agent_review.py`: Claude `opus`/high
   developer, Codex `gpt-6.2-astra`/high reviewer) changes only by an explicit
@@ -29,8 +33,12 @@ Read `agent_review/README.md` (operating guide) and
 - When a branch is enrolled in the workflow, the controller alone posts PR
   comments and archives `docs/agent-reviews/`; push through the controller's
   guarded `push` helper and run gates with `verify`.
-- After changing behavioral files (controller, schemas, prompts, permission
-  base), reinstall to `C:\Dev\agent-review` and `activate` each running
-  enrollment; do this only for a reviewed version.
+- The controller version and project config stay fixed during a run (owner
+  addendum 3). When reviewing changes to this controller, drive the review
+  enrollment through its pinned `versions/<package>/agent_review.py` and test
+  candidates through the gates; do not reinstall or `activate` for every
+  correction. Install a reviewed version to `C:\Dev\agent-review` for new
+  enrollments; `activate` an existing enrollment only as an explicit owner
+  decision between runs.
 - Never commit credentials, local machine state (`~/.agent-review`,
   `C:\ProgramData\agent-review`) or raw model event streams.

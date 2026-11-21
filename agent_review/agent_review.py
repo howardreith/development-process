@@ -950,7 +950,8 @@ class ClaudeDeveloper:
         parsed = self.parse(log_path)
         prov = self.session_provenance(session_id, after=positions)
         parsed.update({"exit_code": proc.returncode, "deadline_exceeded": deadline_exceeded, "terminated": terminated,
-                       "duration_s": round(time.monotonic() - started, 1), "observed_effort": prov["efforts"]})
+                       "duration_s": round(time.monotonic() - started, 1), "observed_effort": prov["efforts"],
+                       "transcript_models": prov["models"]})
         return parsed
 
     @staticmethod
@@ -1539,8 +1540,11 @@ class Controller:
             return "dispositions reference unknown findings: " + ", ".join(sorted(unknown))
         for item in report["dispositions"]:
             entry = ledger[item["finding_id"]]
-            if item["disposition"] == "deferred_optional" and entry["blocks_readiness"]:
-                return f"{item['finding_id']} blocks readiness and cannot be deferred as optional"
+            if item["disposition"] == "deferred_optional" and (entry["blocks_readiness"] or
+                                                               entry.get("correctness_obligation") or
+                                                               entry.get("category") == "defect"):
+                return (f"{item['finding_id']} blocks readiness or is an actionable correctness finding and cannot "
+                        "be deferred as optional")
             if item["disposition"] == "fixed":
                 if not item["commits"]:
                     return f"{item['finding_id']} is marked fixed without a commit"
@@ -1900,8 +1904,11 @@ class Controller:
             last = (entry.get("dispositions") or [{}])[-1].get("disposition")
             if a["assessment"] not in COMPATIBLE_ASSESSMENTS[last]:
                 reasons.append(f"{a['finding_id']}: assessment {a['assessment']} does not answer disposition {last}")
-            if a["assessment"] == "deferral_accepted" and entry["blocks_readiness"]:
-                reasons.append(f"{a['finding_id']}: a finding that blocks readiness cannot be resolved by deferral")
+            if a["assessment"] == "deferral_accepted" and (entry["blocks_readiness"] or
+                                                            entry.get("correctness_obligation") or
+                                                            entry.get("category") == "defect"):
+                reasons.append(f"{a['finding_id']}: a blocking or actionable correctness finding cannot be resolved "
+                               "by deferral")
             if a["assessment"] in REJECTING_ASSESSMENTS and a["finding_id"] not in ids:
                 reasons.append(f"{a['finding_id']}: rejected/open prior finding must be restated in findings")
             if a["assessment"] in POSITIVE_ASSESSMENTS and a["finding_id"] not in ids:
@@ -2418,8 +2425,8 @@ class Controller:
         if out["session_id"] != dev["session_id"]:
             raise Stop("BLOCKED", f"developer ran in session {out['session_id']}, not the enrolled {dev['session_id']}")
         allowed = re.compile(self.cfg["developer"]["allowed_model_pattern"])
-        models = [out["init_model"], *out["main_models"]]
-        if any(not m or not allowed.match(m) for m in models):
+        models = [out["init_model"], *out["main_models"], *out.get("transcript_models", [])]
+        if any(not m or not allowed.match(m) for m in models):  # stream and this invocation's transcript records
             raise Stop("BLOCKED", f"developer ran on {models}, not an allowed {self.cfg['developer']['model']} model")
         efforts = out["observed_effort"]
         if efforts != [self.cfg["developer"]["effort"]]:

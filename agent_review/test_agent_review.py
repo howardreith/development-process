@@ -221,7 +221,8 @@ class FakeDeveloper:
                 "main_models": [model], "result": "", "structured_output": report, "permission_denials": [],
                 "model_usage": {}, "cost_usd": 0.0, "is_error": False, "subtype": getattr(action, "subtype", "success"),
                 "exit_code": getattr(action, "exit_code", 0), "deadline_exceeded": False, "terminated": False,
-                "duration_s": 0.1, "observed_effort": getattr(action, "efforts", ["high"])}
+                "duration_s": 0.1, "observed_effort": getattr(action, "efforts", ["high"]),
+                "transcript_models": getattr(action, "transcript_models", [model])}
 
 
 def report(env, checkpoint, dispositions=(), status="checkpoint_ready", restoration="not_applicable", validation=None):
@@ -3774,6 +3775,36 @@ class DevProcRoundNineTests(CrashFixture, Base):
         status_call = next(c for c in calls if any(a.endswith("/statuses") for a in c))
         self.assertIn("--paginate", status_call)
         self.assertEqual({"ci": "success", "lint": "success"}, {c["name"]: c["conclusion"] for c in checks})
+
+
+class FirstReleaseTests(Base):
+    """Material findings fixed under the first-release scope (owner addendum 3)."""
+
+    def test_correctness_obligation_cannot_be_deferred(self):
+        """R8-F3: neither the developer's deferral nor the reviewer's acceptance can close it."""
+        env = self.env
+        ctl = env.controller()
+        ctl.state["findings"]["R2-F1"] = {"status": "open", "category": "optional_polish", "blocks_readiness": False,
+                                          "correctness_obligation": True, "title": "restated defect",
+                                          "dispositions": []}
+        bad = report(env, "phase-1", [{"finding_id": "R2-F1", "disposition": "deferred_optional", "commits": [],
+                                       "evidence": "defer"}])
+        self.assertIn("cannot be deferred", ctl.accept_report(bad))
+
+    def test_conflicting_transcript_model_is_refused(self):
+        """R10-F1."""
+        env = Env("headless")
+        self.addCleanup(env.cleanup)
+
+        def work(e):
+            e.commit("a.txt", "a\n", "work")
+            e.push()
+            return report(e, "phase-1")
+        work.transcript_models = [OPUS, "claude-sonnet-other"]
+        env.developer.script = [work]
+        with self.assertRaises(ar.Stop) as stop:
+            env.controller().develop_step()
+        self.assertIn("not an allowed", stop.exception.reason)
 
 
 class ToolTranscriptTests(unittest.TestCase):
