@@ -25,6 +25,14 @@ if __name__ == "__main__" and "--gate" in sys.argv:  # run as the project's `liv
     os.environ["AGENT_REVIEW_LIVE"] = "1"
     os.environ["AGENT_REVIEW_LIVE_PRINT"] = "1"
 
+# Importable both as a top-level module (discover -s agent_review, or the gate's script path) and as
+# agent_review.test_* from the repository root (python -m unittest agent_review/test_*.py), where the folder would
+# otherwise shadow the controller module as a namespace package.
+_HERE = __import__("os").path.dirname(__import__("os").path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+if getattr(sys.modules.get("agent_review"), "__file__", None) is None:
+    sys.modules.pop("agent_review", None)
 import agent_review as ar
 from test_agent_review import Env, git
 

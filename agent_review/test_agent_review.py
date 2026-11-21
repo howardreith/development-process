@@ -25,6 +25,14 @@ import uuid
 import unittest
 from pathlib import Path
 
+# Importable both as a top-level module (discover -s agent_review, or the gate's script path) and as
+# agent_review.test_* from the repository root (python -m unittest agent_review/test_*.py), where the folder would
+# otherwise shadow the controller module as a namespace package.
+_HERE = __import__("os").path.dirname(__import__("os").path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+if getattr(sys.modules.get("agent_review"), "__file__", None) is None:
+    sys.modules.pop("agent_review", None)
 import agent_review as ar
 
 HERE = Path(__file__).resolve().parent
@@ -3403,6 +3411,225 @@ class DevProcRoundSevenTests(CrashFixture, Base):
         self.assertEqual("invalidated", restarted.state["rounds"][0]["status"])
         self.assertEqual("accepted", restarted.state["rounds"][-1]["status"])
         self.assertEqual(2, len(env.reviewer.calls))
+
+
+class DevProcRoundEightTests(CrashFixture, Base):
+    """Regressions for the development-process round-8 review findings."""
+
+    def handed_off(self):
+        ctl = self.env.controller()
+        self.to_finalize(ctl)
+        self.assertEqual("AWAITING_OWNER_REVIEW", ctl.finalize())
+        return ctl
+
+    def gated_env(self, gates):
+        plan = {"schema_version": "agent-review.plan.v1", "mission_id": "fixture", "checkpoints": [
+            {"id": "phase-1", "type": "intermediate", "scope": "s", "exit_conditions": ["e"], "required_gates": ["unit"]},
+            {"id": "final", "type": "final", "scope": "s", "exit_conditions": ["e"]}]}
+        env = Env("foreground", plan=plan, cfg_overrides={"gates": gates})
+        self.addCleanup(env.cleanup)
+        return env
+
+    def test_gate_completing_during_checks_never_exposes_the_older_pass(self):
+        """R7-F3: a real gate run (failing this time) completes while readiness is checked continuously."""
+        import threading
+        flag = Path(tempfile.mkdtemp(prefix="agent-review-flag-")) / "exit-code"
+        self.addCleanup(shutil.rmtree, flag.parent, True)
+        flag.write_text("0", encoding="utf-8")
+        code = f"import time, sys, pathlib; time.sleep(0.4); sys.exit(int(pathlib.Path({str(flag)!r}).read_text()))"
+        env = self.gated_env({"unit": {"argv": [sys.executable, "-c", code]}})
+        ctl = env.controller()
+        head = git(env.work, "rev-parse", "HEAD")
+        ctl.run_gate("unit")
+        self.assertEqual([], ctl.missing_gates(head))  # the older pass
+        flag.write_text("1", encoding="utf-8")
+        runner = env.controller()
+        thread = threading.Thread(target=runner.run_gate, args=("unit",))
+        thread.start()
+        evidence = ctl.dir / "evidence"
+        while not list(evidence.glob("gate-unit-*.pending"))[1:]:  # the second run's marker exists
+            time.sleep(0.005)
+        observations = []
+        while thread.is_alive():
+            observations.append(ctl.missing_gates(head))
+        thread.join()
+        observations.append(ctl.missing_gates(head))
+        self.assertTrue(observations)
+        self.assertTrue(all(o == ["unit"] for o in observations), observations)  # never the older pass
+
+    def test_conflicting_applied_settings_and_unnamed_tool_calls(self):
+        """R1-F6."""
+        with tempfile.TemporaryDirectory() as home:
+            rev = ar.CodexReviewer({"executable": sys.executable, "codex_home": home, "model": "m", "effort": "high"})
+            folder = Path(home) / "sessions"
+            folder.mkdir()
+            rollout = folder / f"rollout-1-{TID}.jsonl"
+            meta = json.dumps({"type": "session_meta", "payload": {"id": TID}})
+
+            def applied(model):
+                return json.dumps({"type": "event_msg", "payload": {"type": "thread_settings_applied", "thread_settings": {
+                    "model": model, "reasoning_effort": "high", "approval_policy": "never",
+                    "permission_profile": {"network": "restricted"}}}})
+            rollout.write_text("\n".join([meta, applied("other-model"), applied("m")]) + "\n", encoding="utf-8")
+            prov = rev.provenance(TID)
+            self.assertTrue(prov["observed_model"].startswith("<conflicting"))  # the earlier setting is kept
+            reasons, _ = ar.invocation_problems({"completed": True, "thread_id": TID}, prov,
+                                                {"model": "m", "effort": "high"})
+            self.assertTrue(any("model" in r for r in reasons))
+            unnamed = json.dumps({"type": "response_item", "payload": {"type": "function_call", "arguments": "{}"}})
+            rollout.write_text("\n".join([meta, applied("m"), unnamed]) + "\n", encoding="utf-8")
+            self.assertIn("tool name", rev.provenance(TID)["provenance_problem"])
+
+    def test_verdict_removed_from_github_is_not_accepted(self):
+        """R7-F4: the verdict is authenticated on the PR before acceptance."""
+        env = self.env
+        env.reviewer.script = [{"decision": "checkpoint_passed"}]
+        ctl = env.controller()
+
+        def delete_after_store(record):
+            if "Astra — review" in record["body"]:
+                env.gh.on_post = None
+                env.gh.comments_list.remove(record)  # removed on GitHub right after it was stored
+        env.gh.on_post = delete_after_store
+        ctl.accept_report(report(env, "phase-1"))
+        ctl.transition("review", "t")
+        with self.assertRaises(ar.Stop) as stop:
+            ctl.review_round()
+        self.assertIn("not completely published", stop.exception.reason)
+        self.assertEqual({}, ctl.state["rounds_completed"])
+        resumed = env.controller()
+        self.assertEqual("checkpoint_passed", resumed.review_round())  # re-sent, authenticated, then accepted
+        self.assertEqual(1, len(env.reviewer.calls))
+        self.assertFalse(resumed.publication_problems("r01-review", resumed.state["publications"]["r01-review"],
+                                                      env.gh.comments(7)))
+
+    def test_extension_is_persisted_with_the_reopen(self):
+        """R5-F2."""
+        env = self.env
+        ctl = self.handed_off()
+        cp = ctl.checkpoint["id"]
+        cap = ctl.state["rounds_completed"][cp]
+        ctl.state["limits"]["max_review_rounds_per_checkpoint"] = cap
+        ctl.save()
+        env.commit("late.txt", "late\n", "moved after handoff")
+        env.push()
+        env.gh.fail_next = 99  # settlement fails after the reopen transaction
+        with self.assertRaises(ar.Stop):
+            ctl.resume("extend", max_rounds=cap + 2)
+        on_disk = ar.read_json(env.dir / "state.json")
+        self.assertEqual(("ACTIVE", cap + 2), (on_disk["status"], on_disk["limits"]["max_review_rounds_per_checkpoint"]))
+
+    def test_preceding_hashed_receipts_keep_their_failing_scope(self):
+        """R6-F3: receipts named under the preceding format (definition = argv only)."""
+        flag = Path(tempfile.mkdtemp(prefix="agent-review-flag-")) / "code"
+        self.addCleanup(shutil.rmtree, flag.parent, True)
+        flag.write_text("1", encoding="utf-8")
+        code = f"import sys, pathlib; sys.exit(int(pathlib.Path({str(flag)!r}).read_text()))"
+        env = self.gated_env({"unit": {"argv": [sys.executable, "-c", code], "extra_args_pattern": "A|B"}})
+        ctl = env.controller()
+        head = git(env.work, "rev-parse", "HEAD")
+        ctl.run_gate("unit", ["A"])  # fails
+        decl = ctl.cfg["gates"]["unit"]
+        for path in (ctl.dir / "evidence").glob("gate-unit-*.json"):
+            path.rename(path.with_name(path.name.replace(f"-d{ar.gate_definition_id(decl)}-",
+                                                         f"-d{ar.legacy_definition_id(decl)}-")))
+        flag.write_text("0", encoding="utf-8")
+        ctl.run_gate("unit", ["B"])
+        self.assertEqual(["unit"], ctl.missing_gates(head))  # A's failure survives the format change
+        ctl.run_gate("unit", ["A"])
+        self.assertEqual([], ctl.missing_gates(head))
+        ctl.cfg["gates"]["unit"]["extra_args_pattern"] = "B"  # A now positively excluded: its evidence is history
+        flag.write_text("1", encoding="utf-8")
+        self.assertEqual(["unit"], ctl.missing_gates(head))  # only B's (current-definition) run would count...
+        flag.write_text("0", encoding="utf-8")
+        ctl.run_gate("unit", ["B"])
+        self.assertEqual([], ctl.missing_gates(head))
+
+    def test_late_confirmed_part_is_appended_and_required(self):
+        """R6-F1: a key archived with part of its inventory gets an append-only supplement."""
+        env = self.env
+        ctl = env.controller()
+        long_body = "### Codex GPT-6.2 Astra — review — round 6\n\n" + ("q" * 50 + "\n") * 2000
+        ctl.queue("r06-review", long_body)
+        pub = ctl.state["publications"]["r06-review"]
+        ctl.send("r06-review", pub)
+        late = pub["parts"][-1]
+        saved = (late["comment_id"], late["url"])
+        late.update(comment_id=None, url=None)  # as an earlier version recorded it: not yet confirmed
+        pub["state"] = "superseded"
+        ctl.archive("first")
+        self.assertIn("r06-review", ctl.state["archived_keys"])
+        folder = Path(ctl.state["repo_root"]) / ctl.transcript_folder()
+        late["comment_id"], late["url"] = saved  # confirmed later
+        self.assertEqual([late], ctl.unarchived_parts(pub, folder))
+        ctl.archive("second")
+        self.assertEqual([], ctl.unarchived_parts(pub, folder))
+        self.assertTrue(list(folder.glob("*-r06-review-supplement.md")))
+
+    def test_receipt_corrections_are_archived(self):
+        """R8-F1."""
+        env = self.env
+        ctl = self.handed_off()
+        receipt = next(k for k in ctl.state["publications"] if ar.VERDICT_KEY_RE.match(k) and k.startswith("final-"))
+        ctl.retire_receipts("test")
+        ctl.archive("after correction")
+        folder = Path(ctl.state["repo_root"]) / ctl.transcript_folder()
+        self.assertTrue(list(folder.glob(f"*-{receipt}-retired.md")))
+        self.assertFalse(list(folder.glob(f"*-{receipt}.md")))  # the receipt itself describes the archive head
+
+    def test_activation_supersedes_an_outstanding_request(self):
+        """R8-F2."""
+        env = self.env
+        ctl = env.controller()
+        ctl.accept_report(report(env, "phase-1"))
+        candidate = ctl.capture_candidate()
+        ctl.state["rounds"].append({"round": 1, "request_id": "x-r01-old", "checkpoint_id": "phase-1",
+                                    "checkpoint_type": "intermediate", **candidate, "pending_findings": [],
+                                    "report": ctl.state["last_report"], "created_at": ar.now_iso(),
+                                    "status": "requested", "attempts": [], "attempt_seq": 0,
+                                    "contract": {"workflow": ctl.state["workflow"]["fingerprint"],
+                                                 "project": ar.project_digest(ctl.cfg)}})
+        ctl.state.update(active_round=1, phase="review")
+        ctl.save()
+        (env.wf / "prompts" / "reviewer.md").write_text("new rules\n", encoding="utf-8")
+        result = env.controller().activate()
+        self.assertIn("round 1 request", result["invalidated"])
+        env.reviewer.script = [{"decision": "checkpoint_passed"}]
+        fresh = env.controller()
+        self.assertEqual("checkpoint_passed", fresh.review_round())
+        self.assertNotEqual("x-r01-old", fresh.state["rounds"][-1]["request_id"])
+
+    def test_final_pass_with_an_open_correctness_finding_is_invalid(self):
+        """R8-F3."""
+        env = self.env
+        ctl = env.controller()
+        self.to_finalize(ctl)
+        ctl.state["findings"]["R9-F1"] = {"status": "open", "category": "defect", "blocks_readiness": False,
+                                          "title": "non-blocking defect"}
+        reasons, _ = ctl.readiness(git(env.work, "rev-parse", "HEAD"))
+        self.assertTrue(any("actionable correctness" in r for r in reasons))
+
+    def test_quota_error_in_json_events_is_fatal(self):
+        """R8-F4."""
+        path = self.env.root / "events.jsonl"
+        path.write_text('{"type":"thread.started","thread_id":"%s"}\n{"type":"turn.started"}\n'
+                        '{"type":"error","message":"You have hit your usage limit. Try again later."}\n' % TID,
+                        encoding="utf-8")
+        info = {"exit_code": 1, **ar.parse_codex_events(path)}
+        self.assertTrue(info["errors"])
+        ctl = self.env.controller()
+        rnd = {"round": 1, "pending_findings": [], "checkpoint_type": "intermediate", "checkpoint_id": "phase-1",
+               "request_id": "x-r01-q", "H": "0" * 40, "B": "0" * 40, "M": "0" * 40}
+        envelope = ctl.validate_review(rnd, self.env.root / "missing.json", info, {}, self.env.root / "missing.txt")
+        self.assertTrue(envelope["fatal"])
+
+    def test_documented_module_invocation_imports(self):
+        """R8-F5."""
+        root = Path(ar.__file__).resolve().parent.parent
+        out = subprocess.run([sys.executable, "-m", "unittest", "agent_review/test_live_smoke.py"], cwd=root,
+                             capture_output=True, text=True, timeout=300,
+                             env={k: v for k, v in os.environ.items() if k != "AGENT_REVIEW_LIVE"})
+        self.assertEqual(0, out.returncode, out.stderr[-2000:])
 
 
 class ToolTranscriptTests(unittest.TestCase):

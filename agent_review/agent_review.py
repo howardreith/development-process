@@ -675,8 +675,9 @@ class CodexReviewer:
                     scalar(obj_at(payload, "sandbox_policy").get("type"), "sandbox type") or "<missing>")
             elif ptype == "thread_settings_applied":
                 settings = obj_at(payload, "thread_settings")
-                info["observed_model"] = scalar(settings.get("model"), "model")
-                info["observed_effort"] = scalar(settings.get("reasoning_effort"), "reasoning effort")
+                info.setdefault("applied_models", []).append(scalar(settings.get("model"), "model") or "<missing>")
+                info.setdefault("applied_efforts", []).append(scalar(settings.get("reasoning_effort"), "reasoning effort")
+                                                              or "<missing>")
                 info.setdefault("approvals_seen", []).append(scalar(settings.get("approval_policy"), "approval policy")
                                                              or "<missing>")
                 info.setdefault("networks_seen", []).append(
@@ -685,8 +686,14 @@ class CodexReviewer:
                 info["usage"] = obj_at(payload, "info").get("total_token_usage")
                 info["plan_type"] = obj_at(payload, "rate_limits").get("plan_type")
             elif kind == "response_item" and ptype in ("function_call", "custom_tool_call"):
-                if str(payload.get("name", "")).split(".")[-1] in DELEGATION_TOOLS:
+                name = payload.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    problem("a tool call record has no tool name")
+                elif name.split(".")[-1] in DELEGATION_TOOLS:
                     info["subagent_suspected"] = True  # a recorded delegation dispatch
+        for field, seen in (("observed_model", "applied_models"), ("observed_effort", "applied_efforts")):
+            values = sorted(set(info.pop(seen, [])))  # every applied setting counts; a later one cannot erase another
+            info[field] = values[0] if len(values) == 1 else ("<conflicting:" + ",".join(values) + ">" if values else None)
         for field, seen in (("approval_policy", "approvals_seen"), ("network", "networks_seen")):
             values = sorted(set(info.pop(seen, [])))
             info[field] = values[0] if len(values) == 1 else ("<conflicting:" + ",".join(values) + ">" if values else None)
@@ -712,7 +719,7 @@ def _rollout_header(path):
 def parse_codex_events(events_path):
     """Outcome of the actual event sequence: completed only if the last turn event is turn.completed and no
     failure or unparseable event occurred."""
-    thread_id, last_turn, malformed, failed = None, None, False, False
+    thread_id, last_turn, malformed, failed, errors = None, None, False, False, []
     for line in Path(events_path).read_text(encoding="utf-8", errors="replace").splitlines():
         if not line.strip():
             continue
@@ -740,8 +747,13 @@ def parse_codex_events(events_path):
             last_turn = "completed"
         elif kind in ("turn.failed", "error"):
             last_turn, failed = "failed", True
+            detail = event.get("message") if kind == "error" else (event.get("error") or {})
+            if isinstance(detail, dict):
+                detail = detail.get("message")
+            if isinstance(detail, str):
+                errors.append(detail[:1000])
     return {"thread_id": thread_id, "completed": last_turn == "completed" and not malformed and not failed,
-            "failed": failed or malformed}
+            "failed": failed or malformed, "errors": errors}
 
 
 def invocation_problems(info, prov, requested):
@@ -1576,8 +1588,10 @@ class Controller:
         candidate = self.capture_candidate()
         self.verify_transcripts(candidate["H"])
         self.verify_transcript_delta(candidate["M"], candidate["H"])
+        contract = {"workflow": self.state["workflow"]["fingerprint"], "project": project_digest(self.cfg)}
         reuse = (rnd and rnd["status"] in ("requested", "reviewing") and rnd["H"] == candidate["H"]
-                 and rnd["M"] == candidate["M"] and rnd["checkpoint_id"] == cp["id"])
+                 and rnd["M"] == candidate["M"] and rnd["checkpoint_id"] == cp["id"]
+                 and rnd.get("contract", contract) == contract)  # never reused under another review contract
         if not reuse:
             if rnd:
                 rnd["status"] = "superseded"
@@ -1592,7 +1606,8 @@ class Controller:
                    "pending_findings": list(self.state.get("pending_findings", [])),
                    "report": self.state["last_report"], "developer_provenance": self.state.get("last_report_provenance"),
                    "evidence_since": self.state["rounds"][-1]["created_at"] if self.state["rounds"] else self.state["created_at"],
-                   "created_at": now_iso(), "status": "requested", "attempts": [], "attempt_seq": 0}
+                   "created_at": now_iso(), "status": "requested", "attempts": [], "attempt_seq": 0,
+                   "contract": contract}
             self.state["rounds"].append(rnd)
             self.state["active_round"] = number
             self.save()
@@ -1767,7 +1782,7 @@ class Controller:
         if info.get("exit_code") != 0:
             reasons.append(f"reviewer process exited {info.get('exit_code')}")
         stderr = Path(stderr_path).read_text(encoding="utf-8", errors="replace") if Path(stderr_path).exists() else ""
-        if USAGE_LIMIT_RE.search(stderr):
+        if USAGE_LIMIT_RE.search(stderr + "\n" + "\n".join(info.get("errors") or [])):  # stderr or JSON events
             reasons.append("reviewer reported a usage limit or model availability error")
             fatal = True
         if Path(result_path).exists():
@@ -1874,6 +1889,13 @@ class Controller:
                           if (ledger.get(fid) or {}).get("blocks_readiness") or fid in {f["id"] for f in blocking}]
         if passing and blocking_after:
             reasons.append("blocking findings would remain open after this passing decision: " + ", ".join(sorted(blocking_after)))
+        if result["decision"] == "ready_for_owner_review":
+            categories = {**{fid: (e.get("category")) for fid, e in ledger.items()},
+                          **{f["id"]: f["category"] for f in result["findings"]}}
+            defects = sorted(fid for fid in open_after if categories.get(fid) == "defect")
+            if defects:  # protocol section 11
+                reasons.append("ready_for_owner_review with actionable correctness findings lacking an accepted "
+                               "disposition: " + ", ".join(defects))
         return reasons
 
     def finish_round(self, rnd):
@@ -1915,9 +1937,18 @@ class Controller:
             raise Stop("PAUSED", "required gate evidence for the reviewed candidate is no longer valid ("
                        + ", ".join(missing) + "); re-run the gates and submit a report for review")
         result = envelope["result"]
-        record = self.publish(f"r{rnd['round']:02d}-review", self.review_body(rnd, envelope))
-        if record["state"] != "posted" or not all(part.get("comment_id") for part in record["parts"]):
-            raise Stop("PAUSED", f"round {rnd['round']} verdict is not a current, fully posted publication")
+        key = f"r{rnd['round']:02d}-review"
+        record = self.publish(key, self.review_body(rnd, envelope))
+        problem = self.publication_problems(key, record, self.gh.comments(self.state["pr"]["number"]))
+        if problem:  # authenticated on GitHub, not just in the local inventory, before anything is committed
+            if record["state"] == "posted":
+                record["state"] = "pending"  # the next attempt reconciles (never re-posts blindly) and re-checks
+                listing = {c["id"] for c in self.gh.comments(self.state["pr"]["number"])}
+                for part in record["parts"]:
+                    if part.get("comment_id") not in listing:
+                        part.update(comment_id=None, url=None)
+                self.save()
+            raise Stop("PAUSED", f"round {rnd['round']} verdict is not completely published on the PR: {problem}")
         rnd["published"] = [{"comment_id": p["comment_id"], "url": p["url"]} for p in record["parts"]]
         stale = self.freshness(rnd)  # publication may have taken minutes of retries
         if stale:
@@ -2149,7 +2180,10 @@ class Controller:
         folder = self.dir / "evidence"
         out = []
         marker = f"-{commit[:12]}-"
-        paths = (sorted(folder.glob("gate-*.json")) + sorted(folder.glob("gate-*.pending"))) if folder.exists() else []
+        # run markers are listed BEFORE receipts and never deleted: a run that completes between the two listings
+        # is seen either as its completed receipt or as a started run without one (fail closed), never as neither
+        markers = sorted(folder.glob("gate-*.pending")) if folder.exists() else []
+        paths = markers + (sorted(folder.glob("gate-*.json")) if folder.exists() else [])
         for path in paths:
             if marker not in path.name:
                 continue
@@ -2172,11 +2206,15 @@ class Controller:
                 data.get("candidate") == commit and data.get("gate") == named_gate and \
                 isinstance(data.get("argv"), list) and data.get("recorded_at") == identity["stamp"] and \
                 (m is None or argv_id(data["argv"]) == identity["argv"])
-            if valid and m is None:  # an intact receipt from the earlier naming scheme: attribute it from its body
-                declared = (self.cfg.get("gates") or {}).get(named_gate)
-                base = [a.replace("{repo_root}", self.state["repo_root"]) for a in declared["argv"]] if declared else None
+            declared = (self.cfg.get("gates") or {}).get(named_gate)
+            if declared and m is not None and identity["definition"] == legacy_definition_id(declared):
+                # the preceding hashed format (definition covered argv only): same declared command
+                identity["definition"] = gate_definition_id(declared) if not valid or \
+                    extras_permitted(declared, data["argv"], self.state["repo_root"]) else "replaced"
+            if valid and m is None:  # an intact receipt from the earliest naming scheme: attribute it from its body
                 identity.update(argv=argv_id(data["argv"]), definition=gate_definition_id(declared)
-                                if base is not None and data["argv"][:len(base)] == base else "replaced")
+                                if declared and extras_permitted(declared, data["argv"], self.state["repo_root"])
+                                else "replaced")
             if not valid:
                 data = {"schema": "agent-review.gate-receipt.v1", "candidate": commit, "damaged": True,
                         "gate": named_gate, "argv": None, "recorded_at": identity["stamp"]}
@@ -2270,8 +2308,7 @@ class Controller:
                    "worktree_unchanged": clean_after, "passed": code == 0 and clean_after,
                    "log": base.with_suffix(".log").name, "log_sha256": sha256_file(base.with_suffix(".log")),
                    "output_tail": text[-3000:], "recorded_by": "agent-review controller (not model-authored)"}
-        atomic_write_json(base.with_suffix(".json"), receipt)
-        pending.unlink(missing_ok=True)  # the completed, newer receipt also supersedes it if this is interrupted
+        atomic_write_json(base.with_suffix(".json"), receipt)  # the run marker stays: this newer receipt answers it
         return receipt
 
     def runtime_active(self):
@@ -2524,6 +2561,12 @@ class Controller:
         self.state["workflow"] = {"fingerprint": new, "root": str(self.wf), "activated_at": now_iso(), "previous": old}
         invalidated = []
         active = self.active()
+        if active and active["status"] in ("requested", "reviewing") and (new != old or project_changed):
+            self.reconcile_reviewer_attempt(active, self.dir / "rounds" / f"r{active['round']:02d}")
+            active["status"] = "superseded"  # an outstanding request under the old contract is never reused
+            self.state["active_round"] = None
+            invalidated.append(f"round {active['round']} request")
+            active = None
         if active and active["status"] == "validated" and (new != old or project_changed):
             active["status"] = "invalidated"
             self.state["active_round"] = None
@@ -2582,7 +2625,7 @@ class Controller:
                 self.state.update(status="AWAITING_OWNER_REVIEW", status_reason="handoff verified current on resume")
                 self.save()
                 return "AWAITING_OWNER_REVIEW (the handoff is still current)"
-            self.reopen(moved, int(max_rounds or self.limits["max_review_rounds_per_checkpoint"]))
+            self.reopen(moved, int(max_rounds or self.limits["max_review_rounds_per_checkpoint"]), extend_to=max_rounds)
         if self.state["phase"] == "cancelled":
             raise UsageError("enrollment was cancelled")
         limit = int(max_rounds or self.limits["max_review_rounds_per_checkpoint"])
@@ -2615,6 +2658,14 @@ class Controller:
         return "ACTIVE (foreground: continue with `review --report`)"
 
     # -- archive and readiness ---------------------------------------------------------
+    def unarchived_parts(self, pub, folder):
+        """Delivered parts of a publication whose markers appear in none of its committed records."""
+        texts = "".join(path.read_text(encoding="utf-8", errors="replace")
+                        for path in (folder.glob(f"*-{pub['key']}.md") if folder.exists() else []))
+        texts += "".join(path.read_text(encoding="utf-8", errors="replace")
+                         for path in (folder.glob(f"*-{pub['key']}-supplement.md") if folder.exists() else []))
+        return [q for q in pub["parts"] if q.get("comment_id") and q["marker"] not in texts]
+
     def transcript_folder(self):
         return f"{self.cfg['transcript_dir'].strip('/')}/pr-{self.state['pr']['number']}"
 
@@ -2637,8 +2688,8 @@ class Controller:
         archived_keys = set(self.state.get("archived_keys", []))
         files = []
         for pub in sorted(self.state.get("publications", {}).values(), key=lambda p: p["seq"]):
-            if pub["key"] in archived_keys or pub["key"].startswith("final-"):
-                continue
+            if pub["key"] in archived_keys or (pub["key"].startswith("final-status-") and VERDICT_KEY_RE.match(pub["key"])):
+                continue  # receipts describe the archive head; their corrections are substantive records
             if pub["state"] == "superseded" and any(p.get("posting_since") and not p.get("comment_id") for p in pub["parts"]):
                 self.visible_parts(pub["key"], pub)  # resolve uncertain deliveries before recording what was public
                 if any(p.get("posting_since") and not p.get("comment_id") for p in pub["parts"]):
@@ -2676,6 +2727,17 @@ class Controller:
                     files.append((f"{rel_dir}/{seq:03d}-{pub['key']}-envelope.json", env_text + "\n",
                                   f"{pub['key']}-envelope"))
                     seq += 1
+        for pub in sorted(self.state.get("publications", {}).values(), key=lambda p: p["seq"]):
+            if pub["key"] not in archived_keys:
+                continue  # covered above
+            if any(p.get("posting_since") and not p.get("comment_id") for p in pub["parts"]):
+                self.visible_parts(pub["key"], pub)
+            late = self.unarchived_parts(pub, folder)
+            if late:  # parts confirmed after the key was archived: an append-only supplement
+                body = (f"_Supplement: {len(late)} part(s) of `{pub['key']}` confirmed on the PR after it was "
+                        "first archived._\n\n" + "\n\n---\n\n".join(self.outbox_body(pub["key"], q) for q in late))
+                files.append((f"{rel_dir}/{seq:03d}-{pub['key']}-supplement.md", body, f"{pub['key']}-supplement-{seq}"))
+                seq += 1
         if not files:
             return head
         pending = {"parent": head, "reason": reason, "commit": None,
@@ -2800,6 +2862,15 @@ class Controller:
             reasons.append(f"PR head {short(pr['headRefOid'])} is not {short(archive_head)}")
         unresolved = sorted(k for k, p in self.state.get("publications", {}).items()
                             if any(part.get("posting_since") and not part.get("comment_id") for part in p["parts"]))
+        folder = Path(self.state["repo_root"]) / self.transcript_folder()
+        uncovered = sorted(k for k, p in self.state.get("publications", {}).items()
+                           if k in set(self.state.get("archived_keys", [])) and self.unarchived_parts(p, folder))
+        if uncovered:
+            reasons.append("committed records lack delivered parts of " + ", ".join(uncovered))
+        open_defects = sorted(fid for fid, e in self.state.get("findings", {}).items()
+                              if e.get("category") == "defect" and e.get("status") != "resolved")
+        if open_defects:  # protocol section 11: actionable correctness findings need accepted dispositions
+            reasons.append("actionable correctness findings without an accepted disposition: " + ", ".join(open_defects))
         if unresolved:
             reasons.append("delivery not yet resolved for " + ", ".join(unresolved)
                            + " (resume with --resend-undelivered after checking the PR)")
@@ -2956,7 +3027,18 @@ class Controller:
         if not ok:
             self.invalidate_ready("; ".join(why))
         try:
-            archive_head = self.archive("final")
+            for _ in range(3):  # corrections of older receipts are archived before the new receipt is posted
+                archive_head = self.archive("final")
+                keep = f"final-status-{short(archive_head)}"
+                stale = [k for k, p in self.state.get("publications", {}).items()
+                         if k.startswith("final-status-") and VERDICT_KEY_RE.match(k) and p["state"] != "superseded"
+                         and k != keep]
+                if not stale:
+                    break
+                self.retire_receipts(f"Superseded by the handoff being prepared after `{short(archive_head)}`.",
+                                     keep=keep)
+            else:
+                raise Stop("PAUSED", "older handoff receipts could not be retired and archived; retry finalize")
         except Stop as stop:
             self.retire_receipts(f"Handoff not current: {stop.reason}")
             raise
@@ -3011,6 +3093,25 @@ class Controller:
                           handoff={"H": ready["H"], "A": archive_head, "at": now_iso(), "status_section": section})
         self.transition("done", "owner review handoff posted")
         return "AWAITING_OWNER_REVIEW"
+
+    def publication_problems(self, key, pub, listing):
+        """Why one publication is not settled on the PR: inventory, markers, author, body and uniqueness."""
+        comments = {c["id"]: c for c in listing}
+        if pub["state"] != "posted":
+            return "not sent"
+        total = len(pub["parts"])
+        numbering = [re.search(r" part=(\d+)/(\d+) ", part.get("marker", "")) for part in pub["parts"]]
+        if not total or any(not m or (int(m.group(1)), int(m.group(2))) != (i + 1, total)
+                            for i, m in enumerate(numbering)):
+            return "incomplete part inventory"
+        for part in pub["parts"]:
+            remote = comments.get(part["comment_id"])
+            copies = [c for c in listing if c.get("user") == self.cfg["expected_actor"]
+                      and (c.get("body") or "").startswith(part["marker"])]
+            if not remote or remote.get("user") != self.cfg["expected_actor"] or len(copies) != 1 or \
+                    normalize_body(remote.get("body")) != normalize_body(self.outbox_body(key, part)):
+                return f"part {part['marker'][-30:]} is gone, altered, by another author, or duplicated"
+        return None
 
     def missing_publications(self, include_receipt=None):
         """Keys of substantive records not settled on the PR: unsent, gone, altered or by another author.
@@ -3076,7 +3177,7 @@ class Controller:
             return stop.reason
         return "; ".join(reasons) or None
 
-    def reopen(self, moved, limit=None):
+    def reopen(self, moved, limit=None, extend_to=None):
         """Retire the handoff. Receipt corrections, the cleared handoff, the develop phase, the resulting status
         (BLOCKED when the round budget is exhausted) and the queued public updates persist in one save."""
         exhausted = self.budget_exhausted(limit)
@@ -3084,6 +3185,8 @@ class Controller:
                                      f"{self.checkpoint['id']} is exhausted; resume with a larger --max-rounds") \
             if exhausted else ("ACTIVE", f"handoff superseded: {moved}")
         with self.txn():
+            if extend_to:  # the owner-authorized limit persists in the same save as the status it justifies
+                self.state["limits"]["max_review_rounds_per_checkpoint"] = int(extend_to)
             self.retire_receipts(f"Handoff superseded: {moved}")
             if self.state.get("handoff") or self.state.get("ready_review"):
                 self.state.setdefault("superseded_handoffs", []).append({**(self.state.get("handoff") or {}),
@@ -3196,6 +3299,20 @@ def gate_definition_id(gate):
 
 def argv_id(argv):
     return sha256_text(json.dumps(list(argv)))[:10]
+
+
+def legacy_definition_id(gate):
+    """The preceding format's definition identity (declared argv only)."""
+    return sha256_text(json.dumps(gate["argv"]))[:10]
+
+
+def extras_permitted(gate, argv, repo_root):
+    """Whether a recorded argv is the gate's declared command plus extra arguments its policy permits."""
+    base = [a.replace("{repo_root}", repo_root) for a in gate["argv"]]
+    if list(argv[:len(base)]) != base:
+        return False
+    extra = list(argv[len(base):])
+    return not extra or bool(gate.get("extra_args_pattern") and re.fullmatch(gate["extra_args_pattern"], " ".join(extra)))
 
 
 RECEIPT_NAME_RE = re.compile(r"^d([0-9a-f]{10})-a([0-9a-f]{10})-(\d{8}T\d{12}Z)$")
