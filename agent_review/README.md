@@ -166,6 +166,7 @@ git -C C:/Dev/<repo> worktree add -b claude/<feature> <worktree> origin/<default
 # commit the mission file (or a first change) and push it
 python $ar enroll  --project <name> --worktree <worktree> --plan single --mission <MISSION.md> --mode headless
 python $ar run     --enrollment <id>      # develop → verify → review → correct → … → owner handoff
+python $ar list                          # every enrollment on this machine (read-only)
 python $ar status  --enrollment <id> [--remote]
 python $ar stop    --enrollment <id> --reason "..."
 python $ar resume  --enrollment <id> --reason "what changed" [--max-rounds N]
@@ -175,6 +176,32 @@ python $ar cancel  --enrollment <id> --reason "..."
 Plans with intermediate checkpoints and `required_gates` go in `plans/` (or
 `~/.agent-review/plans/`). Exit codes: 0 done/awaiting owner, 2 BLOCKED,
 3 PAUSED, 4 refused.
+
+`list` prints a JSON array with one object per claim in the host registry
+(`%ProgramData%\agent-review\registry`), sorted by enrollment ID: `enrollment`,
+`repository`, `branch`, and from that enrollment's `state.json` `status`,
+`phase`, `pr` (number or null) and `updated_at`. It is strictly read-only: no
+locks, no writes and no network or GitHub calls, so it is safe while
+controllers run. A claim whose state file (or the claim itself) is missing,
+unreadable or malformed is still listed, with `status` `"unknown"` and an
+`error` field saying why; one damaged enrollment never fails the listing.
+Enrollment resolves the state root to an absolute path, so new claims record
+both `dir` and `state_dir` as absolute paths and enrollments made with a
+relative `--state-root` list correctly from any directory. Older claims naming only a relative directory, paths on network
+storage (a UNC/device path or a mapped network drive), and any path whose
+registry folder, claim file, state directory components or `state.json` is a
+symbolic link, junction or other reparse point are reported the same way
+without being read (links are refused conservatively, whatever their target;
+paths with `..` segments are refused, and a path with a missing component is
+reported missing without being opened). A registry folder that is linked,
+remote or cannot be enumerated (for example, listing permission denied) makes
+`list` refuse with exit 4 rather than print `[]`; an absent registry prints
+`[]`. A state file whose
+`enrollment_id` differs from the claim's is reported without copying any of
+its fields. `pr` is a positive integer or null even if the state file holds
+something else. Cancelled
+enrollments release their claim and are not listed. Use `status --enrollment
+<id>` for the full detail of one enrollment.
 
 ### Prepared mission: Black Tentacles (not started)
 

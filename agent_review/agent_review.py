@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import socket
+import stat
 import string
 import subprocess
 import sys
@@ -3706,8 +3707,11 @@ def _enroll_into(folder, enrollment_id, cfg, plan, args, git, gh, mission, top, 
                              + ", ".join(broken[:5]))
         state["archived"].update(known)
     atomic_write_json(folder / "state.json", state)
-    claim = {"enrollment_id": enrollment_id, "dir": str(folder), "repository": cfg["repository"], "branch": branch,
-             "at": now_iso()}
+    # state_dir: the absolute location for `list`, which runs from anywhere. folder is already absolute (the state
+    # root is resolved at enrollment, R13-F1), so dir and state_dir agree for new claims; list still accepts older
+    # claims that carry only dir.
+    claim = {"enrollment_id": enrollment_id, "dir": str(folder), "state_dir": os.path.abspath(folder),
+             "repository": cfg["repository"], "branch": branch, "at": now_iso()}
     atomic_write_json(reg, claim)
     atomic_write_json(Path(git("rev-parse", "--absolute-git-dir")) / "agent-review-enrollment.json", claim)
     return folder, state
@@ -4078,6 +4082,152 @@ def find_enrollment(value):
     raise UsageError(f"enrollment {value} is not registered under {folder}")
 
 
+LIST_ROW = {"enrollment": None, "repository": None, "branch": None,
+            "status": "unknown", "phase": None, "pr": None, "updated_at": None}
+
+
+def remote_path_reason(text):
+    """Why a path names network storage, or None. Decided from the path string and the local drive table only,
+    before anything touches the path: a UNC or device path (\\\\server\\share, //server/share, \\\\?\\UNC\\...)
+    or a drive letter mapped to a network share (GetDriveTypeW == DRIVE_REMOTE). Windows only."""
+    if os.name != "nt":
+        return None
+    path = text.replace("/", "\\")
+    local_device = re.match(r"\\\\[?.]\\([A-Za-z]):", path)  # \\?\C:\... is a local drive in long-path form
+    if path.startswith("\\\\") and not local_device:
+        return "a UNC or device path (possibly a network share)"
+    letter = local_device or re.match(r"([A-Za-z]):", path)
+    if letter:
+        import ctypes
+        if ctypes.windll.kernel32.GetDriveTypeW(f"{letter.group(1)}:\\") == 4:  # DRIVE_REMOTE
+            return "on a mapped network drive"
+    return None
+
+
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+
+PATH_MISSING = "missing"  # inspect_local_path: a component does not exist, so the path was not fully inspected
+
+
+def inspect_local_path(path):
+    """None when every component of path exists and is a plain local entry, so opening exactly this path stays on
+    local storage; PATH_MISSING when a component does not exist (the path must then not be opened: Windows could
+    normalize the missing part away and reach components that were never inspected); otherwise the reason it
+    could leave local storage. Nothing is followed: the path string and drive table are checked first
+    (remote_path_reason), '..' segments are refused (the effective path must be the inspected one), then every
+    component from the root down is examined with lstat, which does not traverse links, so a parent is known to be
+    a plain local directory before its child is examined. Any symbolic link, junction or other reparse point is
+    refused conservatively, whatever its target."""
+    text = str(path)
+    remote = remote_path_reason(text)
+    if remote:
+        return f"{text} is {remote}"
+    path = Path(text)
+    if not path.is_absolute():
+        return f"{text} is a relative path"
+    if ".." in path.parts:
+        return f"{text} contains a '..' segment; only canonical paths are read"
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            return PATH_MISSING
+        except OSError as exc:
+            return f"{current} cannot be inspected without following it: {exc}"
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT:
+            return f"{current} is a symbolic link, junction or other reparse point"
+    return None
+
+
+def _text(value):
+    return value if isinstance(value, str) else None
+
+
+def _list_row(entry):
+    row = dict(LIST_ROW)
+    problem = inspect_local_path(entry)
+    if problem == PATH_MISSING:
+        return {**row, "error": f"claim {entry.name} disappeared while listing; it was not read"}
+    if problem:
+        return {**row, "error": f"claim {entry.name} was not read: {problem}; list reads local files only"}
+    try:
+        claim = read_json(entry)
+        if not isinstance(claim, dict):
+            raise ValueError("claim is not a JSON object")
+    except (OSError, ValueError, RecursionError) as exc:  # RecursionError: pathologically nested JSON
+        return {**row, "error": f"claim {entry.name} is unreadable: {type(exc).__name__}: {exc}"}
+    row.update(enrollment=_text(claim.get("enrollment_id")), repository=_text(claim.get("repository")),
+               branch=_text(claim.get("branch")))
+    # state_dir (absolute, recorded at enrollment) is preferred; older claims only carry dir.
+    key = "state_dir" if "state_dir" in claim else "dir"
+    folder = claim.get(key)
+    if not isinstance(folder, str) or not folder.strip():
+        return {**row, "error": f"claim {entry.name} names no valid enrollment directory "
+                                f"({key} is {type(folder).__name__})"}
+    if not Path(folder).is_absolute():  # UNC forms are absolute and are refused by local_read_problem below
+        return {**row, "error": f"claim {entry.name} names a relative state directory ({folder}) that cannot be "
+                                "resolved independently of the working directory; it was not read"}
+    state_path = Path(folder) / "state.json"
+    problem = inspect_local_path(state_path)
+    if problem == PATH_MISSING:  # reported without opening: an uninspected path is never read
+        return {**row, "error": f"state file is missing: {state_path}"}
+    if problem:
+        return {**row, "error": f"state file {state_path} was not read: {problem}; list inspects local state only "
+                                "and did not access it"}
+    try:
+        state = read_json(state_path)
+        if not isinstance(state, dict):
+            raise ValueError("state is not a JSON object")
+    except FileNotFoundError:
+        return {**row, "error": f"state file is missing: {state_path}"}
+    except (OSError, ValueError, RecursionError) as exc:
+        return {**row, "error": f"state file is unreadable: {state_path}: {type(exc).__name__}: {exc}"}
+    owner = state.get("enrollment_id")
+    if row["enrollment"] is None or owner != row["enrollment"]:  # never show another enrollment's status or PR
+        return {**row, "error": f"state file {state_path} belongs to enrollment {owner!r}, not to this claim's "
+                                f"{row['enrollment']!r}; its fields were not used"}
+    pr = state.get("pr")
+    number = pr.get("number") if isinstance(pr, dict) else None
+    row.update(phase=_text(state.get("phase")), updated_at=_text(state.get("updated_at")),
+               pr=number if isinstance(number, int) and not isinstance(number, bool) and number > 0 else None)
+    status = state.get("status")
+    if isinstance(status, str) and status:
+        row["status"] = status
+    else:
+        row["error"] = f"state file has no valid status: {state_path}"
+    return row
+
+
+def list_enrollments():
+    """Every enrollment claim in the host registry with its state summary, sorted by enrollment ID. Strictly
+    read-only: no locks, no writes (not even creating the registry folder), no network or GitHub calls, and no
+    access to paths on network storage or behind links. A damaged claim or state file is reported (status
+    "unknown" with an error) instead of failing the whole listing."""
+    folder = host_dir() / "registry"
+    problem = inspect_local_path(folder)
+    if problem == PATH_MISSING:  # nothing was ever enrolled on this machine
+        return []
+    if problem:  # the registry itself is not an enrollment: refuse rather than enumerate a possibly remote folder
+        raise UsageError(f"host registry {folder} was not read: {problem}; list reads local files only")
+    try:  # os.scandir raises scan errors (Path.glob would silently yield nothing and report an empty registry)
+        with os.scandir(folder) as scan:
+            entries = sorted(folder / e.name for e in scan if e.name.lower().endswith(".json"))
+    except OSError as exc:
+        raise UsageError(f"host registry {folder} cannot be enumerated: {type(exc).__name__}: {exc}; "
+                         "the enrollments it holds cannot be listed")
+    rows = []
+    for entry in entries:
+        try:
+            rows.append(_list_row(entry))
+        except Exception as exc:  # last resort: one damaged enrollment never hides the others
+            rows.append({**LIST_ROW, "error": f"claim {entry.name} could not be inspected: "
+                                              f"{type(exc).__name__}: {exc}"})
+    return sorted(rows, key=lambda r: (r["enrollment"] is None, r["enrollment"] or ""))
+
+
 COMMAND_STATUSES = {"run": {"ACTIVE"}, "review": {"ACTIVE"}, "finalize": {"ACTIVE"},
                     "archive": {"ACTIVE", "PAUSED", "BLOCKED", "AWAITING_OWNER_REVIEW"},
                     "resume": {"ACTIVE", "PAUSED", "BLOCKED", "AWAITING_OWNER_REVIEW"},
@@ -4147,6 +4297,7 @@ def main(argv=None):
     p = sub.add_parser("check-project", help="validate a project config against its repository and GitHub")
     p.add_argument("--project", required=True)
     p.add_argument("--repo", required=True)
+    sub.add_parser("list", help="read-only: every enrollment registered on this machine, with its status")
     p = sub.add_parser("enroll", help="enroll a branch, draft PR, mission and plan")
     p.add_argument("--project", required=True)
     p.add_argument("--worktree", required=True)
@@ -4238,6 +4389,9 @@ def main(argv=None):
             problems, facts = check_project(load_project(args.project), args.repo)
             print(json.dumps({"project": args.project, "problems": problems, **facts}, indent=2))
             return EXIT_OK if not problems else EXIT_BLOCKED
+        if args.command == "list":
+            print(json.dumps(list_enrollments(), indent=2))
+            return EXIT_OK
         if args.command == "enroll":
             folder, state = enroll(args)
             print(json.dumps({"enrollment": state["enrollment_id"], "dir": str(folder), "pr": state["pr"]["url"],

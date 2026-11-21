@@ -1,0 +1,114 @@
+{
+  "B": "2fbf851e51f55b57dacaebee3576cbba8d9abef5",
+  "H": "5c786193d800972057e2e6a39ca96c98549d4645",
+  "M": "2fbf851e51f55b57dacaebee3576cbba8d9abef5",
+  "checkpoint_id": "final",
+  "checkpoint_type": "final",
+  "fatal": false,
+  "invocation": {
+    "completed": true,
+    "duration_s": 58.8,
+    "errors": [],
+    "exit_code": 0,
+    "failed": false,
+    "observed": {
+      "approval_policy": "never",
+      "cli_version": "0.170.0",
+      "network": "restricted",
+      "observed_effort": "high",
+      "observed_model": "gpt-6.2-astra",
+      "plan_type": "pro",
+      "rollout_found": true,
+      "sandbox": "read-only",
+      "source": "Codex session rollout (CLI-recorded thread settings; not model-authored)",
+      "subagent_suspected": false,
+      "turn_efforts": [
+        "high"
+      ],
+      "turn_models": [
+        "gpt-6.2-astra"
+      ],
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 183936,
+        "input_tokens": 230064,
+        "output_tokens": 1667,
+        "reasoning_output_tokens": 28,
+        "total_tokens": 231731
+      }
+    },
+    "requested": {
+      "effort": "high",
+      "model": "gpt-6.2-astra",
+      "sandbox": "read-only"
+    },
+    "thread_id": "01a1fdbf-b736-73c3-9772-cd05610973a2",
+    "timed_out": false
+  },
+  "mission": {
+    "id": "list-command-integration-mission",
+    "sha256": "71ca3956b7521d7e3c7cd4770c4b353156ab6893943bf262e469282825daa668"
+  },
+  "ok": true,
+  "path": "~\\.agent-review\\state\\devproc-claude-list-command-20261121054931-04cb\\rounds\\r01\\envelope-1.json",
+  "pr": 2,
+  "project_sha256": "c7c0f2de947d34bfbcdc0930ecb0d14ffda525794a0aaf9289e463ec434d1623",
+  "protocol": "agent-review.v1",
+  "publication": "r01-review",
+  "published": [
+    {
+      "comment_id": 7061571026,
+      "of": 1,
+      "part": 1,
+      "url": "https://github.com/howardreith/development-process/pull/2#issuecomment-7061571026"
+    }
+  ],
+  "raw_result_if_rejected": null,
+  "reasons": [],
+  "repository": "howardreith/development-process",
+  "request_id": "devproc-claude-list-command-20261121054931-04cb-r01-0ce755",
+  "response_sha256": "4b2a450c143cf4d280ef25e27b36b58ef8ab7f38634312f4e680da89e7827db3",
+  "result": {
+    "candidate_commit": "5c786193d800972057e2e6a39ca96c98549d4645",
+    "checkpoint_id": "final",
+    "checkpoint_type": "final",
+    "decision": "ready_for_owner_review",
+    "decision_rationale": "Merge cbcb789 has the required parents in order and preserves both branches\u2019 behavior. The integration adjusts the list regression test and documentation to reflect main\u2019s absolute state directory. The required unit gate passed on candidate 5c78619, including the handoff, enrollment ownership, and list regressions. No integration defect or required evidence gap remains.",
+    "evidence_assessment": {
+      "executed_verification": [
+        "Git inspection confirmed that cbcb789 has parents b89fa6c and 2fbf851, that main is an ancestor of the candidate, and that the sole change after the merge adds the integration mission. A tracked-tree scan found no conflict markers.",
+        "The controller\u2019s unit receipt records exit 0 for unittest discovery on the full candidate hash, with the worktree unchanged. The supplied log\u2019s SHA-256 matches the receipt. Of 208 tests, 207 passed and the opt-in live-model smoke test was skipped.",
+        "The log records passes for the lagging PR view test, both EnrollmentOwnershipTests, and every ListCommandTests case. These include listing under a held writer lock, checking for filesystem changes and subprocess or network calls, isolating damaged entries, and listing a relative-root enrollment from three working directories."
+      ],
+      "inspected": [
+        "The integration mission, original list mission, repository instructions, operating guide, review protocol, full feature diff, developer report, and empty prior-findings ledger.",
+        "The merge differences against both parents, the controller\u2019s unit receipt, and its matching test log."
+      ],
+      "limitations": [
+        "Runtime evidence comes from the controller-recorded unit gate. The reviewer used read-only Git and file inspection. The handoff regression exercises a simulated lagging GitHub response."
+      ],
+      "required_gaps": [],
+      "source_inspection_only": [
+        "Comparison with main confirmed that the bounded handoff wait, its regression test, the enrollment ownership checks, and EnrollmentOwnershipTests are intact. The README retains the Black Tentacles section alongside the list instructions.",
+        "Comparison with the PR #2 parent confirmed that the list implementation is unchanged. The revised assertion checks the absolute dir that main now records, while retaining the decoy-state check that verifies listing across working directories."
+      ]
+    },
+    "findings": [],
+    "prior_finding_assessments": [],
+    "request_id": "devproc-claude-list-command-20261121054931-04cb-r01-0ce755",
+    "round": 1,
+    "schema_version": "agent-review.review.v1",
+    "summary": {
+      "delivered_behavior": "The integrated controller lists enrollments read-only, isolates damaged entries, and locates new enrollments independently of the caller\u2019s working directory. Main\u2019s handoff and ownership safeguards are preserved.",
+      "pending_later_phase_work": [],
+      "remaining_owner_review": [
+        "Decide whether to merge draft PR #2 into main."
+      ],
+      "scope_reviewed": "The complete list-command integration mission, including the merge against each parent and validation of the final candidate.",
+      "unresolved_questions": []
+    }
+  },
+  "round": 1,
+  "validated_at": "2026-11-21T10:57:01Z",
+  "workflow_fingerprint": "ee771861f2db48a795e846f2b126dfe9021814c5e1698b93b8cc0923f98c8c22"
+}

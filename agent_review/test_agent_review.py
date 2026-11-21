@@ -3855,6 +3855,408 @@ class FirstReleaseTests(Base):
         self.assertIn("not an allowed", stop.exception.reason)
 
 
+def tree_snapshot(root):
+    """Every file and directory under root with its size and modification time: any write shows up as a change."""
+    return {str(p.relative_to(root)): (p.is_dir(), p.stat().st_size if p.is_file() else 0, p.stat().st_mtime_ns)
+            for p in sorted(Path(root).rglob("*"))}
+
+
+@contextlib.contextmanager
+def forbid_processes_and_network(test, forbidden=()):
+    """Tripwire, not a simulated response: fails the test if the code under test starts any process (git, gh),
+    opens a network connection, or reads a JSON file on a UNC/device path or under any `forbidden` path (links the
+    code must not follow). Nothing is answered on the code's behalf; every attempt is recorded and refused, and the
+    record is checked after the block (so a catch-all in the code under test cannot hide a violation)."""
+    from unittest import mock
+    attempts = []
+    real_read_json = ar.read_json
+    blocked = [os.path.normcase(os.path.normpath(str(p))) for p in forbidden]
+
+    def refuse(what):
+        def _refuse(*args, **kwargs):
+            attempts.append(what)
+            raise AssertionError(f"read-only command attempted {what}")
+        return _refuse
+
+    def guarded_read_json(path):
+        text = str(path).replace("/", "\\")
+        if text.startswith("\\\\") and not re.match(r"\\\\[?.]\\[A-Za-z]:", text):  # \\?\C:\ is a local drive
+            return refuse(f"to read network path {path}")()
+        effective = os.path.normcase(os.path.normpath(str(path)))  # what the OS opens after collapsing '..'
+        if any(effective.startswith(prefix) for prefix in blocked):
+            return refuse(f"to read through a link: {path}")()
+        return real_read_json(path)
+    with mock.patch.object(subprocess, "Popen", side_effect=refuse("a process")), \
+            mock.patch.object(socket.socket, "connect", refuse("a network connection")), \
+            mock.patch.object(socket, "create_connection", side_effect=refuse("a network connection")), \
+            mock.patch.object(ar, "read_json", guarded_read_json):
+        yield
+    test.assertEqual([], attempts)
+
+
+def set_windows_privilege(name, enabled):
+    """Enable or disable a privilege in this process's own token; returns whether it was enabled before, or None
+    if the token does not hold it. Test setup only (real OS state, nothing simulated)."""
+    import ctypes
+    from ctypes import wintypes
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class LUID(ctypes.Structure):
+        _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+    class LUID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Luid", LUID), ("Attributes", wintypes.DWORD)]
+
+    class TOKEN_PRIVILEGES(ctypes.Structure):
+        _fields_ = [("PrivilegeCount", wintypes.DWORD), ("Privileges", LUID_AND_ATTRIBUTES * 1)]
+    enabled_flag = 0x2  # SE_PRIVILEGE_ENABLED
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.LookupPrivilegeValueW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.POINTER(LUID)]
+    advapi32.AdjustTokenPrivileges.argtypes = [wintypes.HANDLE, wintypes.BOOL, ctypes.POINTER(TOKEN_PRIVILEGES),
+                                               wintypes.DWORD, ctypes.POINTER(TOKEN_PRIVILEGES),
+                                               ctypes.POINTER(wintypes.DWORD)]
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), 0x20 | 0x8, ctypes.byref(token)):  # ADJUST|QUERY
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        luid = LUID()
+        if not advapi32.LookupPrivilegeValueW(None, name, ctypes.byref(luid)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        new = TOKEN_PRIVILEGES(1, (LUID_AND_ATTRIBUTES * 1)(LUID_AND_ATTRIBUTES(luid, enabled_flag if enabled else 0)))
+        old, size = TOKEN_PRIVILEGES(), wintypes.DWORD(0)
+        if not advapi32.AdjustTokenPrivileges(token, False, ctypes.byref(new), ctypes.sizeof(old), ctypes.byref(old),
+                                              ctypes.byref(size)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if ctypes.get_last_error() == 1300:  # ERROR_NOT_ALL_ASSIGNED: the token does not hold this privilege
+            return None
+        if old.PrivilegeCount == 0:  # already in the requested state
+            return enabled
+        return bool(old.Privileges[0].Attributes & enabled_flag)
+    finally:
+        kernel32.CloseHandle(token)
+
+
+class ListCommandTests(Base):
+    """Mission: read-only `list` of every enrollment claim in the host registry."""
+
+    def run_list(self, forbidden=()):
+        with forbid_processes_and_network(self, forbidden), contextlib.redirect_stdout(io.StringIO()) as out:
+            code = ar.main(["list"])
+        self.assertEqual(ar.EXIT_OK, code)
+        return out.getvalue()
+
+    def test_lists_an_enrollment_with_its_fields_without_locks_or_writes(self):
+        env = self.env
+        ctl = env.controller()
+        ctl.save()  # stamps updated_at, as every controller transition does
+        self.assertTrue(ctl.state["updated_at"])
+        claim = ar.registry_path("owner/repo", env.branch)
+        self.assertTrue(claim.exists())
+        with ctl.lock("run"):  # the owning controller holds its writer lock: list neither waits nor is refused
+            before = tree_snapshot(env.root)
+            rows = json.loads(self.run_list())
+            self.assertEqual(before, tree_snapshot(env.root))  # nothing written, no lock or holder files
+        self.assertEqual([{"enrollment": ctl.state["enrollment_id"], "repository": "owner/repo",
+                           "branch": env.branch, "status": "ACTIVE", "phase": ctl.state["phase"], "pr": 7,
+                           "updated_at": ctl.state["updated_at"]}], rows)
+        self.assertEqual(ctl.state["status"], rows[0]["status"])
+
+    def test_empty_registry_prints_an_empty_array(self):
+        env = self.env
+        ctl = env.controller()
+        ctl.verify_inputs()
+        self.assertEqual("CANCELLED", ctl.cancel("owner decision"))  # releases the only claim
+        self.assertEqual([], list((ar.host_dir() / "registry").glob("*.json")))
+        self.assertEqual("[]", self.run_list().strip())
+        from unittest import mock
+        absent = env.root / "fresh-host"  # a machine where nothing was ever enrolled
+        with mock.patch.dict(os.environ, {"AGENT_REVIEW_HOST_DIR": str(absent)}):
+            self.assertEqual("[]", self.run_list().strip())
+        self.assertFalse(absent.exists())  # list does not even create the registry folder
+
+    def test_damaged_enrollments_are_reported_unknown_without_failing(self):
+        env = self.env
+        ctl = env.controller()
+        enrollment = ctl.state["enrollment_id"]
+        (env.dir / "state.json").write_text("{ not json", encoding="utf-8")  # damaged state file
+        registry = ar.host_dir() / "registry"
+        ar.atomic_write_json(registry / "other.json", {"enrollment_id": "a-missing-state", "dir": str(env.root / "gone"),
+                                                        "repository": "owner/other", "branch": "claude/x"})
+        (registry / "zz-broken.json").write_text("garbage", encoding="utf-8")  # damaged claim itself
+        rows = json.loads(self.run_list())
+        self.assertEqual(["a-missing-state", enrollment, None], [r["enrollment"] for r in rows])  # sorted by ID
+        missing, damaged, broken = rows
+        self.assertEqual(("unknown", "owner/other", "claude/x", None, None),
+                         (missing["status"], missing["repository"], missing["branch"], missing["pr"], missing["phase"]))
+        self.assertIn("missing", missing["error"])
+        self.assertIn(str(env.root / "gone"), missing["error"])
+        self.assertEqual(("unknown", "owner/repo", env.branch), (damaged["status"], damaged["repository"], damaged["branch"]))
+        self.assertIn("unreadable", damaged["error"])
+        self.assertEqual("unknown", broken["status"])
+        self.assertIn("zz-broken.json", broken["error"])
+
+    # R1 regressions: each damaged entry is listed next to the real, healthy enrollment.
+
+    def claim(self, enrollment, folder, **extra):
+        ar.atomic_write_json(ar.host_dir() / "registry" / f"{enrollment}.json",
+                             {"enrollment_id": enrollment, "dir": folder, "repository": "owner/other",
+                              "branch": f"claude/{enrollment}", **extra})
+
+    def state_dir(self, name, text):
+        folder = self.env.root / "other-state" / name
+        folder.mkdir(parents=True)
+        (folder / "state.json").write_text(text, encoding="utf-8")
+        return str(folder)
+
+    def listed(self, forbidden=()):
+        rows = {r["enrollment"]: r for r in json.loads(self.run_list(forbidden))}
+        ctl = self.env.controller()
+        healthy = rows.pop(ctl.state["enrollment_id"])
+        self.assertEqual({"enrollment": ctl.state["enrollment_id"], "repository": "owner/repo",
+                          "branch": self.env.branch, "status": "ACTIVE", "phase": ctl.state["phase"], "pr": 7,
+                          "updated_at": ctl.state.get("updated_at")}, healthy)
+        return rows
+
+    def test_malformed_claims_never_hide_healthy_enrollments(self):
+        """R1-F1: non-string dir values and pathologically nested JSON (RecursionError) stay per-entry."""
+        deep = "[" * 200000
+        self.claim("a-dir-number", 42)
+        self.claim("b-dir-object", {"path": "x"})
+        self.claim("c-dir-empty", "")
+        self.claim("d-deep-state", self.state_dir("deep", deep))
+        (ar.host_dir() / "registry" / "e-deep-claim.json").write_text(deep, encoding="utf-8")
+        rows = self.listed()
+        for enrollment, needle in (("a-dir-number", "dir is int"), ("b-dir-object", "dir is dict"),
+                                   ("c-dir-empty", "dir is str"), ("d-deep-state", "RecursionError")):
+            self.assertEqual("unknown", rows[enrollment]["status"], enrollment)
+            self.assertEqual("owner/other", rows[enrollment]["repository"])
+            self.assertIn(needle, rows[enrollment]["error"])
+        self.assertIn("e-deep-claim.json", rows[None]["error"])
+        self.assertIn("RecursionError", rows[None]["error"])
+
+    def test_invalid_state_values_keep_the_output_types(self):
+        """R1-F2: pr is a positive integer or null; status is a string (else unknown with an error)."""
+        base = {"phase": "develop", "updated_at": "2026-11-21T00:00:00Z"}
+        for name, pr in (("p-string", {"number": "7"}), ("p-bool", {"number": True}), ("p-object", {"number": {}}),
+                         ("p-float", {"number": 7.5}), ("p-scalar", 7)):
+            self.claim(name, self.state_dir(name, json.dumps({**base, "enrollment_id": name, "status": "ACTIVE",
+                                                              "pr": pr})))
+        self.claim("s-number", self.state_dir("s-number", json.dumps({**base, "enrollment_id": "s-number", "status": 5,
+                                                                       "pr": {"number": 3}, "phase": ["x"]})))
+        rows = self.listed()
+        for name in ("p-string", "p-bool", "p-object", "p-float", "p-scalar"):
+            self.assertEqual(("ACTIVE", None, "develop"), (rows[name]["status"], rows[name]["pr"], rows[name]["phase"]))
+        bad = rows["s-number"]
+        self.assertEqual(("unknown", 3, None), (bad["status"], bad["pr"], bad["phase"]))
+        self.assertIn("no valid status", bad["error"])
+
+    def test_enrollment_with_a_relative_state_root_is_listed_from_any_directory(self):
+        """R1-F3 (round 2): a real enrollment made with a relative --state-root records an absolute state_dir in
+        its claim (and, since R13-F1, an absolute dir as well), so list reads that enrollment's own state from any
+        working directory, never a decoy that a relative path would resolve to there."""
+        env = self.env
+        ctl = env.controller()
+        ctl.verify_inputs()
+        self.assertEqual("CANCELLED", ctl.cancel("re-enroll with a relative state root"))
+        saved = os.getcwd()
+        self.addCleanup(os.chdir, saved)
+        os.chdir(env.root)
+        folder, state = ar.enroll(env.args(state_root="rel-root"), github=env.gh, root=env.wf)
+        enrollment = state["enrollment_id"]
+        claim = ar.read_json(ar.registry_path("owner/repo", env.branch))
+        self.assertEqual(str(env.root / "rel-root" / enrollment), claim["dir"])  # resolved at enrollment (R13-F1)
+        self.assertEqual(str(env.root / "rel-root" / enrollment), claim["state_dir"])
+        on_disk = ar.read_json(env.root / "rel-root" / enrollment / "state.json")
+        decoy = env.work / "rel-root" / enrollment  # what the relative dir would mean from the work tree
+        decoy.mkdir(parents=True)
+        (decoy / "state.json").write_text(json.dumps({"enrollment_id": enrollment, "status": "AWAITING_OWNER_REVIEW",
+                                                      "phase": "done", "pr": {"number": 99}}), encoding="utf-8")
+        expected = [{"enrollment": enrollment, "repository": "owner/repo", "branch": env.branch,
+                     "status": on_disk["status"], "phase": on_disk["phase"], "pr": 7,
+                     "updated_at": on_disk.get("updated_at")}]
+        self.assertEqual("ACTIVE", on_disk["status"])
+        for cwd in (env.work, env.root, env.origin):
+            os.chdir(cwd)
+            self.assertEqual(expected, json.loads(self.run_list()))
+
+    def test_relative_state_directory_is_not_resolved_against_the_callers_directory(self):
+        """R1-F3: an older claim (no state_dir) with a relative dir would read whatever state happens to sit under
+        the current directory. It is reported (unknown, with the reason) and never read, from any directory."""
+        decoy = self.env.root / "rel-state" / "x"
+        decoy.mkdir(parents=True)
+        (decoy / "state.json").write_text(json.dumps({"status": "AWAITING_OWNER_REVIEW", "pr": {"number": 99}}),
+                                          encoding="utf-8")
+        self.claim("relative", os.path.join("rel-state", "x"))
+        saved = os.getcwd()
+        self.addCleanup(os.chdir, saved)
+        for cwd in (self.env.root, self.env.work):  # the decoy resolves from the first; nothing from the second
+            os.chdir(cwd)
+            row = self.listed()["relative"]
+            self.assertEqual(("unknown", None), (row["status"], row["pr"]))
+            self.assertIn("relative state directory", row["error"])
+
+    @unittest.skipUnless(os.name == "nt", "UNC paths and mapped network drives are Windows path forms")
+    def test_network_state_directories_are_reported_without_access(self):
+        """R1-F4: UNC/device paths are refused from the string alone (the tripwire fails on any read of them);
+        the healthy enrollment on a local drive is still read through the drive-type check."""
+        paths = {"n-unc": r"\\agent-review-unreachable.invalid\share\state\x",
+                 "n-forward": "//agent-review-unreachable.invalid/share/state/x",
+                 "n-long-unc": r"\\?\UNC\agent-review-unreachable.invalid\share\x"}
+        for name, folder in paths.items():
+            self.claim(name, folder)
+        own = self.state_dir("long", json.dumps({"enrollment_id": "n-local-long", "status": "PAUSED",
+                                                 "pr": {"number": 11}}))
+        self.claim("n-local-long", "\\\\?\\" + str(Path(own).resolve()))  # long-path form of a local drive
+        rows = self.listed()
+        for name, folder in paths.items():
+            self.assertEqual("unknown", rows[name]["status"])
+            self.assertIn("UNC or device path", rows[name]["error"])
+            self.assertIn("did not access it", rows[name]["error"])
+        self.assertEqual(("PAUSED", 11), (rows["n-local-long"]["status"], rows["n-local-long"]["pr"]))
+        self.assertIsNone(ar.remote_path_reason(str(self.env.root)))  # local fixed drive: not network storage
+
+    def test_claim_pointing_at_another_enrollments_state_shows_none_of_its_fields(self):
+        """R2-F1: identity is checked before any summary field is copied."""
+        env = self.env
+        self.claim("m-mismatch", str(env.dir))  # the healthy enrollment's own state directory
+        ar.atomic_write_json(ar.host_dir() / "registry" / "m-anonymous.json",
+                             {"dir": str(env.dir), "repository": "owner/other", "branch": "claude/anon"})
+        rows = self.listed()  # the healthy enrollment keeps its own values
+        mismatch = rows["m-mismatch"]
+        self.assertEqual(("unknown", None, None, None),
+                         (mismatch["status"], mismatch["pr"], mismatch["phase"], mismatch["updated_at"]))
+        self.assertIn("belongs to enrollment", mismatch["error"])
+        anonymous = rows[None]
+        self.assertEqual(("unknown", None, "claude/anon"), (anonymous["status"], anonymous["pr"], anonymous["branch"]))
+        self.assertIn("not to this claim's None", anonymous["error"])
+
+    @unittest.skipUnless(os.name == "nt", "junctions and reparse points are Windows filesystem links")
+    def test_links_are_refused_before_they_are_followed(self):
+        """R1-F4 (round 2): a junction as the state directory or as a parent component of it, and a junctioned
+        registry, are refused from lstat alone; the tripwire fails on any read through them. Link targets are
+        local, so conservative refusal is exercised without contacting a share."""
+        import _winapi
+        env = self.env
+        target = Path(self.state_dir("target", json.dumps({"enrollment_id": "l-direct", "status": "ACTIVE",
+                                                           "pr": {"number": 5}})))
+        (target / "sub").mkdir()
+        (target / "sub" / "state.json").write_text(json.dumps({"enrollment_id": "l-component", "status": "ACTIVE"}),
+                                                   encoding="utf-8")
+        junction = env.root / "junction"
+        _winapi.CreateJunction(str(target), str(junction))
+        self.addCleanup(os.rmdir, junction)  # removes the junction itself, never its target
+        self.claim("l-direct", str(target))  # the same content, read directly, is fine
+        self.claim("l-junction", str(junction))
+        self.claim("l-component", str(junction / "sub"))
+        rows = self.listed([junction])
+        self.assertEqual(("ACTIVE", 5), (rows["l-direct"]["status"], rows["l-direct"]["pr"]))
+        for name in ("l-junction", "l-component"):
+            self.assertEqual(("unknown", None), (rows[name]["status"], rows[name]["pr"]), name)
+            self.assertIn("reparse point", rows[name]["error"])
+            self.assertIn("did not access it", rows[name]["error"])
+        host_link = env.root / "host-link"
+        _winapi.CreateJunction(str(ar.host_dir()), str(host_link))
+        self.addCleanup(os.rmdir, host_link)
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"AGENT_REVIEW_HOST_DIR": str(host_link)}), \
+                forbid_processes_and_network(self, [host_link]), \
+                contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(ar.EXIT_USAGE, ar.main(["list"]))
+        self.assertEqual("", out.getvalue())
+        self.assertIn("reparse point", err.getvalue())
+
+    @unittest.skipUnless(os.name == "nt", "junctions are Windows filesystem links")
+    def test_noncanonical_or_missing_paths_are_never_opened(self):
+        """R1-F4 (round 3): Windows collapses `missing\\..` lexically, so `<root>\\missing\\..\\junction` would
+        open through a junction the component walk never reached. '..' segments are refused, and a missing component
+        stops the walk without opening the path (reported as missing). The tripwire compares normalized paths."""
+        import _winapi
+        env = self.env
+        target = Path(self.state_dir("target", json.dumps({"enrollment_id": "c-dotdot", "status": "ACTIVE",
+                                                           "pr": {"number": 5}})))
+        junction = env.root / "junction"
+        _winapi.CreateJunction(str(target), str(junction))
+        self.addCleanup(os.rmdir, junction)
+        self.claim("c-dotdot", str(env.root) + r"\missing\..\junction")
+        self.claim("c-dotdot-local", str(env.root) + r"\missing\..\other-state\target")  # refused, though local
+        self.claim("c-missing", str(env.root / "nope" / "x"))
+        rows = self.listed([junction, env.root / "nope", env.root / "missing"])
+        for name in ("c-dotdot", "c-dotdot-local"):
+            self.assertEqual(("unknown", None), (rows[name]["status"], rows[name]["pr"]), name)
+            self.assertIn("'..' segment", rows[name]["error"])
+        self.assertEqual(("unknown", None), (rows["c-missing"]["status"], rows["c-missing"]["pr"]))
+        self.assertIn("state file is missing", rows["c-missing"]["error"])
+
+    def test_unreadable_registry_is_refused_not_reported_empty(self):
+        """R3-F1: when the registry's attributes are readable but listing its contents is denied, list refuses
+        with a registry diagnostic and a nonzero exit instead of printing []. Absent and readable-empty registries
+        still print [] (test_empty_registry_prints_an_empty_array)."""
+        registry = ar.host_dir() / "registry"
+        self.assertTrue(list(registry.glob("*.json")))  # populated: the fixture's real enrollment claim
+        if os.name == "nt":
+            # An elevated token may hold SeBackupPrivilege enabled, which bypasses the DACL for directory opens;
+            # disable it in this test process for the duration (restored in cleanup) so the deny ACE applies.
+            previous = set_windows_privilege("SeBackupPrivilege", False)
+            if previous:
+                self.addCleanup(set_windows_privilege, "SeBackupPrivilege", True)
+            user = subprocess.run(["whoami"], check=True, capture_output=True, text=True).stdout.strip()
+            subprocess.run(["icacls", str(registry), "/deny", f"{user}:(RD)"], check=True, capture_output=True)
+            self.addCleanup(subprocess.run, ["icacls", str(registry), "/remove:d", user], check=True,
+                            capture_output=True)
+        else:
+            if os.geteuid() == 0:
+                self.skipTest("root bypasses directory permissions")
+            os.chmod(registry, 0o300)  # search and write, no read: entries cannot be listed
+            self.addCleanup(os.chmod, registry, 0o755)
+        with self.assertRaises(PermissionError):
+            os.listdir(registry)  # the condition under test really holds
+        self.assertTrue(registry.is_dir())  # while its metadata stays readable
+        with forbid_processes_and_network(self), contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(ar.EXIT_USAGE, ar.main(["list"]))
+        self.assertEqual("", out.getvalue())
+        self.assertIn("cannot be enumerated", err.getvalue())
+        self.assertIn("registry", err.getvalue())
+
+    def test_registry_that_is_not_a_directory_is_refused(self):
+        """R3-F1: any scan error is a refusal, not an empty listing."""
+        from unittest import mock
+        host = self.env.root / "file-host"
+        host.mkdir()
+        (host / "registry").write_text("not a directory", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"AGENT_REVIEW_HOST_DIR": str(host)}), forbid_processes_and_network(self), \
+                contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(ar.EXIT_USAGE, ar.main(["list"]))
+        self.assertEqual("", out.getvalue())
+        self.assertIn("cannot be enumerated", err.getvalue())
+
+    def test_symbolic_links_to_state_or_claim_files_are_refused(self):
+        """R1-F4 (round 2): a symbolic link as state.json or as a registry claim file is refused from lstat alone
+        (also on POSIX); the tripwire fails on any read through either link."""
+        env = self.env
+        target = Path(self.state_dir("target", json.dumps({"enrollment_id": "l-file", "status": "ACTIVE",
+                                                           "pr": {"number": 5}})))
+        registry = ar.host_dir() / "registry"
+        plain = env.root / "plain"
+        plain.mkdir()
+        self.claim("l-real", str(target))
+        try:
+            os.symlink(target / "state.json", plain / "state.json")
+            os.symlink(registry / "l-real.json", registry / "l-claimlink.json")
+        except OSError as exc:  # Windows needs Developer Mode or SeCreateSymbolicLinkPrivilege; junctions do not
+            self.skipTest(f"symbolic links cannot be created here: {exc}")
+        self.claim("l-file", str(plain))
+        rows = self.listed([plain / "state.json", registry / "l-claimlink.json"])
+        self.assertIn("belongs to enrollment", rows["l-real"]["error"])  # control: the target itself is readable
+        self.assertEqual(("unknown", None), (rows["l-file"]["status"], rows["l-file"]["pr"]))
+        self.assertIn("reparse point", rows["l-file"]["error"])
+        self.assertIn("did not access it", rows["l-file"]["error"])
+        self.assertIn("l-claimlink.json was not read", rows[None]["error"])
+        self.assertIn("reparse point", rows[None]["error"])
+
+
 class EnrollmentOwnershipTests(Base):
     """R13-F1: enrollment ownership must not depend on the caller's directory, and a claim whose prior state cannot
     be established is never replaced."""
