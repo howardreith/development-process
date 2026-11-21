@@ -2910,6 +2910,13 @@ class Controller:
         if not ok:
             reasons.append("material change after the reviewed candidate: " + "; ".join(why))
         pr = self.pr_view()
+        if pr["headRefOid"] != archive_head and self.git.remote_head(self.state["branch"]) == archive_head:
+            # the branch is already at A: GitHub's PR view lags a push by seconds; wait a bounded time for it
+            for _ in range(int(self.limits.get("pr_view_wait_attempts", 12))):
+                self.sleep(self.limits.get("pr_view_wait_seconds", 5))
+                pr = self.pr_view()
+                if pr["headRefOid"] == archive_head:
+                    break
         if pr["headRefOid"] != archive_head:
             reasons.append(f"PR head {short(pr['headRefOid'])} is not {short(archive_head)}")
         unresolved = sorted(k for k, p in self.state.get("publications", {}).items()
@@ -3551,6 +3558,34 @@ def registry_path(repository, branch):
     return host_dir() / "registry" / f"{branch_key(repository, branch)}.json"
 
 
+def prior_claim_state(claim: Path):
+    """The state an existing ownership claim points to, or UsageError when ownership cannot be established from
+    readable, valid prior state. A missing or unreadable state file means "ownership needs inspection", never
+    "this branch is available": the enrollment may still be live (or its developer still running) elsewhere."""
+    def refuse(why):
+        raise UsageError(f"ownership claim {claim} cannot be verified ({why}); inspect it before enrolling again. If "
+                         "that enrollment is truly gone and no developer from it is running, remove the claim file "
+                         "by hand.")
+    try:
+        prior = read_json(claim)
+    except (OSError, ValueError):
+        refuse("the claim is unreadable")
+    if not isinstance(prior, dict) or not isinstance(prior.get("dir"), str) or not prior.get("enrollment_id"):
+        refuse("the claim is malformed")
+    folder = Path(prior["dir"])
+    if not folder.is_absolute():
+        refuse("the claim records a relative state folder")
+    try:
+        old = read_json(folder / "state.json")
+    except FileNotFoundError:
+        refuse(f"its state file {folder / 'state.json'} is missing")
+    except (OSError, ValueError):
+        refuse(f"its state file {folder / 'state.json'} is unreadable")
+    if not isinstance(old, dict) or old.get("enrollment_id") != prior["enrollment_id"]:
+        refuse("its state file does not belong to the claimed enrollment")
+    return old
+
+
 def enroll(args, github=None, root=HERE):
     cfg = load_project(args.project, root)
     if cfg.get("enrollment_allowed") is False:  # the repository's own instructions forbid this workflow's actions
@@ -3579,19 +3614,18 @@ def enroll(args, github=None, root=HERE):
         reg = registry_path(cfg["repository"], branch)
         marker = Path(git("rev-parse", "--absolute-git-dir")) / "agent-review-enrollment.json"
         for claim in (reg, marker):  # machine registry and the worktree's own marker (independent of the home)
-            if claim.exists():
-                prior = read_json(claim)
-                prior_state = Path(prior["dir"]) / "state.json"
-                if prior_state.exists():  # carry the replaced enrollment's authenticated records into the ledger
-                    old = read_json(prior_state)
-                    if old.get("archived") and old.get("pr", {}).get("number"):
-                        ledger = records_ledger_path(cfg["repository"], old["pr"]["number"])
-                        known = read_json(ledger) if ledger.exists() else {}
-                        known.update(old["archived"])
-                        atomic_write_json(ledger, known)
-                if prior_state.exists() and read_json(prior_state).get("status") not in ("AWAITING_OWNER_REVIEW", "CANCELLED"):
-                    raise UsageError(f"branch {branch} already has an active enrollment: {prior['enrollment_id']}")
-        state_root = Path(expand(args.state_root or cfg.get("state_root") or str(agent_home() / "state")))
+            if claim.exists() or claim.is_symlink():
+                old = prior_claim_state(claim)  # refuses when ownership cannot be established
+                if old.get("status") not in ("AWAITING_OWNER_REVIEW", "CANCELLED"):
+                    raise UsageError(f"branch {branch} already has an active enrollment: {old['enrollment_id']}")
+                if old.get("archived") and old.get("pr", {}).get("number"):
+                    # carry the replaced enrollment's authenticated records into the ledger
+                    ledger = records_ledger_path(cfg["repository"], old["pr"]["number"])
+                    known = read_json(ledger) if ledger.exists() else {}
+                    known.update(old["archived"])
+                    atomic_write_json(ledger, known)
+        # Resolved once, so that every derived and persisted path is independent of the caller's directory.
+        state_root = Path(expand(args.state_root or cfg.get("state_root") or str(agent_home() / "state"))).resolve()
         state_root.mkdir(parents=True, exist_ok=True)
         slug = re.sub(r"[^a-z0-9]+", "-", branch.lower()).strip("-")
         enrollment_id = f"{cfg['project_id']}-{slug}-{dt.datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:4]}"
@@ -3673,8 +3707,9 @@ def _enroll_into(folder, enrollment_id, cfg, plan, args, git, gh, mission, top, 
                              + ", ".join(broken[:5]))
         state["archived"].update(known)
     atomic_write_json(folder / "state.json", state)
-    # state_dir: the absolute location (resolved now, against the enrolling process's directory) for `list`, which
-    # runs from anywhere; dir keeps its existing value for every other command.
+    # state_dir: the absolute location for `list`, which runs from anywhere. folder is already absolute (the state
+    # root is resolved at enrollment, R13-F1), so dir and state_dir agree for new claims; list still accepts older
+    # claims that carry only dir.
     claim = {"enrollment_id": enrollment_id, "dir": str(folder), "state_dir": os.path.abspath(folder),
              "repository": cfg["repository"], "branch": branch, "at": now_iso()}
     atomic_write_json(reg, claim)
@@ -4041,6 +4076,8 @@ def find_enrollment(value):
     for entry in folder.glob("*.json") if folder.exists() else []:
         data = read_json(entry)
         if data.get("enrollment_id") == value:
+            if not Path(data["dir"]).is_absolute():
+                raise UsageError(f"enrollment {value} records a relative state folder; inspect {entry}")
             return Path(data["dir"])
     raise UsageError(f"enrollment {value} is not registered under {folder}")
 

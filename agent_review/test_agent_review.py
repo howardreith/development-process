@@ -3811,6 +3811,26 @@ class FirstReleaseTests(Base):
         del ctl.cfg["required_gates"]  # default: every declared gate is required
         self.assertEqual(["extra", "unit"], ctl.required_gates())
 
+    def test_handoff_waits_for_a_lagging_pr_view(self):
+        """Live task (PR #2): right after the archive push, GitHub's PR view still showed the previous head and
+        finalize blocked on every attempt. When the branch itself is already at the archive head, readiness waits a
+        bounded time for the PR view; a PR view that never catches up still blocks."""
+        env = self.env
+        ctl = env.controller()
+        self.to_finalize(ctl)
+        stale = git(env.work, "rev-parse", "HEAD")
+        real_pr, calls = env.gh.pr, {"n": 0}
+
+        def lagging_pr(number):
+            data = real_pr(number)
+            calls["n"] += 1
+            if calls["n"] <= 3:
+                data["headRefOid"] = stale  # the previous head, as GitHub reported it for a few seconds
+            return data
+        env.gh.pr = lagging_pr
+        self.assertEqual("AWAITING_OWNER_REVIEW", ctl.finalize())
+        self.assertGreater(calls["n"], 3)
+
     def test_preflight_uses_the_same_developer_model_check(self):
         """R11-F2."""
         cfg = {"developer": {"allowed_model_pattern": "^claude-opus-", "model": "opus"}}
@@ -4034,8 +4054,8 @@ class ListCommandTests(Base):
 
     def test_enrollment_with_a_relative_state_root_is_listed_from_any_directory(self):
         """R1-F3 (round 2): a real enrollment made with a relative --state-root records an absolute state_dir in
-        its claim (dir keeps its existing relative value), so list reads that enrollment's own state from any
-        working directory, never a decoy that the relative dir would resolve to there."""
+        its claim (and, since R13-F1, an absolute dir as well), so list reads that enrollment's own state from any
+        working directory, never a decoy that a relative path would resolve to there."""
         env = self.env
         ctl = env.controller()
         ctl.verify_inputs()
@@ -4046,7 +4066,7 @@ class ListCommandTests(Base):
         folder, state = ar.enroll(env.args(state_root="rel-root"), github=env.gh, root=env.wf)
         enrollment = state["enrollment_id"]
         claim = ar.read_json(ar.registry_path("owner/repo", env.branch))
-        self.assertEqual(os.path.join("rel-root", enrollment), claim["dir"])  # unchanged for other commands
+        self.assertEqual(str(env.root / "rel-root" / enrollment), claim["dir"])  # resolved at enrollment (R13-F1)
         self.assertEqual(str(env.root / "rel-root" / enrollment), claim["state_dir"])
         on_disk = ar.read_json(env.root / "rel-root" / enrollment / "state.json")
         decoy = env.work / "rel-root" / enrollment  # what the relative dir would mean from the work tree
@@ -4235,6 +4255,74 @@ class ListCommandTests(Base):
         self.assertIn("did not access it", rows["l-file"]["error"])
         self.assertIn("l-claimlink.json was not read", rows[None]["error"])
         self.assertIn("reparse point", rows[None]["error"])
+
+
+class EnrollmentOwnershipTests(Base):
+    """R13-F1: enrollment ownership must not depend on the caller's directory, and a claim whose prior state cannot
+    be established is never replaced."""
+
+    def claims(self):
+        env = self.env
+        reg = ar.registry_path("owner/repo", env.branch)
+        marker = Path(git(env.work, "rev-parse", "--absolute-git-dir")) / "agent-review-enrollment.json"
+        return {path: path.read_bytes() for path in (reg, marker)}
+
+    def test_relative_state_root_is_resolved_and_a_second_enrollment_elsewhere_is_refused(self):
+        env = self.env
+        state = ar.read_json(env.dir / "state.json")
+        state["status"] = "CANCELLED"  # release the fixture's own enrollment
+        ar.atomic_write_json(env.dir / "state.json", state)
+        first, second = env.root / "first-cwd", env.root / "second-cwd"
+        first.mkdir()
+        second.mkdir()
+        saved = os.getcwd()
+        self.addCleanup(os.chdir, saved)
+        os.chdir(first)
+        folder, state = ar.enroll(env.args(state_root="relative-state"), github=env.gh, root=env.wf)
+        self.assertTrue(folder.is_absolute())
+        self.assertEqual((first / "relative-state").resolve(), folder.parent)
+        before = self.claims()
+        for data in before.values():
+            self.assertTrue(Path(json.loads(data)["dir"]).is_absolute())
+        os.chdir(second)  # e.g. status run from the developer worktree
+        self.assertEqual(folder, ar.find_enrollment(state["enrollment_id"]))
+        self.assertTrue((ar.find_enrollment(state["enrollment_id"]) / "state.json").is_file())
+        with self.assertRaises(ar.UsageError) as refused:
+            ar.enroll(env.args(state_root="relative-state"), github=env.gh, root=env.wf)
+        self.assertIn("active enrollment", str(refused.exception))
+        self.assertEqual(before, self.claims())  # both original claims intact
+        self.assertFalse((second / "relative-state").exists() and any((second / "relative-state").iterdir()))
+
+    def test_claim_whose_prior_state_cannot_be_established_is_not_replaced(self):
+        env = self.env
+        before = self.claims()
+        state_file = env.dir / "state.json"
+        hidden = env.root / "hidden-state.json"
+        state_file.rename(hidden)  # absolute claim, prior state unavailable (the developer may still be running)
+        with self.assertRaises(ar.UsageError) as refused:
+            ar.enroll(env.args(state_root=str(env.root / "elsewhere")), github=env.gh, root=env.wf)
+        self.assertIn("cannot be verified", str(refused.exception))
+        self.assertIn("missing", str(refused.exception))
+        self.assertEqual(before, self.claims())
+        self.assertFalse((env.root / "elsewhere").exists() and any((env.root / "elsewhere").iterdir()))
+        reg = next(iter(before))
+        for label, text in (("unreadable state", "{not json"), ("foreign state", '{"enrollment_id": "other"}')):
+            with self.subTest(label):
+                state_file.write_text(text, encoding="utf-8")
+                with self.assertRaises(ar.UsageError) as refused:
+                    ar.enroll(env.args(state_root=str(env.root / "elsewhere")), github=env.gh, root=env.wf)
+                self.assertIn("cannot be verified", str(refused.exception))
+                self.assertEqual(before, self.claims())
+        hidden.replace(state_file)
+        for label, claim in (("relative claim", dict(json.loads(before[reg]), dir="relative-state/x")),
+                             ("malformed claim", ["not", "a", "claim"])):
+            with self.subTest(label):
+                ar.atomic_write_json(reg, claim)
+                with self.assertRaises(ar.UsageError) as refused:
+                    ar.enroll(env.args(state_root=str(env.root / "elsewhere")), github=env.gh, root=env.wf)
+                self.assertIn("cannot be verified", str(refused.exception))
+        reg.write_bytes(before[reg])
+        self.assertEqual(before, self.claims())
 
 
 class ToolTranscriptTests(unittest.TestCase):

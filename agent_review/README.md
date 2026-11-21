@@ -185,9 +185,9 @@ locks, no writes and no network or GitHub calls, so it is safe while
 controllers run. A claim whose state file (or the claim itself) is missing,
 unreadable or malformed is still listed, with `status` `"unknown"` and an
 `error` field saying why; one damaged enrollment never fails the listing.
-New claims record an absolute `state_dir` (alongside the unchanged `dir`), so
-enrollments made with a relative `--state-root` list correctly from any
-directory. Older claims naming only a relative directory, paths on network
+Enrollment resolves the state root to an absolute path, so new claims record
+both `dir` and `state_dir` as absolute paths and enrollments made with a
+relative `--state-root` list correctly from any directory. Older claims naming only a relative directory, paths on network
 storage (a UNC/device path or a mapped network drive), and any path whose
 registry folder, claim file, state directory components or `state.json` is a
 symbolic link, junction or other reparse point are reported the same way
@@ -202,6 +202,29 @@ its fields. `pr` is a positive integer or null even if the state file holds
 something else. Cancelled
 enrollments release their claim and are not listed. Use `status --enrollment
 <id>` for the full detail of one enrollment.
+
+### Prepared mission: Black Tentacles (not started)
+
+The `black-tentacles` plan keeps the mission
+(`C:\Dev\KingmakerGunslingerLab\BLACK-TENTACLES-MISSION.md`, hash-pinned at
+enrollment) as the contract. It reviews automatically after Phases 0–1
+(intermediate) and at the complete Phase 4 candidate (final), and both require
+the `focused` gate. The exact start sequence is in the tabletop repository's
+`docs/AGENT-REVIEW-WORKFLOW.md` (draft PR #194):
+
+```powershell
+$ar   = 'C:/Dev/agent-review/agent_review.py'
+$repo = 'C:/Dev/KingmakerGunslingerLab/repo/KingmakerGunslinger'
+$wt   = 'C:/Dev/KingmakerGunslingerLab/worktrees/black-tentacles'
+git -C $repo fetch origin
+git -C $repo worktree add -b codex/black-tentacles $wt origin/master
+Copy-Item C:/Dev/KingmakerGunslingerLab/BLACK-TENTACLES-MISSION.md "$wt/planning/BLACK-TENTACLES-MISSION.md"
+git -C $wt add planning/BLACK-TENTACLES-MISSION.md
+git -C $wt commit -m "Add Black Tentacles mission contract"
+Push-Location $wt; powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:/Dev/KingmakerGunslingerLab/codex-policy/Push-KingmakerGunslinger.ps1; Pop-Location
+python $ar enroll --project kingmaker-gunslinger --worktree $wt --plan black-tentacles --mission C:/Dev/KingmakerGunslingerLab/BLACK-TENTACLES-MISSION.md --mode headless --title "[draft] Black Tentacles"
+python $ar run --enrollment <id printed by enroll>
+```
 
 `stop` writes a `STOP` file; the developer finishes or restores its current
 transaction, commits, pushes and returns `paused`. At the soft deadline (8 h)
@@ -237,6 +260,7 @@ Deferred or not supported in this release. These are refused or paused rather th
 | Upgrading the controller or refreshing project config during an active run | Not supported during a run. `activate` is an explicit owner action; it invalidates in-progress review results and requires a fresh review |
 | Migrating experimental predecessor state formats | Not supported; an incompatible state version is refused (`unsupported enrollment state version`) |
 | Automatic recovery from ambiguous publication (a POST whose outcome is unknown) | Pauses; the owner checks the PR and resumes with `--resend-undelivered` |
+| Replacing an ownership claim whose enrollment state is missing, unreadable, foreign or recorded as a relative path | Refused (ownership needs inspection). If that enrollment is truly gone and no developer from it is running, remove the claim file by hand. State roots are resolved to absolute paths at enrollment |
 | Merge, release, tagging, requesting reviewers | Never performed |
 
 Working on the controller itself: review it with a fixed installed version. Run that enrollment's commands
@@ -285,15 +309,42 @@ timeout. A review of the ~3,000-line controller took 5–6 minutes and about
 
 ```powershell
 python C:/Dev/development-process/agent_review/agent_review.py install --dest C:/Dev/agent-review
-python $ar activate --enrollment <id>   # for each running enrollment, after reviewing the change
+python $ar activate --enrollment <id>   # per enrollment, between runs, after reviewing the change
 ```
 
-`install` refuses while any controller holds a lock. To disable: `stop` or
-`cancel` running enrollments, delete or rename `C:\Dev\agent-review\`, and
-remove the allowances from `~/.claude-personal/settings.json`. State in
-`~/.agent-review\` and claims in `C:\ProgramData\agent-review\` can then be
-deleted. No GitHub settings, tokens, Actions or webhooks exist to revoke;
-Codex configuration was never edited.
+**Install and activate.** `install` adds a new immutable version under
+`C:\Dev\agent-review\versions\` and points `current.json` at it. Existing
+versions are never modified or removed, so it does not wait for running
+controllers: a running controller and its helpers keep the code they loaded,
+and each enrollment stays pinned to its version. Under the new version an
+enrollment pauses until you `activate` it. Activation is an explicit owner
+decision between runs; results validated under the old version are reviewed
+again.
+
+**Pause (keep everything for later).** `stop` only writes a stop request and
+returns at once. The controller pauses at its next safe boundary, and an active
+developer invocation first finishes its own work and any runtime restoration.
+Wait until `status` shows a status other than `ACTIVE`, `developer_running`
+false and `lock_holder` null. Keep the installed version and the state, then
+continue with `resume`.
+
+**Permanent disable.** Do not delete anything right after `stop`.
+1. `stop` each running enrollment and wait for the paused state above. For a
+   project with `runtime_lock_paths`, also wait until those lock files are gone
+   (the runtime was restored).
+2. `cancel --reason …` each remaining enrollment (ACTIVE, PAUSED, BLOCKED or
+   AWAITING_OWNER_REVIEW). Cancel itself refuses, leaving the enrollment PAUSED,
+   while a developer, a push/verify helper or a runtime transaction is still
+   live. Repeat it until it reports `CANCELLED`, which releases both ownership
+   claims.
+3. Only then delete or rename `C:\Dev\agent-review\`, remove the allowances
+   from `~/.claude-personal/settings.json`, and delete the state in
+   `~/.agent-review\` and the host files in `C:\ProgramData\agent-review\`.
+
+No GitHub settings, tokens, Actions or webhooks exist to revoke, and the Codex
+configuration was never edited. A claim whose enrollment state is missing or
+unreadable blocks a new enrollment of that branch until you inspect it (see
+"First-release scope and limitations").
 
 ## Tests
 
