@@ -8,7 +8,7 @@ GitHub is simulated (FakeGitHub, clearly not a real PR); both model exchanges
 are real and consume subscription quota.
 
     $env:AGENT_REVIEW_LIVE = "1"; $env:AGENT_REVIEW_LIVE_OUT = "<dir>"
-    python -m unittest tools/agent_review/test_live_smoke.py -v
+    python -m unittest agent_review/test_live_smoke.py -v
 """
 import json
 import os

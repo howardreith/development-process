@@ -6,7 +6,7 @@ and checks. Only the external model (Codex/Claude) and GitHub boundaries are
 stubbed, and every stubbed response below is a labeled simulation, not a model
 exchange.
 
-Run: python -m unittest discover -s tools/agent_review -p "test_*.py" -v
+Run: python -m unittest discover -s agent_review -p "test_*.py" -v
 """
 import argparse
 import contextlib
