@@ -44,6 +44,7 @@ POLICY = {
 STATUS_START, STATUS_END = "<!-- agent-review:status:start -->", "<!-- agent-review:status:end -->"
 VERDICT_KEY_RE = re.compile(r"^(r\d+-review|final-status-[0-9a-f]{10})$")
 NEW_FINDING_ID = "R{round}-F"
+UNCERTAIN_SEND_WINDOW_S = 600
 POSITIVE_ASSESSMENTS = {"fix_verified", "rebuttal_accepted", "deferral_accepted"}
 REJECTING_ASSESSMENTS = {"fix_rejected", "rebuttal_rejected", "deferral_rejected", "still_open"}
 COMPATIBLE_ASSESSMENTS = {
@@ -174,6 +175,7 @@ def pid_alive(pid) -> bool:
 
 
 DELEGATION_TOOLS = {"spawn_agent", "followup_task"}
+UUID_LIKE_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
@@ -580,26 +582,53 @@ class CodexReviewer:
         return {"exit_code": proc.returncode, "timed_out": timed_out, **parse_codex_events(events_path),
                 "duration_s": round(time.monotonic() - started, 1)}
 
-    def provenance(self, thread_id):
+    @staticmethod
+    def _names_parent(value, thread_id):
+        """Whether structured session metadata declares thread_id as its parent (keys naming parent/fork)."""
+        if isinstance(value, dict):
+            return any((("parent" in k.lower() or "fork" in k.lower()) and v == thread_id)
+                       or CodexReviewer._names_parent(v, thread_id) for k, v in value.items())
+        if isinstance(value, list):
+            return any(CodexReviewer._names_parent(v, thread_id) for v in value)
+        return False
+
+    def provenance(self, thread_id, since=None):
         info = {"rollout_found": False, "observed_model": None, "observed_effort": None, "turn_models": [],
                 "turn_efforts": [], "sandbox": None, "approval_policy": None, "network": None,
                 "cli_version": None, "usage": None, "plan_type": None, "subagent_suspected": False,
                 "source": "Codex session rollout (CLI-recorded thread settings; not model-authored)"}
-        if not thread_id:
+        if not thread_id or not UUID_LIKE_RE.match(thread_id):
             return info
-        matches = list((self.home / "sessions").rglob(f"rollout-*{thread_id}.jsonl"))
-        if not matches:
+        matches = [m for m in (self.home / "sessions").rglob(f"rollout-*-{thread_id}.jsonl")]
+        verified = []
+        for match in matches:
+            try:
+                first = json.loads(match.read_text(encoding="utf-8", errors="replace").splitlines()[0])
+            except (ValueError, IndexError):
+                continue
+            if first.get("type") == "session_meta" and (first.get("payload") or {}).get("id") == thread_id:
+                verified.append(match)
+        if len(verified) != 1:
+            info["provenance_problem"] = f"{len(verified)} rollouts verifiably belong to thread {thread_id}"
             return info
+        rollout = verified[0]
         info["rollout_found"] = True
-        for other in matches[0].parent.glob("rollout-*.jsonl"):  # a delegated agent records its own thread
-            if other != matches[0]:
-                with open(other, encoding="utf-8", errors="replace") as handle:
-                    if thread_id in handle.readline():  # its session metadata names this thread as parent
-                        info["subagent_suspected"] = True
-        for line in matches[0].read_text(encoding="utf-8", errors="replace").splitlines():
+        for other in (self.home / "sessions").rglob("rollout-*.jsonl"):  # delegated agents record their own thread
+            if other == rollout or (since and other.stat().st_mtime < since):
+                continue
+            try:
+                meta = json.loads(other.read_text(encoding="utf-8", errors="replace").splitlines()[0])
+            except (ValueError, IndexError):
+                continue
+            if meta.get("type") == "session_meta" and self._names_parent(meta.get("payload"), thread_id):
+                info["subagent_suspected"] = True
+        for line in rollout.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.strip():
+                continue
             try:
                 obj = json.loads(line)
             except ValueError:
+                info["provenance_problem"] = "the rollout contains malformed records"
                 continue
             kind, payload = obj.get("type"), obj.get("payload") or {}
             ptype = payload.get("type") if isinstance(payload, dict) else None
@@ -647,6 +676,11 @@ def parse_codex_events(events_path):
             malformed = True
             continue
         kind = event.get("type")
+        if kind.startswith("turn.") and thread_id is None:
+            malformed = True  # a turn outcome before the thread started cannot be attributed
+        if kind == "thread.started" and not UUID_LIKE_RE.match(str(event.get("thread_id", ""))):
+            malformed = True
+            continue
         if kind == "thread.started":
             if thread_id is not None and event.get("thread_id") != thread_id:
                 failed = True  # conflicting thread identities: the outcome cannot be attributed
@@ -667,8 +701,10 @@ def invocation_problems(info, prov, requested):
     reasons, fatal = [], False
     if not info.get("completed") or info.get("failed"):
         reasons.append("no successful terminal turn event from the reviewer")
+    if prov.get("provenance_problem"):
+        reasons.append("reviewer provenance unreliable: " + prov["provenance_problem"])
     if not prov.get("rollout_found"):
-        return reasons + ["reviewer provenance unavailable (no session rollout for the thread)"], fatal
+        return reasons + ["reviewer provenance unavailable (no verified session rollout for the thread)"], fatal
     models, efforts = prov.get("turn_models") or [], prov.get("turn_efforts") or []
     if prov.get("observed_model") != requested["model"] or not models or any(m != requested["model"] for m in models):
         reasons.append(f"reviewer model not affirmatively {requested['model']}: {prov.get('observed_model')} {models}")
@@ -1158,17 +1194,19 @@ class Controller:
 
     def verify_transcript_delta(self, base, head):
         """Everything the review diff excludes (the whole transcript tree, any PR) must be the controller's own
-        records for this PR, added as plain files with their recorded content."""
+        records for this PR: added as plain files, positively listed in its inventory, with readable matching content."""
         archived = self.state.get("archived", {})
-        raw = self.git("diff", "--raw", "--no-renames", "--no-ext-diff", base, head, "--",
+        raw = self.git("diff", "--raw", "-z", "--no-renames", "--no-ext-diff", base, head, "--",
                        self.cfg["transcript_dir"].strip("/"))
-        for line in filter(None, raw.splitlines()):
-            meta, _, path = line.partition("\t")
-            fields = meta.split()
-            if fields[4] != "A" or fields[1] != "100644" or archived.get(path) != self.git.blob_sha256(head, path):
-                raise Stop("BLOCKED", f"transcript tree change outside the controller's records: {fields[4]} {path}")
+        fields = raw.split("\0")
+        for meta, path in zip(fields[0::2], fields[1::2]):
+            if not meta:
+                continue
+            parts = meta.split()
+            blob = self.git.blob_sha256(head, path)
+            if parts[4] != "A" or parts[1] != "100644" or path not in archived or blob is None or blob != archived[path]:
+                raise Stop("BLOCKED", f"transcript tree change outside the controller's records: {parts[4]} {path}")
 
-    # -- publication -----------------------------------------------------------
     def marker(self, key, index, total, digest):
         return f"<!-- agent-review:v1 enrollment={self.state['enrollment_id']} key={key} part={index}/{total} sha256={digest} -->"
 
@@ -1212,10 +1250,22 @@ class Controller:
                 attempts += 1
                 try:
                     found = self.reconcile(number, part["marker"], body)
+                    if not found and part.get("posting_since"):
+                        waited = (dt.datetime.now(dt.timezone.utc) - dt.datetime.strptime(
+                            part["posting_since"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)).total_seconds()
+                        if waited < self.limits.get("uncertain_send_window_seconds", UNCERTAIN_SEND_WINDOW_S):
+                            raise RuntimeError("an earlier POST may have been stored; waiting for it to become visible")
+                        # absent from authenticated listings for the whole window: the earlier POST was not stored.
+                        # A late duplicate would still be caught by the single-copy checks at confirmation.
+                        part.pop("posting_since")
+                        self.save()
                     if not found and tentative is None:
                         if self.viewer() != self.cfg["expected_actor"]:  # checked at the mutation itself
                             raise Stop("BLOCKED", f"the gh login is {self._viewer}, not {self.cfg['expected_actor']}; "
                                                   "nothing was posted")
+                        self.pr_view()  # the enrolled open draft PR, re-read immediately before writing to it
+                        part["posting_since"] = now_iso()
+                        self.save()  # an interrupted or lost POST leaves this record of uncertain delivery
                         tentative = self.gh.post_comment(number, part["body_file"])
                         if tentative.get("user") not in (None, self.cfg["expected_actor"]):
                             raise Stop("BLOCKED", f"comment {tentative['id']} was posted as {tentative.get('user')}, "
@@ -1232,6 +1282,7 @@ class Controller:
                                              "reconciled (never re-posted blindly) on resume")
                     self.sleep(self.limits["retry_backoff_seconds"][min(attempts - 1, 1)])
             part["comment_id"], part["url"] = found["id"], found["url"]
+            part.pop("posting_since", None)
             self.save()
         record["state"], record["posted_at"] = "posted", now_iso()
         self.save()
@@ -1472,6 +1523,7 @@ class Controller:
     def review_attempt(self, rnd, rnd_dir):
         rnd["attempt_seq"] = n = rnd.get("attempt_seq", 0) + 1  # monotonic across owner-granted budgets
         attempt = {"n": n, "started": now_iso()}
+        attempt_started_epoch = time.time()
         rnd["attempts"].append(attempt)
         self.save()
         snapshot = rnd_dir / f"snapshot-{n}"
@@ -1493,7 +1545,7 @@ class Controller:
                                      on_start=on_start)
         finally:
             self.remove_snapshot(snapshot)
-        prov = self.reviewer.provenance(info.get("thread_id"))
+        prov = self.reviewer.provenance(info.get("thread_id"), since=attempt_started_epoch - 60)
         envelope = self.validate_review(rnd, result_path, info, prov, rnd_dir / f"stderr-{n}.txt")
         envelope["path"] = str(rnd_dir / f"envelope-{n}.json")
         atomic_write_json(envelope["path"], envelope)
@@ -1533,15 +1585,22 @@ class Controller:
             self.git.ok("worktree", "prune")
 
     def full_findings(self):
-        """Ledger entries with each finding's complete text, recovered from accepted envelopes when needed."""
+        """Ledger entries with each finding's complete text. Legacy entries are recovered only from the round that
+        last stated the finding, and only if that round's envelope matches its recorded digest."""
         ledger = json.loads(json.dumps(self.state.get("findings", {})))
-        missing = {fid for fid, e in ledger.items() if "finding" not in e}
-        for rnd in self.state.get("rounds", []):  # later rounds override earlier statements of the same finding
-            if missing and rnd.get("status") == "accepted" and rnd.get("envelope_path") and Path(rnd["envelope_path"]).exists() \
-                    and sha256_file(rnd["envelope_path"]) == rnd.get("envelope_sha256"):
-                for f in (read_json(rnd["envelope_path"]).get("result") or {}).get("findings", []):
-                    if f["id"] in missing:
-                        ledger[f["id"]].update(finding=f, finding_round=rnd["round"])
+        rounds = {r["round"]: r for r in self.state.get("rounds", [])}
+        for fid, entry in ledger.items():
+            if "finding" in entry:
+                continue
+            rnd = rounds.get(entry.get("finding_round") or entry.get("last_round"))
+            if not rnd or not rnd.get("envelope_path") or not Path(rnd["envelope_path"]).is_file():
+                continue
+            raw = Path(rnd["envelope_path"]).read_bytes()
+            if sha256_bytes(raw) != rnd.get("envelope_sha256"):
+                continue
+            for f in (json.loads(raw).get("result") or {}).get("findings", []):
+                if f["id"] == fid:
+                    entry.update(finding=f, finding_round=rnd["round"])
         return ledger
 
     def write_review_inputs(self, rnd, rnd_dir, snapshot):
@@ -1720,13 +1779,13 @@ class Controller:
         """Accept a validated round: binding and freshness checks, publication, freshness again, then one
         atomic state update (including any resulting stop)."""
         path = Path(rnd["envelope_path"])
-        envelope = read_json(path) if path.exists() else {}
-        if not path.exists() or sha256_file(path) != rnd.get("envelope_sha256") or \
-                envelope.get("workflow_fingerprint") != self.state["workflow"]["fingerprint"]:
-            self.retire_verdict(rnd, "its preserved result no longer matches its recorded digest or workflow version")
-            rnd["status"] = "invalidated"  # rerun under the current rules; the retired verdict is settled first
-            self.state["active_round"] = None
-            self.save()
+        raw = path.read_bytes() if path.is_file() else None
+        envelope = json.loads(raw) if raw is not None and sha256_bytes(raw) == rnd.get("envelope_sha256") else None
+        if envelope is None or envelope.get("workflow_fingerprint") != self.state["workflow"]["fingerprint"]:
+            # bytes authenticated before parsing; unreadable, altered or other-version results take one transition
+            self.retire_verdict(rnd, "its preserved result is missing, altered or from another workflow version",
+                                persist_with=lambda: (rnd.update(status="invalidated"),
+                                                      self.state.update(active_round=None)))
             self.settle_publications()
             return self.review_round()
         stale = self.freshness(rnd)
@@ -1751,6 +1810,21 @@ class Controller:
         stale = self.freshness(rnd)  # publication may have taken minutes of retries
         if stale:
             self.make_historical(rnd, envelope, stale, correction=True)
+        if result["decision"] in ("checkpoint_passed", "ready_for_owner_review") and self.missing_gates(rnd["H"], cp_now):
+            missing = self.missing_gates(rnd["H"], cp_now)  # re-checked immediately before acceptance
+            self.queue(f"r{rnd['round']:02d}-review-superseded",
+                       f"### Workflow — correction — round {rnd['round']} review is not accepted\n\nRequired gate "
+                       f"evidence became invalid before acceptance ({', '.join(missing)}); the pass above does not "
+                       "advance the checkpoint.\n\n_Automated workflow status; not a human review._\n")
+            record["state"] = "superseded"  # posted in full; kept and archived as a superseded record
+            rnd["status"] = "invalidated"
+            self.state.update(active_round=None, develop_context="needs_report", status="PAUSED",
+                              status_reason="required gate evidence invalid: " + ", ".join(missing))
+            self.transition("develop", "pass not accepted: gate evidence invalid", save=False)
+            self.save()
+            self.settle_publications()
+            raise Stop("PAUSED", "required gate evidence became invalid before acceptance (" + ", ".join(missing)
+                       + "); re-run the gates and submit a report for review")
         cp = self.checkpoint
         ledger = self.state.setdefault("findings", {})
         for a in result["prior_finding_assessments"]:
@@ -1993,17 +2067,26 @@ class Controller:
         return problems
 
     def gate_status(self, commit):
-        """{gate: (passed, [latest receipt paths])}. For each gate and exact argument list the newest receipt
-        supersedes older ones; a gate passes only if every such latest receipt is valid and passing."""
-        latest = {}
-        ordered = sorted(self.gate_receipts(commit), key=lambda item: (str(item[1].get("recorded_at", "")), item[0].name))
-        for path, data in ordered:  # the newest run of the same gate and arguments supersedes older ones
-            latest[(data.get("gate"), json.dumps(data.get("argv")))] = (path, data)
+        """{gate: (passed, [latest receipt paths])}. Runs are ordered by the stamp in their controller-written file
+        names. For each gate and exact argument list the newest run supersedes older ones; a damaged receipt fails
+        its gate until a newer valid run exists. A gate passes only if every latest receipt is valid and passing."""
+        def stamp(path):
+            return path.stem.rsplit("-", 1)[-1]
+        ordered = sorted(self.gate_receipts(commit), key=lambda item: stamp(item[0]))
+        latest, damaged = {}, {}
+        for path, data in ordered:
+            if data.get("damaged") or data.get("recorded_at") != stamp(path):
+                damaged[data["gate"]] = stamp(path)  # unreadable, identity-less or re-dated: fails closed
+                continue
+            latest[(data["gate"], json.dumps(data.get("argv")))] = (path, data)
         status = {}
-        damaged_gates = {data["gate"] for _, data in ordered if data.get("damaged")}
         for (gate, _), (path, data) in latest.items():
-            ok, paths = status.get(gate, (gate not in damaged_gates, []))
+            ok, paths = status.get(gate, (True, []))
             status[gate] = (ok and not self.receipt_problems(path, data, commit), paths + [path])
+        for gate, when in damaged.items():
+            newest_valid = max((stamp(p) for p in status.get(gate, (True, []))[1]), default="")
+            if newest_valid <= when:
+                status[gate] = (False, status.get(gate, (False, []))[1])
         return status
 
     def missing_gates(self, commit, checkpoint=None):
@@ -2169,6 +2252,13 @@ class Controller:
         if self.viewer() != self.cfg["expected_actor"]:
             problems.append("the GitHub login is not the project's expected actor")
         return problems
+
+    def assert_claims(self):
+        """This enrollment must still hold both the host branch claim and the worktree's own marker."""
+        for claim in (registry_path(self.cfg["repository"], self.state["branch"]),
+                      Path(self.git("rev-parse", "--absolute-git-dir")) / "agent-review-enrollment.json"):
+            if not claim.exists() or read_json(claim).get("enrollment_id") != self.state["enrollment_id"]:
+                raise UsageError(f"enrollment {self.state['enrollment_id']} no longer holds its claim ({claim.name})")
 
     def helper_lock(self, command):
         return Lock(self.dir / "helper.lock", command)
@@ -2345,9 +2435,17 @@ class Controller:
         archived_keys = set(self.state.get("archived_keys", []))
         files = []
         for pub in sorted(self.state.get("publications", {}).values(), key=lambda p: p["seq"]):
-            if pub["state"] != "posted" or pub["key"] in archived_keys or pub["key"].startswith("final-"):
+            if pub["key"] in archived_keys or pub["key"].startswith("final-"):
                 continue
-            body = "\n\n---\n\n".join(self.outbox_body(pub["key"], p) for p in pub["parts"])
+            carried = [p for p in pub["parts"] if p.get("comment_id")]  # parts that actually reached GitHub
+            if pub["state"] == "posted":
+                carried = pub["parts"]
+            elif not (pub["state"] == "superseded" and carried):
+                continue  # never sent: nothing public to archive
+            body = "\n\n---\n\n".join(self.outbox_body(pub["key"], p) for p in carried)
+            if pub["state"] == "superseded":
+                body = (f"_Superseded record: {len(carried)} of {len(pub['parts'])} part(s) were published; it is not "
+                        "a current verdict._\n\n" + body)
             files.append((f"{rel_dir}/{seq:03d}-{pub['key']}.md", body, pub["key"]))
             seq += 1
             review_key = re.fullmatch(r"r(\d+)-review(-historical)?", pub["key"])
@@ -2483,6 +2581,9 @@ class Controller:
         pr = self.pr_view()
         if pr["headRefOid"] != archive_head:
             reasons.append(f"PR head {short(pr['headRefOid'])} is not {short(archive_head)}")
+        live = self.git.remote_head(self.state["branch"])
+        if live != archive_head:  # the PR view can lag a push; the branch itself is authoritative
+            reasons.append(f"branch head {short(live)} is not {short(archive_head)}")
         if pr.get("reviewRequests"):
             reasons.append("human reviewers are requested on the PR; the workflow ends without review requests")
         if status_section and status_section not in (pr.get("body") or "").replace("\r\n", "\n"):
@@ -2564,7 +2665,7 @@ class Controller:
             self.save()
         self.settle_publications()
 
-    def retire_verdict(self, rnd, why, envelope=None, stale=None, historical_if_unsent=False):
+    def retire_verdict(self, rnd, why, envelope=None, stale=None, historical_if_unsent=False, persist_with=None):
         """A round's verdict will not be accepted. Visible parts get a correction; when only part of it (or, if
         requested, none of it) reached GitHub, the complete review is published as historical. Both are queued
         (persisted) before the verdict is marked superseded."""
@@ -2580,10 +2681,17 @@ class Controller:
                                             f"\n\nThe review posted (in whole or in part) for `{short(rnd['H'])}` will "
                                             f"not be accepted: {why}. It is preserved for the record.\n\n"
                                             "_Automated workflow status; not a human review._\n")
+        if envelope is None and rnd.get("envelope_path") and Path(rnd["envelope_path"]).is_file():
+            raw = Path(rnd["envelope_path"]).read_bytes()
+            if sha256_bytes(raw) == rnd.get("envelope_sha256"):
+                envelope = json.loads(raw)  # only the authenticated result is ever rendered
         if envelope and envelope.get("result") and (0 < visible < total or (not visible and historical_if_unsent)):
             self.queue(f"{key}-historical", self.review_body(rnd, envelope, stale=stale or [why]))
         if normal:
             normal["state"] = "superseded"
+            normal["visible_parts"] = visible  # the archive keeps exactly the parts that reached GitHub
+        if persist_with:
+            persist_with()
         self.save()
 
     def queue_public_op(self, op, **fields):
@@ -2680,8 +2788,13 @@ class Controller:
     def missing_publications(self, include_receipt=None):
         """Keys of substantive records not settled on the PR: unsent, gone, altered or by another author.
         Final receipts are checked only when named (the active handoff receipt)."""
-        comments = {c["id"]: c for c in self.gh.comments(self.state["pr"]["number"])}
+        listing = self.gh.comments(self.state["pr"]["number"])
+        comments = {c["id"]: c for c in listing}
         missing = []
+        if include_receipt:
+            named = self.state.get("publications", {}).get(include_receipt)
+            if not named or named["state"] != "posted":
+                missing.append(include_receipt + " (the handoff receipt is absent or not current)")
         for key, pub in self.state.get("publications", {}).items():
             if key.startswith("final-") and key != include_receipt:
                 continue
@@ -2692,9 +2805,11 @@ class Controller:
                 continue
             for part in pub["parts"]:
                 remote = comments.get(part["comment_id"])
-                if not remote or remote.get("user") != self.cfg["expected_actor"] or \
+                copies = [c for c in listing if c.get("user") == self.cfg["expected_actor"]
+                          and (c.get("body") or "").startswith(part["marker"])]
+                if not remote or remote.get("user") != self.cfg["expected_actor"] or len(copies) != 1 or \
                         normalize_body(remote.get("body")) != normalize_body(self.outbox_body(key, part)):
-                    missing.append(key)
+                    missing.append(key)  # gone, altered, by another author, or duplicated
                     break
         return missing
 
@@ -2743,7 +2858,7 @@ class Controller:
         section = sanitize(f"{start}\n**Agent review status:** {text} Records: `{self.transcript_folder()}/`.\n{end}")[0]
         body = pr.get("body") or ""
         if body.count(start) == 0 and body.count(end) == 0:
-            body = body.rstrip() + "\n\n" + section
+            body = (body + "\n\n" + section) if body else section  # owner text untouched
         elif body.count(start) == 1 and body.count(end) == 1 and body.index(start) < body.index(end):
             body = body[:body.index(start)] + section + body[body.index(end) + len(end):]
         else:
@@ -2844,8 +2959,17 @@ def compose_developer_settings(cfg, root: Path, enrollment_id: str, repo_root=No
     if project_settings and project_settings.is_file():  # keep the repository's attribution preferences only
         data = read_json(project_settings)
         composed.update({k: data[k] for k in ("attribution", "includeCoAuthoredBy") if k in data})
-    return {**composed, "permissions": {"allow": fill(allow),
-                            "deny": fill(base["deny"] + deny)}}
+    return {**composed, "permissions": {"allow": mirror_shell_rules(fill(allow)),
+                                        "deny": mirror_shell_rules(fill(base["deny"] + deny))}}
+
+
+def mirror_shell_rules(rules):
+    """Every Bash(...) rule also applies to the PowerShell tool, so the two shells can never drift apart."""
+    out = list(rules)
+    for rule in rules:
+        if rule.startswith("Bash(") and "PowerShell(" + rule[5:] not in out:
+            out.append("PowerShell(" + rule[5:])
+    return out
 
 
 def push_argv(cfg, root: Path, enrollment_id: str):
@@ -3048,6 +3172,8 @@ def _enroll_into(folder, enrollment_id, cfg, plan, args, git, gh, mission, top, 
             "by the controller through the owner's account; none is a human review. Records are archived under "
             f"`{cfg['transcript_dir']}/`.\n\n<!-- agent-review:status:start -->\n**Agent review status:** enrolled."
             "\n<!-- agent-review:status:end -->\n")[0])
+        if gh.viewer() != cfg["expected_actor"]:  # refreshed under the enrollment lock, right before the write
+            raise UsageError("GitHub actor changed before the draft PR could be created")
         number = gh.create_draft_pr(branch, target, args.title or f"[draft] {plan.get('title', plan['mission_id'])}",
                                     body)
     pr = gh.pr(number)
@@ -3103,6 +3229,86 @@ def _json_file(path):
         return None
 
 
+PROBE_COMPOSED = "git status --short"
+
+
+def _tool_commands(log_path):
+    """Shell commands the headless session attempted, from its stream-json log (CLI-recorded)."""
+    commands = []
+    for line in Path(log_path).read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if obj.get("type") == "assistant":
+            for item in (obj.get("message") or {}).get("content") or []:
+                if isinstance(item, dict) and item.get("type") == "tool_use" and item.get("name") in ("Bash", "PowerShell"):
+                    commands.append((item.get("input") or {}).get("command", ""))
+    return commands
+
+
+class _AmbientDeveloper(ClaudeDeveloper):
+    """Control launch for the probe only: identical except that ambient setting sources are NOT excluded."""
+
+    def argv(self, session_id, resume):
+        args = super().argv(session_id, resume)
+        i = args.index("--setting-sources")
+        return args[:i] + args[i + 2:]
+
+
+def _user_status_allowance(cfg):
+    """The owner's user-level allowance for the read-only `status` command, if granted (the ambient rule probed)."""
+    base = Path(expand(cfg["developer"]["config_dir"])) if cfg["developer"].get("config_dir") else Path.home() / ".claude"
+    settings = _json_file(base / "settings.json") or {}
+    for rule in (settings.get("permissions") or {}).get("allow", []):
+        if rule.startswith("Bash(python ") and rule.endswith(" status *)"):
+            return rule
+    return None
+
+
+def permission_isolation_probe(cfg, root, work):
+    """Observe the effective headless permission profile with the real launch arguments. An allowance granted in
+    the owner's user settings (the read-only `status` command) that the composed file lacks must be denied under
+    the production launch, while a composed allowance runs. A control launch without --setting-sources "" shows
+    that the same user rule would otherwise allow the command, so the denial is caused by the isolation."""
+    rule = _user_status_allowance(cfg)
+    if not rule:
+        return {"ok": None, "skipped": "no user-level `status` allowance exists to probe; isolation not observed"}
+    command = rule[len("Bash("):-len(" *)")] + " --enrollment agent-review-permission-probe"  # read-only, harmless
+    repo = work / "probe-repo"
+    repo.mkdir(parents=True)
+    run(["git", "init", "--quiet", str(repo)])
+    composed = compose_developer_settings(cfg, root, "preflight", repo)
+    head = command.split(" status ")[0]
+    # the probe isolates the setting-source mechanism: drop composed deny rules that would also match the command
+    composed["permissions"]["deny"] = [d for d in composed["permissions"]["deny"] if head not in d]
+    if any(a.startswith(f"Bash({head} status") for a in composed["permissions"]["allow"]):
+        raise UsageError("the composed profile itself allows the probe command; the probe cannot discriminate")
+    atomic_write_json(work / "probe-settings.json", composed)
+    prompt = (f"This is a permission probe. Use the Bash tool to run exactly `{command}`, then use the Bash tool to run "
+              f"exactly `{PROBE_COMPOSED}`. Do not retry or run anything else. Then return a report with "
+              'schema_version "agent-review.developer.v1", status "paused", checkpoint_id "preflight", '
+              'candidate_commit null, summary stating which commands ran or were denied, empty arrays, '
+              'runtime_restoration "not_applicable", blocker null, owner_decision_needed null.')
+    observed = {}
+    for label, kind in (("production", ClaudeDeveloper), ("control_without_isolation", _AmbientDeveloper)):
+        dev = kind(cfg["developer"], work / "probe-settings.json", root / REPORT_SCHEMA_FILE)
+        sid = str(uuid.uuid4())
+        result = dev.run(prompt, sid, False, repo, work / f"probe-{label}.jsonl", work / f"probe-{label}.err", 600)
+        attempted = _tool_commands(work / f"probe-{label}.jsonl")
+        denied = [(d.get("tool_input") or {}).get("command", "") for d in result["permission_denials"]]
+        observed[label] = {"session_id": sid, "attempted": attempted, "denied": denied,
+                           "ambient_attempted": any(command in c for c in attempted),
+                           "ambient_denied": any(command in c for c in denied),
+                           "composed_attempted": any(PROBE_COMPOSED in c for c in attempted),
+                           "composed_denied": any(PROBE_COMPOSED in c for c in denied)}
+    prod, ctrl = observed["production"], observed["control_without_isolation"]
+    return {"user_level_allowance": rule, "probe_command": command, **observed,
+            "ok": prod["ambient_attempted"] and prod["ambient_denied"] and prod["composed_attempted"]
+            and not prod["composed_denied"] and ctrl["ambient_attempted"] and not ctrl["ambient_denied"],
+            "source": "Claude Code stream-json result permission_denials and tool_use records (CLI-recorded)"}
+
+
 def preflight(cfg, root=HERE):
     """Real bounded calls to both configured models; records requested vs observed metadata."""
     import tempfile
@@ -3128,6 +3334,7 @@ def preflight(cfg, root=HERE):
                         and dev_out["session_id"] == sid and isinstance(dev_out["structured_output"], dict)
                         and not validate_schema(dev_out["structured_output"], read_json(root / REPORT_SCHEMA_FILE))
                         and dev_out["structured_output"].get("status") == "paused"}
+    out["developer"]["permission_isolation"] = permission_isolation_probe(cfg, root, work)
     rev = CodexReviewer(cfg["reviewer"])
     schema = work / "schema.json"
     atomic_write_json(schema, {"type": "object", "additionalProperties": False, "required": ["ok"],
@@ -3154,52 +3361,74 @@ def preflight(cfg, root=HERE):
 # --------------------------------------------------------------------------- install
 
 LAUNCHER = """#!/usr/bin/env python3
-\"\"\"agent-review launcher: runs the current installed version (versions/<fingerprint>/agent_review.py).\"\"\"
+\"\"\"agent-review launcher: runs the current installed package (versions/<package>/agent_review.py).\"\"\"
 import json
 import runpy
 import sys
 from pathlib import Path
 here = Path(__file__).resolve().parent
 current = json.loads((here / "current.json").read_text(encoding="utf-8"))
-target = here / "versions" / current["fingerprint"] / "agent_review.py"
+target = here / "versions" / current.get("package", current["fingerprint"]) / "agent_review.py"
 sys.argv[0] = str(target)
 runpy.run_path(str(target), run_name="__main__")
 """
-INSTALL_ENTRIES = {"versions", "current.json", "agent_review.py", "__pycache__"}
+# launchers written by earlier installer versions (accepted as owned so they can be upgraded)
+KNOWN_LAUNCHER_SHA256 = {"aa9358e92379d6962c75ea345c98e20be6cdf4a9a73d49e19bfaa7e0685f08ea"}
+INSTALL_SCHEMA = "agent-review.install.v1"
 
 
-def _retire_legacy_flat_install(dest: Path):
-    """Remove a pre-versioning flat installation, but only files its MANIFEST owns and that are unchanged."""
-    manifest = read_json(dest / "MANIFEST.json")
-    for rel, digest in manifest.get("files", {}).items():
-        path = dest / rel
-        if path.exists() and sha256_file(path) != digest:
-            raise UsageError(f"legacy installation file {rel} was modified; refusing to remove it")
-    for rel in manifest.get("files", {}):
-        (dest / rel).unlink(missing_ok=True)
-    (dest / "MANIFEST.json").unlink()
-    for folder in sorted({(dest / rel).parent for rel in manifest.get("files", {})}, key=lambda p: len(p.parts), reverse=True):
-        if folder != dest and folder.exists() and not any(f for f in folder.iterdir() if f.name != "__pycache__"):
-            shutil.rmtree(folder, ignore_errors=True)
+def package_digest(hashes):
+    """Digest of every shipped file (behavioral files, project configs, plans, docs): the immutable install key."""
+    return sha256_text(json.dumps(hashes, sort_keys=True))
+
+
+def _installation_problems(dest: Path):
+    """Why dest is not an installation this installer owns (empty list if it is, or if dest is empty)."""
+    entries = {p.name: p for p in dest.iterdir()} if dest.exists() else {}
+    if not entries:
+        return []
+    if "MANIFEST.json" in entries:
+        return ["it is a pre-versioning flat installation; stop its enrollments, move it aside, and install fresh"]
+    problems = []
+    unknown = sorted(set(entries) - {"versions", "current.json", "agent_review.py"})
+    if unknown:
+        problems.append(f"it contains entries the installation does not own: {unknown[:5]}")
+    launcher = entries.get("agent_review.py")
+    if launcher is None or not launcher.is_file() or (launcher.read_text(encoding="utf-8", errors="replace") != LAUNCHER
+                                                      and sha256_file(launcher) not in KNOWN_LAUNCHER_SHA256):
+        problems.append("its agent_review.py is not an agent-review launcher")
+    try:
+        current = read_json(entries["current.json"]) if "current.json" in entries else None
+    except (ValueError, OSError):
+        current = None
+    key = current and (current.get("package") or current.get("fingerprint"))
+    if not key or not (dest / "versions" / str(key) / "MANIFEST.json").is_file():
+        problems.append("its current.json does not point at an installed version")
+    versions = entries.get("versions")
+    if versions is not None:
+        for child in versions.iterdir():
+            if not (child.is_dir() and ((child / "MANIFEST.json").is_file() or child.name.startswith(".staging-"))):
+                problems.append(f"versions/{child.name} is not an installed version")
+    return problems
 
 
 def install(dest: Path, source: Path = HERE):
-    """Install a version immutably under dest/versions/<fingerprint>/ and point the launcher at it. Existing
-    versions are never modified or removed, so running controllers and helpers keep exactly the code they loaded
-    and an enrollment's activated version stays intact; switching versions is an atomic pointer update."""
+    """Install a package immutably under dest/versions/<package digest>/ and point the launcher at it. Existing
+    versions are never modified or removed, so running controllers and helpers keep exactly the code they loaded;
+    switching is an atomic pointer update. Only an empty directory or an installation this installer owns is
+    touched; nothing else (including a pre-versioning flat copy) is modified."""
     dest = Path(dest).resolve()
     digest, hashes, _ = load_workflow(source)
+    package = package_digest(hashes)
     with Lock(host_dir() / "install.lock", "install"):
-        dest.mkdir(parents=True, exist_ok=True)
-        if (dest / "MANIFEST.json").exists():
-            _retire_legacy_flat_install(dest)
-        unknown = sorted(p.name for p in dest.iterdir() if p.name not in INSTALL_ENTRIES)
-        if unknown:
-            raise UsageError(f"{dest} contains entries the installation does not own: {unknown[:5]}")
-        target = dest / "versions" / digest
+        problems = _installation_problems(dest)
+        if problems:
+            raise UsageError(f"refusing to install into {dest}: " + "; ".join(problems))
+        target = dest / "versions" / package
         if target.exists():
-            if load_workflow(target)[0] != digest or not (target / "MANIFEST.json").is_file():
-                raise UsageError(f"installed version {digest[:10]} is incomplete or altered; inspect {target}")
+            _, installed_hashes, _ = load_workflow(target)  # verifies its own MANIFEST
+            if installed_hashes != hashes:
+                raise UsageError(f"installed package {package[:10]} does not match the source; inspect {target}")
         else:
             staging = dest / "versions" / f".staging-{uuid.uuid4().hex[:12]}"
             for rel in hashes:
@@ -3207,16 +3436,18 @@ def install(dest: Path, source: Path = HERE):
                 shutil.copy2(source / rel, staging / rel)
             commit = run(["git", "-C", str(source), "rev-parse", "HEAD"], check=False).stdout.strip()
             dirty = run(["git", "-C", str(source), "status", "--porcelain", "--", "."], check=False).stdout.strip() != ""
-            atomic_write_json(staging / "MANIFEST.json", {"fingerprint": digest, "files": hashes, "source_commit": commit,
-                                                          "source_dirty": dirty, "installed_at": now_iso()})
-            if load_workflow(staging)[0] != digest:
+            atomic_write_json(staging / "MANIFEST.json", {"fingerprint": digest, "package": package, "files": hashes,
+                                                          "source_commit": commit, "source_dirty": dirty,
+                                                          "installed_at": now_iso()})
+            if load_workflow(staging)[1] != hashes:
                 raise UsageError("staged installation does not match its source")
             os.replace(staging, target)
         launcher = dest / "agent_review.py"
         if not launcher.exists() or launcher.read_text(encoding="utf-8") != LAUNCHER:
             write_text(launcher.with_name("agent_review.py.tmp"), LAUNCHER)
             os.replace(launcher.with_name("agent_review.py.tmp"), launcher)
-        atomic_write_json(dest / "current.json", {"fingerprint": digest, "path": str(target), "installed_at": now_iso()})
+        atomic_write_json(dest / "current.json", {"schema": INSTALL_SCHEMA, "fingerprint": digest, "package": package,
+                                                  "path": str(target), "installed_at": now_iso()})
     return digest
 
 
@@ -3328,10 +3559,22 @@ def find_enrollment(value):
     raise UsageError(f"enrollment {value} is not registered under {folder}")
 
 
+COMMAND_STATUSES = {"run": {"ACTIVE"}, "review": {"ACTIVE"}, "finalize": {"ACTIVE"},
+                    "archive": {"ACTIVE", "PAUSED", "BLOCKED", "AWAITING_OWNER_REVIEW"},
+                    "resume": {"ACTIVE", "PAUSED", "BLOCKED", "AWAITING_OWNER_REVIEW"},
+                    "cancel": {"ACTIVE", "PAUSED", "BLOCKED", "AWAITING_OWNER_REVIEW"},
+                    "activate": {"ACTIVE", "PAUSED", "BLOCKED", "AWAITING_OWNER_REVIEW"}}
+
+
 def guarded(controller, command, fn, mutate=True, honor_stop=False):
-    """Run fn under the single-writer lock with reloaded state and the pre-mutation guard."""
+    """Run fn under the single-writer lock with reloaded state and the pre-mutation guard. Status eligibility and
+    the host/worktree claims are re-checked after locking, so a stale process cannot act on old authority."""
     with controller.lock(command):
         controller.reload()
+        allowed = COMMAND_STATUSES.get(command)
+        if allowed and controller.state["status"] not in allowed:
+            raise UsageError(f"enrollment is {controller.state['status']}; {command} is not permitted now")
+        controller.assert_claims()
         try:
             controller.snapshot_fp, _, controller.files = load_workflow(controller.wf)  # read under the interlock
             if mutate:
@@ -3427,7 +3670,8 @@ def main(argv=None):
             if args.out:
                 write_text(args.out, text + "\n")
             print(text)
-            return EXIT_OK if result["developer"]["ok"] and result["reviewer"]["ok"] else EXIT_BLOCKED
+            isolation = result["developer"]["permission_isolation"]["ok"] is not False  # None: nothing to probe
+            return EXIT_OK if result["developer"]["ok"] and isolation and result["reviewer"]["ok"] else EXIT_BLOCKED
         if args.command == "init-project":
             path, cfg = init_project(args)
             print(json.dumps({"project": cfg["project_id"], "config": str(path), "repository": cfg["repository"],
@@ -3477,6 +3721,9 @@ def main(argv=None):
         if args.command == "activate":
             with controller.lock("activate"):
                 controller.reload()
+                if controller.state["status"] not in COMMAND_STATUSES["activate"]:
+                    raise UsageError(f"enrollment is {controller.state['status']}; activate is not permitted")
+                controller.assert_claims()
                 result = controller.activate()
             print(json.dumps(result, indent=2))
             return EXIT_OK

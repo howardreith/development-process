@@ -36,6 +36,10 @@ def git(cwd, *args):
     return subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True).stdout.strip()
 
 
+TID = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"
+TID2 = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c"
+
+
 class FakeGitHub:
     """Simulated GitHub boundary backed by the temporary bare origin."""
 
@@ -141,7 +145,7 @@ class FakeReviewer:
         return {"exit_code": item.get("exit_code", 0), "timed_out": False, "thread_id": thread, "duration_s": 0.1,
                 "completed": item.get("completed", True), "failed": False}
 
-    def provenance(self, thread_id):
+    def provenance(self, thread_id, since=None):
         return self.prov.get(thread_id, {"rollout_found": False})
 
 
@@ -246,7 +250,7 @@ class Env:
                    allowed_remote_urls=[git(self.work, "remote", "get-url", "origin")],
                    push_command=["git", "-C", "{repo_root}", "push", "--quiet", "origin", "HEAD:refs/heads/{branch}"],
                    state_root=str(root / "state"), runtime_lock_paths=[str(root / "runtime.lock")])
-        cfg["limits"].update(retry_backoff_seconds=[0, 0])
+        cfg["limits"].update(retry_backoff_seconds=[0, 0], uncertain_send_window_seconds=0)
         for key, value in (cfg_overrides or {}).items():
             cfg[key] = value
         for rel, data in (extra_wf_files or {}).items():
@@ -1792,9 +1796,16 @@ class DevProcRoundOneTests(CrashFixture, Base):
             (env.wf / "prompts" / "reviewer.md").write_text("# new rules\n", encoding="utf-8")
             second = ar.install(dest, env.wf)
         self.assertNotEqual(first, second)
-        self.assertTrue((dest / "versions" / first / "MANIFEST.json").exists())  # the earlier version is intact
-        self.assertEqual(second, ar.read_json(dest / "current.json")["fingerprint"])
-        self.assertEqual(first, ar.workflow_fingerprint(dest / "versions" / first))
+        current = ar.read_json(dest / "current.json")
+        self.assertEqual(second, current["fingerprint"])
+        versions = [v for v in (dest / "versions").iterdir()]
+        self.assertEqual(2, len(versions))  # the earlier version is intact beside the new one
+        self.assertIn(first, {ar.workflow_fingerprint(v) for v in versions})
+        (env.wf / "plans" / "single.json").write_text(
+            (env.wf / "plans" / "single.json").read_text(encoding="utf-8") + "\n", encoding="utf-8")
+        self.assertEqual(second, ar.install(dest, env.wf))  # same behavior, different shipped plan (R4-F2)
+        self.assertNotEqual(current["package"], ar.read_json(dest / "current.json")["package"])
+        self.assertEqual(3, len(list((dest / "versions").iterdir())))
         out = subprocess.run([sys.executable, str(dest / "agent_review.py"), "status", "--enrollment",
                               ctl.state["enrollment_id"]], capture_output=True, text=True, timeout=120)
         self.assertEqual(0, out.returncode, out.stderr)
@@ -1970,26 +1981,33 @@ class DevProcRoundOneTests(CrashFixture, Base):
         self.assertIn("outgoing version", str(refused.exception))
 
     def test_delegation_detection_uses_tool_identity(self):
-        """F18 (structured): delegation is a recorded dispatch or a child session naming this thread, never text."""
+        """F18 (structured): delegation is a recorded dispatch or a child session whose metadata names this thread
+        as its parent; text mentioning the thread or delegation tools is not."""
         with tempfile.TemporaryDirectory() as home:
-            folder = Path(home) / "sessions"
+            folder = Path(home) / "sessions" / "2026" / "11" / "20"
             folder.mkdir(parents=True)
-            rollout = folder / "rollout-a-thread1.jsonl"
+            rollout = folder / f"rollout-a-{TID}.jsonl"
+            meta = json.dumps({"type": "session_meta", "payload": {"id": TID}})
 
             def write(*items):
-                rollout.write_text("\n".join(json.dumps({"type": "response_item", "payload": i}) for i in items) + "\n",
-                                   encoding="utf-8")
+                rollout.write_text("\n".join([meta] + [json.dumps({"type": "response_item", "payload": i}) for i in items])
+                                   + "\n", encoding="utf-8")
             rev = ar.CodexReviewer({"executable": sys.executable, "codex_home": home, "model": "m", "effort": "high"})
             write({"type": "custom_tool_call", "name": "exec",
                    "input": "// tools.collaboration.spawn_agent(...) is mentioned here\nawait tools.exec_command({cmd: 'rg spawn_agent'})"})
-            self.assertFalse(rev.provenance("thread1")["subagent_suspected"])
+            self.assertFalse(rev.provenance(TID)["subagent_suspected"])
             write({"type": "function_call", "name": "spawn_agent", "arguments": "{}"})
-            self.assertTrue(rev.provenance("thread1")["subagent_suspected"])
+            self.assertTrue(rev.provenance(TID)["subagent_suspected"])
             write({"type": "custom_tool_call", "name": "exec", "input": "x"})
-            (folder / "rollout-b-child.jsonl").write_text(
-                json.dumps({"type": "session_meta", "payload": {"id": "child", "parent_thread_id": "thread1"}}) + "\n",
-                encoding="utf-8")
-            self.assertTrue(rev.provenance("thread1")["subagent_suspected"])
+            other = Path(home) / "sessions" / "2026" / "11" / "21"
+            other.mkdir(parents=True)
+            unrelated = other / f"rollout-b-{TID2}.jsonl"
+            unrelated.write_text(json.dumps({"type": "session_meta", "payload": {"id": TID2, "instructions": f"see {TID}"}})
+                                 + "\n", encoding="utf-8")
+            self.assertFalse(rev.provenance(TID)["subagent_suspected"])  # mere text mention is not a parent link
+            unrelated.write_text(json.dumps({"type": "session_meta", "payload": {"id": TID2, "source": {
+                "subagent": {"parent_thread_id": TID}}}}) + "\n", encoding="utf-8")
+            self.assertTrue(rev.provenance(TID)["subagent_suspected"])  # child in another day's folder
 
     def test_re_enrollment_recognizes_the_controllers_earlier_records(self):
         """F19."""
@@ -2061,33 +2079,28 @@ class DevProcRoundTwoTests(CrashFixture, Base):
         self.assertIn("gate evidence", stop.exception.reason)
         self.assertEqual(0, ctl.state["checkpoint_index"])
 
-    def test_install_owns_only_its_layout_and_migrates_a_legacy_copy(self):
-        """R2-F3."""
+    def test_install_owns_only_its_layout_and_never_touches_other_files(self):
+        """R2-F3 / R1-F3: only an empty directory or an owned installation is modified; a flat legacy copy is left
+        untouched (and running legacy processes undisturbed) with instructions to install fresh."""
         env = self.env
-        foreign = env.root / "not-an-install"
-        foreign.mkdir()
-        (foreign / "notes.txt").write_text("keep me\n", encoding="utf-8")
-        with self.assertRaises(ar.UsageError):
-            ar.install(foreign, env.wf)
-        self.assertTrue((foreign / "notes.txt").exists())
-        legacy = env.root / "legacy"
-        digest, hashes, _ = ar.load_workflow(env.wf)
-        for rel in hashes:
-            (legacy / rel).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(env.wf / rel, legacy / rel)
-        ar.atomic_write_json(legacy / "MANIFEST.json", {"fingerprint": digest, "files": hashes})
-        ar.install(legacy, env.wf)  # a pre-versioning flat copy is replaced by the versioned layout
-        self.assertEqual({"agent_review.py", "current.json", "versions"},
-                         {p.name for p in legacy.iterdir() if p.name != "__pycache__"})
-        tampered = env.root / "legacy2"
-        for rel in hashes:
-            (tampered / rel).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(env.wf / rel, tampered / rel)
-        ar.atomic_write_json(tampered / "MANIFEST.json", {"fingerprint": digest, "files": hashes})
-        (tampered / "prompts" / "reviewer.md").write_text("locally edited\n", encoding="utf-8")
-        with self.assertRaises(ar.UsageError):
-            ar.install(tampered, env.wf)  # an edited owned file is never removed silently
-        self.assertTrue((tampered / "prompts" / "reviewer.md").exists())
+        cases = {"unrelated files": {"notes.txt": "keep me\n"},
+                 "familiar names": {"agent_review.py": "print('my own script')\n", "current.json": "{}"},
+                 "legacy flat copy": {"MANIFEST.json": "{}", "agent_review.py": "legacy\n"}}
+        for label, files in cases.items():
+            with self.subTest(label):
+                folder = env.root / label.replace(" ", "-")
+                folder.mkdir()
+                for name, text in files.items():
+                    (folder / name).write_text(text, encoding="utf-8")
+                with self.assertRaises(ar.UsageError):
+                    ar.install(folder, env.wf)
+                self.assertEqual(files, {p.name: p.read_text(encoding="utf-8") for p in folder.iterdir()})
+        owned = env.root / "owned"
+        ar.install(owned, env.wf)
+        (owned / "versions" / "__pycache__").mkdir()
+        with self.assertRaises(ar.UsageError):  # an unowned entry inside versions/ is not adopted
+            ar.install(owned, env.wf)
+        self.assertTrue((owned / "versions" / "__pycache__").exists())
 
     def test_cancel_waits_for_running_helpers(self):
         """F4."""
@@ -2117,7 +2130,7 @@ class DevProcRoundTwoTests(CrashFixture, Base):
     def test_event_sequence_outcome_is_the_last_turn(self):
         """F6."""
         path = self.env.root / "events.jsonl"
-        cases = {"completed": (['{"type":"thread.started","thread_id":"t"}', '{"type":"turn.completed"}'], True),
+        cases = {"completed": (['{"type":"thread.started","thread_id":"%s"}' % TID, '{"type":"turn.completed"}'], True),
                  "completed then unfinished": (['{"type":"turn.completed"}', '{"type":"turn.started"}'], False),
                  "malformed": (['{"type":"turn.completed"}', '{oops'], False),
                  "failed": (['{"type":"turn.started"}', '{"type":"turn.failed"}'], False)}
@@ -2368,20 +2381,20 @@ class DevProcRoundThreeTests(CrashFixture, Base):
     def test_conflicting_threads_and_settings_fail(self):
         """R1-F6."""
         path = self.env.root / "events.jsonl"
-        path.write_text('{"type":"thread.started","thread_id":"a"}\n{"type":"thread.started","thread_id":"b"}\n'
-                        '{"type":"turn.completed"}\n', encoding="utf-8")
+        path.write_text('{"type":"thread.started","thread_id":"%s"}\n{"type":"thread.started","thread_id":"%s"}\n'
+                        '{"type":"turn.completed"}\n' % (TID, TID2), encoding="utf-8")
         self.assertFalse(ar.parse_codex_events(path)["completed"])
         path.write_text('["not an object"]\n{"type":"turn.completed"}\n', encoding="utf-8")
         self.assertFalse(ar.parse_codex_events(path)["completed"])
         with tempfile.TemporaryDirectory() as home:
-            rollout = Path(home) / "sessions" / "rollout-x-t1.jsonl"
+            rollout = Path(home) / "sessions" / f"rollout-x-{TID}.jsonl"
             rollout.parent.mkdir(parents=True)
-            rows = [{"type": "event_msg", "payload": {"type": "thread_settings_applied", "thread_settings": {
+            rows = [{"type": "session_meta", "payload": {"id": TID}}] + [{"type": "event_msg", "payload": {"type": "thread_settings_applied", "thread_settings": {
                         "model": "m", "reasoning_effort": "high", "approval_policy": a,
                         "permission_profile": {"network": "restricted"}}}} for a in ("on-request", "never")]
             rollout.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
             prov = ar.CodexReviewer({"executable": sys.executable, "codex_home": home, "model": "m",
-                                     "effort": "high"}).provenance("t1")
+                                     "effort": "high"}).provenance(TID)
             self.assertTrue(prov["approval_policy"].startswith("<conflicting"))
 
     def test_activation_public_updates_are_durable(self):
@@ -2523,6 +2536,250 @@ class DevProcRoundThreeTests(CrashFixture, Base):
         env.gh.body = owner_text
         ctl.update_pr_body("status text")
         self.assertTrue(env.gh.body.startswith(owner_text))
+
+
+class DevProcRoundFourTests(CrashFixture, Base):
+    """Regressions for the development-process round-4 review findings."""
+
+    def gated_env(self):
+        gates = {"unit": {"argv": [sys.executable, "-c", "print('ok')"]}}
+        plan = {"schema_version": "agent-review.plan.v1", "mission_id": "fixture", "checkpoints": [
+            {"id": "phase-1", "type": "intermediate", "scope": "s", "exit_conditions": ["e"], "required_gates": ["unit"]},
+            {"id": "final", "type": "final", "scope": "s", "exit_conditions": ["e"]}]}
+        env = Env("foreground", plan=plan, cfg_overrides={"gates": gates})
+        self.addCleanup(env.cleanup)
+        return env
+
+    def test_absent_named_receipt_is_missing(self):
+        """R1-F1."""
+        ctl = self.env.controller()
+        self.assertTrue(ctl.missing_publications(include_receipt="final-status-nonexistent"))
+
+    def test_gate_order_comes_from_filenames_and_damage_is_recoverable(self):
+        """R1-F2."""
+        env = self.gated_env()
+        ctl = env.controller()
+        head = git(env.work, "rev-parse", "HEAD")
+        evidence = ctl.dir / "evidence"
+        evidence.mkdir(parents=True, exist_ok=True)
+        damaged = evidence / f"gate-unit-{head[:12]}-20000101T000000000000Z.json"
+        damaged.write_text("{trunc", encoding="utf-8")
+        self.assertEqual(["unit"], ctl.missing_gates(head))
+        receipt = ctl.run_gate("unit")  # a newer valid run replaces damaged evidence
+        self.assertEqual([], ctl.missing_gates(head))
+        undated = dict(receipt, passed=False, exit_code=1)
+        undated.pop("recorded_at")  # a newer failing receipt without its date still counts, and fails closed
+        ar.atomic_write_json(evidence / f"gate-unit-{head[:12]}-99999999T999999999999Z.json", undated)
+        self.assertEqual(["unit"], ctl.missing_gates(head))
+
+    def test_gate_invalidated_during_publication_is_not_accepted(self):
+        """R1-F2: gates are re-checked after the verdict is published, immediately before acceptance."""
+        env = self.gated_env()
+        ctl = env.controller()
+        receipt = ctl.run_gate("unit")
+        env.reviewer.script = [{"decision": "checkpoint_passed"}]
+
+        def damage_log(record):
+            if "Astra — review" in record["body"]:
+                (ctl.dir / "evidence" / receipt["log"]).write_text("edited\n", encoding="utf-8")
+        env.gh.on_post = damage_log
+        self.assertIsNone(ctl.accept_report(report(env, "phase-1")))
+        ctl.transition("review", "t")
+        with self.assertRaises(ar.Stop) as stop:
+            ctl.review_round()
+        self.assertEqual("PAUSED", stop.exception.status)
+        self.assertEqual(({}, "develop", 0), (ctl.state["rounds_completed"], ctl.state["phase"], ctl.state["checkpoint_index"]))
+        self.assertIn("is not accepted", env.gh.comments_list[-1]["body"])
+
+    def test_reviewer_outcome_and_rollout_identity_are_exact(self):
+        """R1-F6."""
+        path = self.env.root / "events.jsonl"
+        path.write_text('{"type":"turn.completed"}\n{"type":"thread.started","thread_id":"%s"}\n' % TID, encoding="utf-8")
+        self.assertFalse(ar.parse_codex_events(path)["completed"])  # completion before the thread started
+        with tempfile.TemporaryDirectory() as home:
+            rev = ar.CodexReviewer({"executable": sys.executable, "codex_home": home, "model": "m", "effort": "high"})
+            root = Path(home) / "sessions"
+            (root / "a").mkdir(parents=True)
+            (root / "b").mkdir(parents=True)
+            meta = json.dumps({"type": "session_meta", "payload": {"id": TID}}) + "\n"
+            (root / "a" / f"rollout-1-{TID}.jsonl").write_text(meta, encoding="utf-8")
+            self.assertTrue(rev.provenance(TID)["rollout_found"])
+            (root / "b" / f"rollout-2-{TID}.jsonl").write_text(meta, encoding="utf-8")
+            self.assertIn("2 rollouts", rev.provenance(TID)["provenance_problem"])  # ambiguous
+            (root / "b" / f"rollout-2-{TID}.jsonl").write_text(
+                json.dumps({"type": "session_meta", "payload": {"id": TID2}}) + "\n", encoding="utf-8")
+            self.assertTrue(rev.provenance(TID)["rollout_found"])  # a name match with another identity is ignored
+            (root / "a" / f"rollout-1-{TID}.jsonl").write_text(meta + "{broken\n", encoding="utf-8")
+            prov = rev.provenance(TID)
+            self.assertIn("malformed", prov["provenance_problem"])
+            self.assertTrue(any("unreliable" in r for r in ar.invocation_problems(
+                {"completed": True, "thread_id": TID}, prov, {"model": "m", "effort": "high"})[0]))
+
+    def test_fully_visible_retired_verdict_stays_on_the_record(self):
+        """R2-F1."""
+        env = self.env
+        ctl = env.controller()
+        head = git(env.work, "rev-parse", "HEAD")
+        ctl.publish("r05-review", "### Astra — review — round 5\n\nfull text of the retired verdict")
+        ctl.retire_verdict({"round": 5, "H": head}, "test retirement")
+        self.assertEqual("superseded", ctl.state["publications"]["r05-review"]["state"])
+        ctl.archive("test")
+        folder = Path(ctl.state["repo_root"]) / ctl.transcript_folder()
+        record = next(folder.glob("*-r05-review.md")).read_text(encoding="utf-8")
+        self.assertIn("full text of the retired verdict", record)
+        self.assertIn("Superseded record", record)
+
+    def test_recovery_uses_only_the_latest_statement(self):
+        """R2-F2: an older authentic envelope is never substituted for a tampered latest one."""
+        env = self.env
+        ctl = env.controller()
+        rounds_dir = ctl.dir / "rounds"
+        rounds_dir.mkdir(exist_ok=True)
+        for n, text in ((1, "first statement"), (2, "latest statement")):
+            path = rounds_dir / f"env-{n}.json"
+            ar.atomic_write_json(path, {"result": {"findings": [dict(finding("R1-F1"), actual=text)]}})
+            ctl.state["rounds"].append({"round": n, "status": "accepted", "envelope_path": str(path),
+                                        "envelope_sha256": ar.sha256_file(path)})
+        ctl.state["findings"] = {"R1-F1": {"status": "open", "last_round": 2, "finding_round": 2}}
+        self.assertEqual("latest statement", ctl.full_findings()["R1-F1"]["finding"]["actual"])
+        (rounds_dir / "env-2.json").write_text((rounds_dir / "env-2.json").read_text(encoding="utf-8") + " ",
+                                               encoding="utf-8")
+        self.assertNotIn("finding", ctl.full_findings()["R1-F1"])
+
+    def test_archive_production_path_scales_past_99_rounds_and_999_records(self):
+        """R3-F1."""
+        env = self.env
+        ctl = env.controller()
+        folder_rel = ctl.transcript_folder()
+        env.commit(f"{folder_rel}/999-earlier.md", "an earlier record\n", "earlier record")
+        env.push()
+        ctl.state.setdefault("archived", {})[f"{folder_rel}/999-earlier.md"] = \
+            ctl.git.blob_sha256("HEAD", f"{folder_rel}/999-earlier.md")
+        rounds_dir = ctl.dir / "rounds"
+        rounds_dir.mkdir(exist_ok=True)
+        for n in (10, 100):
+            path = rounds_dir / f"env-{n}.json"
+            ar.atomic_write_json(path, {"result": {"summary": f"<result of round {n}>"}})
+            ctl.state["rounds"].append({"round": n, "status": "accepted", "envelope_path": str(path),
+                                        "envelope_sha256": ar.sha256_file(path), "published": []})
+            ctl.publish(f"r{n:02d}-review", f"### Astra — review — round {n}\n\nround {n} text")
+        ctl.archive("test")
+        folder = Path(ctl.state["repo_root"]) / folder_rel
+        for n in (10, 100):
+            envelope = next(folder.glob(f"*-r{n}-envelope.json"))
+            self.assertGreaterEqual(int(envelope.name.split("-")[0]), 1000)
+            self.assertIn(f"<result of round {n}>", envelope.read_text(encoding="utf-8"))
+            self.assertNotIn(f"<result of round {10 if n == 100 else 100}>", envelope.read_text(encoding="utf-8"))
+
+    def test_comment_post_rechecks_the_target_pr(self):
+        """R3-F2."""
+        env = self.env
+        ctl = env.controller()
+        ctl.verify_inputs()
+        env.gh.pr_overrides = {"state": "CLOSED"}
+        with self.assertRaises(ar.Stop):
+            ctl.publish("r01-request", "### heading\nbody")
+        env.gh.pr_overrides = {"isDraft": False}
+        with self.assertRaises(ar.Stop):
+            ctl.publish("r01-request", "### heading\nbody")
+        self.assertEqual([], env.gh.comments_list)
+
+    def test_truncated_envelope_retires_the_visible_verdict(self):
+        """R3-F4."""
+        env = self.env
+        env.reviewer.script = [{"decision": "checkpoint_passed"}, {"decision": "checkpoint_passed"}]
+        ctl = env.controller()
+
+        def crash_after_verdict(record):
+            if "Astra — review" in record["body"]:
+                env.gh.on_post = None
+                raise KeyboardInterrupt("simulated crash after the verdict was stored")
+        env.gh.on_post = crash_after_verdict
+        ctl.accept_report(report(env, "phase-1"))
+        ctl.transition("review", "t")
+        with self.assertRaises(KeyboardInterrupt):
+            ctl.review_round()
+        restarted = env.controller()
+        envelope = Path(restarted.active()["envelope_path"])
+        envelope.write_bytes(envelope.read_bytes()[:40])  # truncated JSON
+        self.assertEqual("checkpoint_passed", restarted.review_round())
+        self.assertTrue(any("not a current verdict" in c["body"] for c in env.gh.comments_list))
+
+    def test_first_status_insertion_keeps_trailing_owner_text(self):
+        """R3-F5."""
+        env = self.env
+        owner_text = "Owner notes  \n\t\n\n"
+        env.gh.body = owner_text
+        env.controller().update_pr_body("status")
+        self.assertTrue(env.gh.body.startswith(owner_text))
+
+    def test_readiness_checks_the_live_branch_head(self):
+        """R4-F1: a lagging PR view cannot certify a handoff after the branch moved."""
+        env = self.env
+        ctl = env.controller()
+        self.to_finalize(ctl)
+        self.assertEqual("AWAITING_OWNER_REVIEW", ctl.finalize())
+        head = git(env.work, "rev-parse", "HEAD")
+        self.assertEqual([], ctl.readiness(head)[0])
+        other = env.root / "other"
+        subprocess.run(["git", "clone", "--quiet", "-b", env.branch, str(env.origin), str(other)], check=True)
+        (other / "y.txt").write_text("y", encoding="utf-8")
+        git(other, "add", "y.txt")
+        git(other, "-c", "user.name=T", "-c", "user.email=t@e.invalid", "commit", "--quiet", "-m", "moved")
+        git(other, "push", "--quiet", "origin", env.branch)
+        env.gh.pr_overrides = {"headRefOid": head}  # GitHub's PR view has not caught up
+        reasons, _ = ctl.readiness(head)
+        self.assertTrue(any("branch head" in r for r in reasons))
+
+    def test_transcript_delta_needs_positive_inventory_membership(self):
+        """R4-F3: a path Git would display quoted is not mistaken for an inventoried record."""
+        env = self.env
+        ctl = env.controller()
+        base = git(env.work, "rev-parse", "HEAD")
+        rel = f"{ctl.transcript_folder()}/001-r\u00e9sum\u00e9.md"  # git displays this path quoted
+        env.commit(rel, "not a controller record\n", "unexpected transcript file")
+        with self.assertRaises(ar.Stop):
+            ctl.verify_transcript_delta(base, git(env.work, "rev-parse", "HEAD"))
+
+    def test_lost_post_with_stale_listing_is_not_duplicated(self):
+        """R4-F4."""
+        env = self.env
+        ctl = env.controller()
+        ctl.limits["uncertain_send_window_seconds"] = 600
+        real_comments, hide = env.gh.comments, {"n": 99}
+
+        def stale_listing(number):
+            listing = real_comments(number)
+            return listing[:-1] if hide["n"] > 0 and listing else listing
+        env.gh.comments = stale_listing
+        env.gh.lose_next_response = 1
+        with self.assertRaises(ar.Stop) as stop:
+            ctl.publish("r01-request", "### heading\nbody")
+        self.assertEqual("PAUSED", stop.exception.status)
+        self.assertEqual(1, len(env.gh.comments_list))  # never posted twice while delivery was uncertain
+        hide["n"] = 0  # the stored comment becomes visible
+        env.controller().settle_publications()
+        self.assertEqual(1, len(env.gh.comments_list))
+        self.assertFalse(env.controller().missing_publications())
+
+    def test_shell_rules_are_mirrored_for_powershell(self):
+        """Live smoke run 13: the PowerShell tool lacked an allowance the Bash tool had."""
+        composed = ar.compose_developer_settings(self.env.controller().cfg, self.env.wf, "e1")
+        for kind in ("allow", "deny"):
+            rules = composed["permissions"][kind]
+            for rule in rules:
+                if rule.startswith("Bash("):
+                    self.assertIn("PowerShell(" + rule[5:], rules)
+        self.assertIn("PowerShell(git ls-remote *)", composed["permissions"]["allow"])
+        self.assertIn("PowerShell(git checkout*)", composed["permissions"]["deny"])
+
+    def test_stale_command_is_refused_after_cancellation(self):
+        """R4-F5."""
+        env = self.env
+        stale = env.controller()  # resolved and status-checked before the lock
+        env.controller().cancel("owner decision")
+        with self.assertRaises(ar.UsageError):
+            ar.guarded(stale, "review", lambda: self.fail("must not run"))
 
 
 class ToolTranscriptTests(unittest.TestCase):
