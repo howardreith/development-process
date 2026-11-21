@@ -1,0 +1,127 @@
+{
+  "B": "2e8f58127ea0fb096d6197c030880292d8231639",
+  "H": "c391eff6edfc82e82b103651397e361ba17a41ab",
+  "M": "2e8f58127ea0fb096d6197c030880292d8231639",
+  "checkpoint_id": "final",
+  "checkpoint_type": "final",
+  "fatal": false,
+  "invocation": {
+    "completed": true,
+    "duration_s": 97.2,
+    "errors": [],
+    "exit_code": 0,
+    "failed": false,
+    "observed": {
+      "approval_policy": "never",
+      "cli_version": "0.170.0",
+      "network": "restricted",
+      "observed_effort": "high",
+      "observed_model": "gpt-6.2-astra",
+      "plan_type": "pro",
+      "rollout_found": true,
+      "sandbox": "read-only",
+      "source": "Codex session rollout (CLI-recorded thread settings; not model-authored)",
+      "subagent_suspected": false,
+      "turn_efforts": [
+        "high"
+      ],
+      "turn_models": [
+        "gpt-6.2-astra"
+      ],
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 348544,
+        "input_tokens": 409878,
+        "output_tokens": 3118,
+        "reasoning_output_tokens": 805,
+        "total_tokens": 412996
+      }
+    },
+    "requested": {
+      "effort": "high",
+      "model": "gpt-6.2-astra",
+      "sandbox": "read-only"
+    },
+    "thread_id": "01a1fd11-e8e2-7620-b656-46eb28ed3343",
+    "timed_out": false
+  },
+  "mission": {
+    "id": "list-command",
+    "sha256": "11e46e96cf01c495c81c03b917b1d9f549f260028ca8587929c25ccb68eb4726"
+  },
+  "ok": true,
+  "path": "~\\.agent-review\\state\\devproc-claude-list-command-20261121013957-b56a\\rounds\\r04\\envelope-1.json",
+  "pr": 2,
+  "project_sha256": "c7c0f2de947d34bfbcdc0930ecb0d14ffda525794a0aaf9289e463ec434d1623",
+  "protocol": "agent-review.v1",
+  "publication": "r04-review",
+  "published": [
+    {
+      "comment_id": 7059489514,
+      "of": 1,
+      "part": 1,
+      "url": "https://github.com/howardreith/development-process/pull/2#issuecomment-7059489514"
+    }
+  ],
+  "raw_result_if_rejected": null,
+  "reasons": [],
+  "repository": "howardreith/development-process",
+  "request_id": "devproc-claude-list-command-20261121013957-b56a-r04-cab8b4",
+  "response_sha256": "7e327fb05ee1092434700b871af47801608672ea5f4e7b63c1055aa76a0860d6",
+  "result": {
+    "candidate_commit": "c391eff6edfc82e82b103651397e361ba17a41ab",
+    "checkpoint_id": "final",
+    "checkpoint_type": "final",
+    "decision": "ready_for_owner_review",
+    "decision_rationale": "The candidate meets all five mission requirements on the supported Windows host. Both pending fixes passed their regression tests. The guarded push and required unit gate identify the same commit as the reviewed snapshot.",
+    "evidence_assessment": {
+      "executed_verification": [
+        "The developer transcript records the guarded push of c391eff6edfc82e82b103651397e361ba17a41ab to claude/list-command, followed by the pinned controller's verify --gate unit on that commit.",
+        "The gate exited 0 with the worktree unchanged. Its log digest matches the receipt. The suite ran 205 tests, with all 14 ListCommandTests passing and only the opt-in live-model smoke skipped.",
+        "The passing fixtures exercised the CLI with a writer lock held, checked the returned fields and unchanged filesystem snapshot, and covered empty registries, damaged entries alongside healthy entries, Windows junctions, and denied registry enumeration."
+      ],
+      "inspected": [
+        "The fixed mission, repository instructions, operating guide, protocol, full feature diff, and surrounding enrollment, claim, state-read, cancellation, and CLI dispatch code.",
+        "The prior findings ledger, developer dispositions, CLI-recorded transcript, and candidate-bound unit receipt and log."
+      ],
+      "limitations": [
+        "Runtime observations come from the recorded candidate gate. The independent review used read-only inspection.",
+        "Path inspection and opening are separate operations. Concurrent replacement of a checked component with a link remains a limitation. The Windows fixtures exercised local drives and UNC refusal. A positively mapped network drive was untested, and POSIX network mounts are undetected.",
+        "Publication, archive creation, and final owner handoff for this live task occur after the controller accepts the review."
+      ],
+      "required_gaps": [],
+      "source_inspection_only": [
+        "The list dispatch reads the registry directly. Its code path acquires no controller lock and invokes no Git, GitHub, or state-writing operation.",
+        "New claims retain the existing dir field and add an absolute state_dir for listing. The README documents the command beside status and explains its output and refusal cases."
+      ]
+    },
+    "findings": [],
+    "prior_finding_assessments": [
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R1-F4",
+        "rationale": "The component walk now returns a distinct missing result, and its callers stop before opening a partially inspected path. The Windows regression passed with a real junction, parent-directory segments, and a missing component. It also checked that the healthy enrollment retained its exact fields."
+      },
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R3-F1",
+        "rationale": "Registry enumeration now uses os.scandir and propagates scan errors to the CLI refusal path. The passing Windows fixture confirmed that a populated registry remained inspectable while enumeration raised PermissionError. The CLI then returned exit 4, empty stdout, and a registry diagnostic. The absent and readable-empty cases still printed []."
+      }
+    ],
+    "request_id": "devproc-claude-list-command-20261121013957-b56a-r04-cab8b4",
+    "round": 4,
+    "schema_version": "agent-review.review.v1",
+    "summary": {
+      "delivered_behavior": "Owners can run list without an enrollment ID to obtain a sorted JSON array of registered enrollments and their current state fields. A damaged entry remains visible with status unknown and a diagnostic. An unreadable registry produces an explicit refusal.",
+      "pending_later_phase_work": [],
+      "remaining_owner_review": [
+        "Review the final draft PR and its controller-published handoff, then decide whether to merge and install the candidate."
+      ],
+      "scope_reviewed": "The complete list-command mission for draft PR #2, including behavior tests, documentation, both pending findings, and the required gate on the pushed candidate.",
+      "unresolved_questions": []
+    }
+  },
+  "round": 4,
+  "validated_at": "2026-11-21T07:47:48Z",
+  "workflow_fingerprint": "6d55b038c5d356387d98e746a3adb8e3b32d44def7aedd1c0374fec9c6596c4f"
+}
