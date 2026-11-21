@@ -56,7 +56,7 @@ simulations.
 | WF08 | Pass (real, fixture) | The no-progress stop fired visibly on PR #1 and on live PR #2. Exhausted budgets, unresolved correctness findings and missing or failed required gates block with a visible status. |
 | WF09 | Pass (fixture, real) | Transcript-only archive commits preserve readiness only under the inventory and hash check. Live PR #2 archived its records as transcript-only commits after the reviewed candidate. |
 | WF10 | Pass (fixture) | Wrong repository, PR, actor or marker is refused before dispatch. Comment text is never executed. Helpers require enrollment authority under a lock. Headless permissions are isolated (the `permissions` gate shows real launches denying a user-level allowance). |
-| WF11 | Pass (real) | Live PR #2 ended AWAITING_OWNER_REVIEW: a draft with no requested reviewers, a handoff receipt naming reviewed source `bc4b300` and transcript-only archive `b89fa6c`, and a PR status section. The effective permissions and the exact launch, resume and stop commands are in `agent_review/README.md`. |
+| WF11 | Pass (real) | Live PR #2 ended AWAITING_OWNER_REVIEW (final handoff comment [7059723699](https://github.com/howardreith/development-process/pull/2#issuecomment-7059723699); recorded readback `planning/evidence/pr-2-handoff-readback.json`): a draft with no requested reviewers, a handoff receipt naming reviewed source `bc4b300` and transcript-only archive `b89fa6c`, and a PR status section. The effective permissions and the exact launch, resume and stop commands are in `agent_review/README.md`. |
 | WF12 | Pass (real, fixture) | On PR #1, controller-core (intermediate) passed and advanced to setup-final without owner input. Fixture: HeadlessCycleTests. |
 
 ### Live task (development-process PR #2)
@@ -100,6 +100,9 @@ unattended, and was enrolled with the installed controller.
   `bc4b300`, archive `b89fa6c`.
 
 **Handoff readback (2026-11-21, read from GitHub and the enrollment state).**
+The tool-recorded readback is committed as `planning/evidence/pr-2-handoff-readback.json`: the `gh` commands, the
+PR fields, the PR body's status section and the full final handoff comment
+([7059723699](https://github.com/howardreith/development-process/pull/2#issuecomment-7059723699)).
 `gh pr view 2` reports an open draft, no requested reviewers, head
 `b89fa6c72dd56de945b255d3320e19059bd30065`. The handoff status comment
 (`key=final-status-b89fa6c72d`, posted 2026-11-21T08:09:52Z) names reviewed

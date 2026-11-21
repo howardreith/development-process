@@ -1,0 +1,25 @@
+{
+ "recorded_at": "2026-11-21T10:23:05Z",
+ "commands": [
+  "gh pr view 2 -R howardreith/development-process --json number,url,state,isDraft,headRefName,headRefOid,baseRefName,reviewRequests,body",
+  "gh api repos/howardreith/development-process/issues/comments/7059723699"
+ ],
+ "pr": {
+  "number": 2,
+  "url": "https://github.com/howardreith/development-process/pull/2",
+  "state": "OPEN",
+  "isDraft": true,
+  "headRefName": "claude/list-command",
+  "headRefOid": "b89fa6c72dd56de945b255d3320e19059bd30065",
+  "baseRefName": "claude/agent-review-controller",
+  "reviewRequests": []
+ },
+ "pr_body_status_section": "**Agent review status:** awaiting owner review. Reviewed source `bc4b30043bc952e204fb76d0dfc423055d99c117`; archive head `b89fa6c72dd56de945b255d3320e19059bd30065` (transcript-only successor). Records: `docs/agent-reviews/pr-2/`.",
+ "handoff_comment": {
+  "id": 7059723699,
+  "url": "https://github.com/howardreith/development-process/pull/2#issuecomment-7059723699",
+  "created_at": "2026-11-21T08:09:52Z",
+  "author": "howardreith",
+  "body": "<!-- agent-review:v1 enrollment=devproc-claude-list-command-20261121013957-b56a key=final-status-b89fa6c72d part=1/1 sha256=51a174b107573f4d48378b78032cf1c095832471ca5d540dc9ff4f6a0e5fb801 -->\n### Workflow — awaiting owner review — source `bc4b30043b`, archive `b89fa6c72d`\n\n- Reviewed source candidate H: `bc4b30043bc952e204fb76d0dfc423055d99c117` (review round 5, Codex `gpt-6.2-astra` / `high`)\n- Archive commit A: `b89fa6c72dd56de945b255d3320e19059bd30065` — adds only the controller's append-only transcript records under `docs/agent-reviews/pr-2/` (path-, mode-, inventory- and hash-checked).\n- Merge base M: `2e8f58127ea0fb096d6197c030880292d8231639`; reviewed target tip B: `7358a159057acaedf25c4f530618845e07dc0448`\n- Developer: Claude `opus` / `high`; observed headless session `e0fa5299-068f-45a3-b1bd-cac2a4644a7e`: init `claude-opus-5-5`, API models ['claude-opus-5-5'], effort ['high']\n- Review rounds: final: 5\n\n**Delivered behavior (reviewer summary):** An owner can run list without an enrollment ID to see a sorted JSON array of registered enrollments and their status, phase, PR number, and update time. A damaged entry remains visible with status unknown and a diagnostic. An empty registry prints [], while an unreadable registry produces an explicit error.\n\n**Remaining owner review:**\n- Review the controller’s final handoff on draft PR #2 and decide whether to merge and install the candidate.\n\n**Open non-blocking items:** none\n\n**Notes:**\n- no required status checks on claude/agent-review-controller (no branch protection or ruleset requires one); verified, not assumed\n\nThis is readiness for the owner's review only. It does not merge, release, or grant visual acceptance. The PR remains a draft with no requested reviewers.\n\n_Automated workflow status posted through the owner's GitHub account; not a human approval._\n"
+ }
+}
