@@ -103,7 +103,10 @@ class FakeReviewer:
     def requested(self):
         return {"model": "gpt-6.2-astra", "effort": "high", "sandbox": "read-only"}
 
-    def run(self, prompt, workdir, schema, result_path, events_path, stderr_path, timeout_s, skip_git=False):
+    def run(self, prompt, workdir, schema, result_path, events_path, stderr_path, timeout_s, skip_git=False,
+            on_start=None):
+        if on_start:
+            on_start(None)  # simulated: no OS process
         item = self.script.pop(0)
         request = json.loads((Path(result_path).parent / "request.json").read_text(encoding="utf-8"))
         inbox = Path(workdir) / ".agent-review-inputs"
@@ -134,7 +137,8 @@ class FakeReviewer:
             for key in item.get("drop", []):
                 result.pop(key)
             Path(result_path).write_text(json.dumps(result), encoding="utf-8")
-        return {"exit_code": item.get("exit_code", 0), "timed_out": False, "thread_id": thread, "duration_s": 0.1}
+        return {"exit_code": item.get("exit_code", 0), "timed_out": False, "thread_id": thread, "duration_s": 0.1,
+                "completed": item.get("completed", True), "failed": False}
 
     def provenance(self, thread_id):
         return self.prov.get(thread_id, {"rollout_found": False})
@@ -613,7 +617,7 @@ class InvalidReviewTests(unittest.TestCase):
     """WF05: no failure shape produces a decision or readiness."""
 
     CASES = {
-        "wrong model (fatal, no retry)": ([{"decision": "checkpoint_passed", "model": "gpt-6.1-sol"}], "wrong reviewer model", 1),
+        "wrong model (fatal, no retry)": ([{"decision": "checkpoint_passed", "model": "gpt-6.1-sol"}], "not affirmatively gpt-6.2-astra", 1),
         "wrong effort (fatal)": ([{"decision": "checkpoint_passed", "effort": "low"}], "effort", 1),
         "contradictory turn effort (fatal)": ([{"decision": "checkpoint_passed", "turn_efforts": ["high", "low"]}], "effort", 1),
         "usage limit (fatal)": ([{"decision": "checkpoint_passed", "stderr": "You've hit your usage limit", "exit_code": 1}], "usage limit", 1),
@@ -626,6 +630,12 @@ class InvalidReviewTests(unittest.TestCase):
         "mismatched request id": ([{"decision": "checkpoint_passed", "override": {"request_id": "forged"}}] * 3, "does not match", 3),
         "final decision on intermediate": ([{"decision": "ready_for_owner_review"}] * 3, "not valid for a intermediate", 3),
         "pass with blocking finding": ([{"decision": "checkpoint_passed", "findings": [finding("R1-F1")]}] * 3, "passing decision", 3),
+        "duplicate JSON keys": ([{"raw": '{"decision": "checkpoint_passed", "decision": "blocked"}'}] * 3, "duplicate JSON keys", 3),
+        "blank rationale": ([{"decision": "checkpoint_passed", "override": {"decision_rationale": "  "}}] * 3, "is blank", 3),
+        "pass without inspected evidence": ([{"decision": "checkpoint_passed", "override": {"evidence_assessment": {
+            "inspected": [], "executed_verification": [], "source_inspection_only": [], "required_gaps": [],
+            "limitations": []}}}] * 3, "no inspected evidence", 3),
+        "malformed new finding id": ([{"decision": "changes_required", "findings": [finding("X-1")]}] * 3, "does not use the form", 3),
         "pass with required evidence gap": ([{"decision": "checkpoint_passed", "override": {"evidence_assessment": {
             "inspected": [], "executed_verification": [], "source_inspection_only": [],
             "required_gaps": ["native observation missing"], "limitations": []}}}] * 3, "required evidence gaps", 3),
@@ -855,14 +865,12 @@ class LimitTests(Base):
         ctl = env.controller()
         ctl.accept_report(report(env, "phase-1"))
         ctl.transition("review", "t")
-        self.assertEqual("changes_required", ctl.review_round())
-        sha = env.commit("feature.txt", "fix\n", "fix")
-        env.push()
-        self.assertIsNone(ctl.accept_report(report(env, "phase-1", [fixed("R1-F1", sha)])))
-        ctl.transition("review", "t")
-        with self.assertRaises(ar.Stop) as stop:
+        with self.assertRaises(ar.Stop) as stop:  # R1-F15: the cap stops with the last allowed review itself
             ctl.review_round()
         self.assertIn("review-round cap", stop.exception.reason)
+        on_disk = ar.read_json(env.dir / "state.json")
+        self.assertEqual(("BLOCKED", "accepted"), (on_disk["status"], on_disk["rounds"][-1]["status"]))
+        self.assertEqual(["R1-F1"], on_disk["pending_findings"])  # preserved for an owner-authorized extension
         ctl.verify_inputs()
         ctl.publish_status(stop.exception.status, stop.exception.reason)
         self.assertIn("Workflow — blocked", env.gh.headings()[-1])
@@ -1467,8 +1475,9 @@ class RoundTwoRegressionTests(Base):
         env.commit("feature.txt", "v2\n", "new candidate")
         env.push()
         current = ctl.run_gate("unit")
-        forged = ctl.dir / "evidence" / "gate-unit-forged.json"
-        ar.atomic_write_json(forged, {**current, "log_sha256": "0" * 64})  # log does not match: not supplied
+        other = ctl.run_gate("filtered", ["-Filter", "abc"])
+        tampered = sorted((ctl.dir / "evidence").glob("gate-filtered-*.log"))[-1]
+        tampered.write_text("altered after the run\n", encoding="utf-8")  # its receipt's log digest no longer matches
         env.reviewer.script = [{"decision": "checkpoint_passed"}]
         ctl.accept_report(report(env, "phase-1"))
         ctl.transition("review", "t")
@@ -1477,7 +1486,7 @@ class RoundTwoRegressionTests(Base):
         names = [n for n in call["inbox"] if n.startswith("evidence/")]
         self.assertIn("evidence/" + current["log"], names)
         self.assertNotIn("evidence/" + old["log"], names)  # a receipt for another commit is not current evidence
-        self.assertNotIn("evidence/gate-unit-forged.json", names)
+        self.assertNotIn("evidence/" + other["log"], names)  # tampered evidence is never supplied
         self.assertIn("withheld", call["transcript"])
 
     def test_developer_helpers_check_enrollment_authority(self):
@@ -1658,6 +1667,382 @@ class RoundFourRegressionTests(Base):
         ctl.save()
         ctl.resume("owner reviewed the disagreement")
         self.assertEqual(0, ctl.state["findings"]["R1-F1"]["rounds_open"])
+
+
+CRASH_DRIVER = """
+import os, sys
+from pathlib import Path
+wf, enrollment, pidfile = sys.argv[1:4]
+sys.path.insert(0, wf)
+import agent_review as ar
+Path(pidfile).write_text(str(os.getpid()), encoding="utf-8")
+ar.Controller(Path(enrollment), github=object(), workflow_root=Path(wf), sleep=lambda s: None).finalize()
+"""
+
+HOOK = """import os, signal, sys, time
+from pathlib import Path
+pid = int(Path(sys.argv[1]).read_text(encoding="utf-8"))
+os.kill(pid, signal.SIGTERM)  # terminate the controller at this exact point
+time.sleep(1)
+sys.exit(1)
+"""
+
+
+class DevProcRoundOneTests(Base):
+    """Regressions for the development-process round-1 review findings."""
+
+    def crash_finalize_at(self, env, hook_name):
+        """Run finalize in a real controller subprocess and kill it from a git hook (F20)."""
+        hook_py = env.root / "kill_controller.py"
+        hook_py.write_text(HOOK, encoding="utf-8")
+        pidfile = env.root / "controller.pid"
+        hook = env.work / ".git" / "hooks" / hook_name
+        hook.write_text(f'#!/bin/sh\n"{Path(sys.executable).as_posix()}" "{hook_py.as_posix()}" "{pidfile.as_posix()}"\n',
+                        encoding="utf-8")
+        driver = env.root / "driver.py"
+        driver.write_text(CRASH_DRIVER, encoding="utf-8")
+        proc = subprocess.run([sys.executable, str(driver), str(env.wf), str(env.dir), str(pidfile)],
+                              capture_output=True, text=True, timeout=300)
+        hook.unlink()
+        self.assertNotEqual(0, proc.returncode)  # the controller was killed mid-archive
+
+    def test_archive_crash_before_commit_recovers_from_intent(self):
+        """F20 + F12 (pre-commit kill): records written, no commit; one record lost; restart completes exactly."""
+        env = self.env
+        ctl = env.controller()
+        self.to_finalize(ctl)
+        self.crash_finalize_at(env, "pre-commit")
+        pending = ar.read_json(env.dir / "state.json")["archive_pending"]
+        self.assertIsNone(pending["commit"])
+        (env.work / pending["files"][-1]["rel"]).unlink()
+        self.assertEqual("AWAITING_OWNER_REVIEW", env.controller().finalize())
+        self.assertTrue(ar.Git(env.work).clean())
+
+    def test_archive_crash_after_commit_adopts_only_the_exact_commit(self):
+        """F20 + F9 (post-commit kill): the commit exists but was not recorded; restart adopts it."""
+        env = self.env
+        ctl = env.controller()
+        self.to_finalize(ctl)
+        self.crash_finalize_at(env, "post-commit")
+        self.assertIsNone(ar.read_json(env.dir / "state.json")["archive_pending"]["commit"])
+        restarted = env.controller()
+        self.assertEqual("AWAITING_OWNER_REVIEW", restarted.finalize())
+        self.assertEqual(1, len(restarted.state["archive_commits"]))
+
+    def test_archive_commit_must_contain_exactly_the_intended_records(self):
+        """F9: a commit missing an intended record fails the inventory check; readiness re-verifies records."""
+        env = self.env
+        ctl = env.controller()
+        parent = git(env.work, "rev-parse", "HEAD")
+        rel = "docs/agent-reviews/pr-7/001-r01-request.md"
+        commit = env.commit(rel, "x\n", "one of two records")
+        digest = ar.Git(env.work).blob_sha256(commit, rel)
+        expected = {rel: digest, "docs/agent-reviews/pr-7/002-r01-review.md": ar.sha256_text("y\n")}
+        self.assertTrue(ctl.archive_commit_problems(parent, commit, expected))
+        self.assertFalse(ctl.archive_commit_problems(parent, commit, {rel: digest}))
+
+    def test_archive_destinations_are_validated_before_writing(self):
+        """F10."""
+        env = self.env
+        ctl = env.controller()
+        with self.assertRaises(ar.Stop):
+            ctl.record_path("docs/agent-reviews/pr-7/../../../outside.md")
+        with self.assertRaises(ar.Stop):
+            ctl.record_path("docs/agent-reviews/pr-8/001-r01-review.md")
+        target = env.root / "elsewhere"
+        target.mkdir()
+        link = env.work / "docs" / "agent-reviews"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        if os.name == "nt":
+            import _winapi
+            _winapi.CreateJunction(str(target), str(link))
+        else:
+            os.symlink(target, link)
+        with self.assertRaises(ar.Stop) as stop:
+            ctl.record_path("docs/agent-reviews/pr-7/001-r01-request.md")
+        self.assertIn("link or junction", stop.exception.reason)
+        self.assertEqual([], list(target.iterdir()))
+
+    def test_resumed_stale_verdict_is_never_published_as_current(self):
+        """F1 (verdict queued, not sent) and F12: a historical review replaces it and is settled on resume."""
+        env = self.env
+        env.reviewer.script = [{"decision": "checkpoint_passed"}]
+        ctl = env.controller()
+        ctl.accept_report(report(env, "phase-1"))
+        ctl.transition("review", "t")
+        real_post, calls = env.gh.post_comment, {"n": 0}
+
+        def post(number, body_file):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise RuntimeError("simulated outage")
+            return real_post(number, body_file)
+        env.gh.post_comment = post
+        with self.assertRaises(ar.Stop):
+            ctl.review_round()
+        env.gh.post_comment = real_post
+        env.commit("feature.txt", "moved\n", "push while paused")
+        env.push()
+        with self.assertRaises(ar.Stop):
+            env.controller().review_round()
+        headings = env.gh.headings()
+        self.assertFalse([h for h in headings if "Astra — review — round 1" in h and "HISTORICAL" not in h])
+        self.assertTrue([h for h in headings if "HISTORICAL" in h])
+
+    def test_already_visible_verdict_gets_a_correction_when_stale(self):
+        """F1 (verdict posted, crash before acceptance)."""
+        env = self.env
+        env.reviewer.script = [{"decision": "checkpoint_passed"}]
+        ctl = env.controller()
+
+        def crash_after_verdict(record):
+            if "Astra — review" in record["body"]:
+                env.gh.on_post = None
+                raise KeyboardInterrupt("simulated controller crash right after the verdict was stored")
+        env.gh.on_post = crash_after_verdict
+        ctl.accept_report(report(env, "phase-1"))
+        ctl.transition("review", "t")
+        with self.assertRaises(KeyboardInterrupt):
+            ctl.review_round()
+        env.commit("feature.txt", "moved\n", "push before restart")
+        env.push()
+        with self.assertRaises(ar.Stop):
+            env.controller().review_round()
+        self.assertIn("Workflow — correction", env.gh.headings()[-1])
+
+    def test_newest_gate_run_supersedes_and_tampered_logs_fail(self):
+        """F2."""
+        flag = Path(tempfile.gettempdir()) / f"agent-review-flag-{uuid.uuid4().hex}"
+        self.addCleanup(lambda: flag.unlink(missing_ok=True))
+        gates = {"flaky": {"argv": [sys.executable, "-c", f"import os,sys; sys.exit(0 if os.path.exists({str(flag)!r}) else 1)"]}}
+        plan = {"schema_version": "agent-review.plan.v1", "mission_id": "fixture", "checkpoints": [
+            {"id": "final", "type": "final", "scope": "s", "exit_conditions": ["e"], "required_gates": ["flaky"]}]}
+        env = Env("foreground", plan=plan, cfg_overrides={"gates": gates})
+        self.addCleanup(env.cleanup)
+        ctl = env.controller()
+        head = git(env.work, "rev-parse", "HEAD")
+        flag.write_text("1", encoding="utf-8")
+        self.assertTrue(ctl.run_gate("flaky")["passed"])
+        self.assertEqual([], ctl.missing_gates(head))
+        flag.unlink()
+        self.assertFalse(ctl.run_gate("flaky")["passed"])
+        self.assertEqual(["flaky"], ctl.missing_gates(head))  # a later failure supersedes the earlier pass
+        flag.write_text("1", encoding="utf-8")
+        latest = ctl.run_gate("flaky")
+        (ctl.dir / "evidence" / latest["log"]).write_text("edited\n", encoding="utf-8")
+        self.assertEqual(["flaky"], ctl.missing_gates(head))  # the same rule rejects a tampered log
+
+    def test_install_is_atomic_and_interlocked_with_running_controllers(self):
+        """F3."""
+        env = self.env
+        dest = env.root / "installed"
+        ar.install(dest, env.wf)
+        self.assertTrue((dest / "MANIFEST.json").exists())
+        ctl = env.controller()
+        with ctl.lock("run"):
+            with self.assertRaises(ar.UsageError):
+                ar.install(dest, env.wf)
+        (env.wf / "prompts" / "reviewer.md").write_text("# new rules\n", encoding="utf-8")
+        ar.install(dest, env.wf)
+        self.assertEqual("# new rules\n", (dest / "prompts" / "reviewer.md").read_text(encoding="utf-8"))
+        self.assertFalse(list(env.root.glob("installed.*")))  # no staging or retired copies left behind
+
+    def test_a_controller_uses_one_snapshot_of_its_workflow(self):
+        """F3: prompts read after start come from the verified snapshot; disk changes pause the next check."""
+        env = self.env
+        ctl = env.controller()
+        (env.wf / "prompts" / "reviewer.md").write_text("tampered prompt\n", encoding="utf-8")
+        self.assertNotIn("tampered", ctl.render("reviewer.md", {}))
+        with self.assertRaises(ar.Stop):
+            ctl.verify_inputs()
+
+    def test_cancel_is_refused_under_live_work_and_survives_publication_failure(self):
+        """F4."""
+        env = self.env
+        ctl = env.controller()
+        ctl.state["developer"]["active_pid"] = os.getpid()
+        with self.assertRaises(ar.Stop):
+            ctl.cancel("x")
+        ctl.state["developer"]["active_pid"] = None
+        (env.root / "runtime.lock").write_text("run\n", encoding="utf-8")
+        with self.assertRaises(ar.Stop):
+            ctl.cancel("x")
+        (env.root / "runtime.lock").unlink()
+        env.gh.fail_next = 99
+        self.assertEqual("CANCELLED", ctl.cancel("owner decision"))
+        on_disk = ar.read_json(env.dir / "state.json")
+        self.assertEqual(("CANCELLED", "cancelled"), (on_disk["status"], on_disk["phase"]))
+        env.gh.fail_next = 0
+        with self.assertRaises(ar.UsageError):
+            env.controller().run_loop()
+
+    def test_helpers_require_active_development_identity_and_version(self):
+        """F5."""
+        env = self.env
+        ctl = env.controller()
+        self.assertEqual([], ctl.helper_authority_problems())
+        for status, phase in (("PAUSED", "develop"), ("ACTIVE", "review")):
+            ctl.state.update(status=status, phase=phase)
+            self.assertTrue(ctl.helper_authority_problems())
+        ctl.state.update(status="ACTIVE", phase="develop")
+        git(env.work, "checkout", "--quiet", "-b", "codex/other")
+        self.assertTrue(ctl.helper_authority_problems())
+        git(env.work, "checkout", "--quiet", env.branch)
+        (env.wf / "prompts" / "reviewer.md").write_text("changed\n", encoding="utf-8")
+        self.assertTrue(any("not the version activated" in p for p in env.controller().helper_authority_problems()))
+
+    def test_reviewer_provenance_must_be_affirmative(self):
+        """F6."""
+        req = {"model": "gpt-6.2-astra", "effort": "high"}
+        good = {"rollout_found": True, "observed_model": "gpt-6.2-astra", "observed_effort": "high",
+                "turn_models": ["gpt-6.2-astra"], "turn_efforts": ["high"], "sandbox": "read-only",
+                "approval_policy": "never", "subagent_suspected": False}
+        info = {"completed": True, "failed": False}
+        self.assertEqual(([], False), ar.invocation_problems(info, good, req))
+        for change in ({"turn_models": []}, {"turn_efforts": []}, {"sandbox": None}, {"approval_policy": None}):
+            with self.subTest(change):
+                self.assertTrue(ar.invocation_problems(info, {**good, **change}, req)[0])
+        self.assertTrue(ar.invocation_problems({"completed": False}, good, req)[0])
+
+    def test_unconfirmed_post_is_not_acknowledged_after_a_read_failure(self):
+        """F8."""
+        env = self.env
+        ctl = env.controller()
+        real_post, real_comments = env.gh.post_comment, env.gh.comments
+        state = {"fail_reads": 1}
+
+        def anonymous(number, body_file):
+            out = real_post(number, body_file)
+            out.pop("user")
+            return out
+
+        def flaky_comments(number):
+            listing = real_comments(number)
+            if state["fail_reads"] and len(listing) and "simulated" not in str(state):
+                pass
+            if state["fail_reads"] > 0 and any(c["user"] == "owner" for c in listing):
+                state["fail_reads"] -= 1
+                raise RuntimeError("simulated transient listing failure")
+            return listing
+        env.gh.post_comment, env.gh.comments = anonymous, flaky_comments
+        record = ctl.publish("r01-request", "### heading\nbody")
+        self.assertEqual("posted", record["state"])
+        self.assertEqual(1, len(env.gh.comments_list))  # verified by a later authenticated read, never re-posted
+
+    def test_activation_recomposes_permissions_and_supersedes_handoff(self):
+        """F11."""
+        env = self.env
+        ctl = env.controller()
+        self.to_finalize(ctl)
+        self.assertEqual("AWAITING_OWNER_REVIEW", ctl.finalize())
+        base = env.wf / "settings" / "developer.base.json"
+        data = ar.read_json(base)
+        data["permissions"]["deny"].append("Bash(newly-denied *)")
+        ar.atomic_write_json(base, data)
+        result = ctl.activate()
+        self.assertIn("owner-review handoff", result["invalidated"])
+        settings = ar.read_json(env.dir / "developer-settings.json")
+        self.assertIn("Bash(newly-denied *)", settings["permissions"]["deny"])
+        self.assertEqual(ar.sha256_file(env.dir / "developer-settings.json"), ctl.state["developer_settings_sha256"])
+        self.assertEqual(("ACTIVE", "review"), (ctl.state["status"], ctl.state["phase"]))
+
+    def test_pr_status_section_is_handled_explicitly_and_verified(self):
+        """F13."""
+        env = self.env
+        ctl = env.controller()
+        self.to_finalize(ctl)
+        self.assertEqual("AWAITING_OWNER_REVIEW", ctl.finalize())
+        env.gh.body = "owner text only"  # someone removed the status section
+        self.assertFalse(ctl.status(remote=True)["handoff_current"])
+        env.gh.body = "intro\n" + ar.STATUS_START + "\nunterminated"
+        with self.assertRaises(ar.Stop) as stop:
+            ctl.update_pr_body("x")
+        self.assertIn("malformed", stop.exception.reason)
+
+    def test_published_request_tuple_stays_fixed_when_the_target_moves(self):
+        """F14."""
+        env = self.env
+        env.reviewer.script = [{"decision": "checkpoint_passed", "stderr": "usage limit reached", "exit_code": 1},
+                               {"decision": "checkpoint_passed"}]
+        ctl = env.controller()
+        ctl.accept_report(report(env, "phase-1"))
+        ctl.transition("review", "t")
+        with self.assertRaises(ar.Stop):
+            ctl.review_round()
+        original_b = ctl.active()["B"]
+        git(env.work, "checkout", "--quiet", "master")
+        env.commit("other.txt", "x\n", "target moves")
+        git(env.work, "push", "--quiet", "origin", "master")
+        git(env.work, "checkout", "--quiet", env.branch)
+        self.assertEqual("checkpoint_passed", ctl.resume("usage restored"))
+        rnd = ctl.state["rounds"][-1]
+        self.assertEqual(original_b, rnd["B"])
+        self.assertEqual(1, len(rnd["B_observed"]))
+        self.assertEqual(original_b, ar.read_json(Path(rnd["envelope_path"]))["B"])
+
+    def test_interrupted_reviewer_attempts_are_reconciled(self):
+        """F16."""
+        env = self.env
+        env.reviewer.script = [{"decision": "checkpoint_passed"}]
+        ctl = env.controller()
+        ctl.accept_report(report(env, "phase-1"))
+        ctl.transition("review", "t")
+        candidate = ctl.capture_candidate()
+        ctl.state["rounds"].append({"round": 1, "request_id": "x-r01-abc", "checkpoint_id": "phase-1",
+                                    "checkpoint_type": "intermediate", **candidate, "pending_findings": [],
+                                    "report": ctl.state["last_report"], "created_at": ar.now_iso(), "status": "reviewing",
+                                    "attempts": [{"n": 1, "started": ar.now_iso(), "pid": os.getpid()}], "attempt_seq": 1})
+        ctl.state["active_round"] = 1
+        with self.assertRaises(ar.Stop) as stop:
+            ctl.review_round()  # the recorded reviewer process is alive
+        self.assertIn("still running", stop.exception.reason)
+        ctl.state["rounds"][0]["attempts"][0]["pid"] = 999999
+        ctl.state.update(status="ACTIVE")
+        self.assertEqual("checkpoint_passed", ctl.review_round())
+        attempts = ctl.state["rounds"][0]["attempts"]
+        self.assertIn("interrupted", attempts[0]["reasons"][0])
+        self.assertEqual([1, 2], [a["n"] for a in attempts])
+
+    def test_push_scans_intermediate_versions(self):
+        """F17."""
+        env = Env("foreground", cfg_overrides={"push_command": None})
+        self.addCleanup(env.cleanup)
+        ctl = env.controller()
+        env.commit("config.txt", f"token=ghp_{'c' * 36}\n", "oops")
+        env.commit("config.txt", "token=redacted\n", "remove it again")
+        with self.assertRaises(ar.UsageError) as refused:
+            ar.guarded_push(ctl.state, ctl.cfg)
+        self.assertIn("outgoing version", str(refused.exception))
+
+    def test_delegation_detection_uses_tool_identity(self):
+        """F18."""
+        with tempfile.TemporaryDirectory() as home:
+            rollout = Path(home) / "sessions" / "rollout-x-thread1.jsonl"
+            rollout.parent.mkdir(parents=True)
+
+            def write(*items):
+                rollout.write_text("\n".join(json.dumps({"type": "response_item", "payload": i}) for i in items) + "\n",
+                                   encoding="utf-8")
+            rev = ar.CodexReviewer({"executable": sys.executable, "codex_home": home, "model": "m", "effort": "high"})
+            write({"type": "custom_tool_call", "name": "exec", "input": "await tools.exec_command({cmd: 'rg spawn_agent'})"})
+            self.assertFalse(rev.provenance("thread1")["subagent_suspected"])
+            write({"type": "custom_tool_call", "name": "exec", "input": "await tools.collaboration.spawn_agent({task: 'x'})"})
+            self.assertTrue(rev.provenance("thread1")["subagent_suspected"])
+            write({"type": "function_call", "name": "spawn_agent", "arguments": "{}"})
+            self.assertTrue(rev.provenance("thread1")["subagent_suspected"])
+
+    def test_re_enrollment_recognizes_the_controllers_earlier_records(self):
+        """F19."""
+        env = self.env
+        ctl = env.controller()
+        self.to_finalize(ctl)
+        self.assertEqual("AWAITING_OWNER_REVIEW", ctl.finalize())
+        ctl.cancel("start over")
+        folder, state = ar.enroll(env.args(), github=env.gh, root=env.wf)
+        self.assertTrue(state["archived"])
+        again = ar.Controller(folder, github=env.gh, reviewer=env.reviewer, developer=env.developer,
+                              sleep=lambda s: None, workflow_root=env.wf)
+        again.verify_transcripts(git(env.work, "rev-parse", "HEAD"))  # genuine records are not foreign
 
 
 class ToolTranscriptTests(unittest.TestCase):

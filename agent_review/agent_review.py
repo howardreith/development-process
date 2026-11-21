@@ -41,6 +41,9 @@ POLICY = {
     "developer": {"model": "opus", "effort": "high", "allowed_model_pattern": "^claude-opus-"},
     "reviewer": {"model": "gpt-6.2-astra", "effort": "high"},
 }
+STATUS_START, STATUS_END = "<!-- agent-review:status:start -->", "<!-- agent-review:status:end -->"
+VERDICT_KEY_RE = re.compile(r"^(r\d{2}-review|final-status-[0-9a-f]{10})$")
+NEW_FINDING_ID = "R{round}-F"
 POSITIVE_ASSESSMENTS = {"fix_verified", "rebuttal_accepted", "deferral_accepted"}
 REJECTING_ASSESSMENTS = {"fix_rejected", "rebuttal_rejected", "deferral_rejected", "still_open"}
 COMPATIBLE_ASSESSMENTS = {
@@ -170,6 +173,8 @@ def pid_alive(pid) -> bool:
         return False
 
 
+DELEGATION_TOOLS = {"spawn_agent", "followup_task"}
+DELEGATION_CALL_RE = re.compile(r"\btools\s*\.\s*(?:collaboration\s*\.\s*)?(?:spawn_agent|followup_task)\s*\(")
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
@@ -290,6 +295,14 @@ def validate_schema(value, schema, path="$"):
     return errors
 
 
+def _no_duplicate_keys(pairs):
+    keys = [k for k, _ in pairs]
+    dupes = sorted({k for k in keys if keys.count(k) > 1})
+    if dupes:
+        raise ValueError(f"duplicate JSON keys {dupes}")
+    return dict(pairs)
+
+
 def strict_schema_copy(schema):
     """Model-facing copy without annotation keywords ($comment etc.)."""
     if isinstance(schema, dict):
@@ -312,29 +325,30 @@ def workflow_files(root: Path):
     return files
 
 
-def compute_fingerprint(root: Path):
-    """(activation fingerprint, all-file hashes).
-
-    The fingerprint covers behavioral files (controller, schemas, prompts, developer
-    settings). Project configs and mission plans are snapshotted into each enrollment,
-    so adding a plan does not pause running enrollments.
-    """
-    hashes = {rel: sha256_file(root / rel) for rel in workflow_files(root)}
+def _fingerprint_of(hashes):
     behavioral = {rel: h for rel, h in hashes.items()
                   if not rel.startswith(("projects/", "plans/")) and rel != "README.md"}
-    digest = sha256_text("\n".join(f"{rel}:{h}" for rel, h in sorted(behavioral.items())))
-    return digest, hashes
+    return sha256_text("\n".join(f"{rel}:{h}" for rel, h in sorted(behavioral.items())))
 
 
-def workflow_fingerprint(root: Path) -> str:
-    """Return the activated workflow fingerprint, verifying an installed manifest."""
-    digest, hashes = compute_fingerprint(root)
+def load_workflow(root: Path):
+    """Read every workflow file once: (fingerprint, hashes, texts). The fingerprint covers behavioral files
+    (controller, schemas, prompts, permission base); project configs and plans are snapshotted per enrollment.
+    An installed copy must match its MANIFEST, so a mixed or partial installation is never used."""
+    data = {rel: (root / rel).read_bytes() for rel in workflow_files(root)}
+    hashes = {rel: sha256_bytes(b) for rel, b in data.items()}
+    digest = _fingerprint_of(hashes)
     manifest = root / "MANIFEST.json"
     if manifest.exists():
         recorded = read_json(manifest)
         if recorded.get("files") != hashes or recorded.get("fingerprint") != digest:
             raise Stop("PAUSED", f"installed workflow at {root} differs from its MANIFEST; reinstall or review the change")
-    return digest
+    return digest, hashes, {rel: b.decode("utf-8") for rel, b in data.items()}
+
+
+def workflow_fingerprint(root: Path) -> str:
+    """The workflow fingerprint as currently on disk (verifying an installed manifest)."""
+    return load_workflow(root)[0]
 
 
 # --------------------------------------------------------------------------- git
@@ -542,12 +556,15 @@ class CodexReviewer:
             args.append("--skip-git-repo-check")
         return args + ["-C", str(workdir), "--output-schema", str(schema), "-o", str(result), "--json", "-"]
 
-    def run(self, prompt, workdir, schema, result_path, events_path, stderr_path, timeout_s, skip_git=False):
+    def run(self, prompt, workdir, schema, result_path, events_path, stderr_path, timeout_s, skip_git=False,
+            on_start=None):
         started = time.monotonic()
         with open(events_path, "w", encoding="utf-8") as out, open(stderr_path, "w", encoding="utf-8") as err:
             flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
             proc = subprocess.Popen(self.argv(workdir, schema, result_path, skip_git), stdin=subprocess.PIPE,
                                     stdout=out, stderr=err, text=True, encoding="utf-8", creationflags=flags)
+            if on_start:
+                on_start(proc.pid)
             timed_out = False
             try:
                 proc.communicate(prompt, timeout=timeout_s)
@@ -555,17 +572,21 @@ class CodexReviewer:
                 timed_out = True
                 kill_tree(proc)  # reviewer is read-only: safe to terminate
                 proc.wait()
-        thread_id = None
+        thread_id, completed, failed = None, False, False
         for line in Path(events_path).read_text(encoding="utf-8", errors="replace").splitlines():
             try:
                 event = json.loads(line)
             except ValueError:
                 continue
-            if event.get("type") == "thread.started":
+            kind = event.get("type")
+            if kind == "thread.started" and thread_id is None:
                 thread_id = event.get("thread_id")
-                break
-        return {"exit_code": proc.returncode, "timed_out": timed_out, "thread_id": thread_id,
-                "duration_s": round(time.monotonic() - started, 1)}
+            elif kind == "turn.completed":
+                completed = True
+            elif kind in ("turn.failed", "error"):
+                failed = True
+        return {"exit_code": proc.returncode, "timed_out": timed_out, "thread_id": thread_id, "completed": completed,
+                "failed": failed, "duration_s": round(time.monotonic() - started, 1)}
 
     def provenance(self, thread_id):
         info = {"rollout_found": False, "observed_model": None, "observed_effort": None, "turn_models": [],
@@ -601,12 +622,40 @@ class CodexReviewer:
                 info["usage"] = (payload.get("info") or {}).get("total_token_usage")
                 info["plan_type"] = (payload.get("rate_limits") or {}).get("plan_type")
             elif kind == "response_item" and ptype in ("function_call", "custom_tool_call"):
-                blob = json.dumps(payload)
-                if "spawn_agent" in blob or "followup_task" in blob:
+                name = str(payload.get("name", ""))
+                if name.split(".")[-1] in DELEGATION_TOOLS:
                     info["subagent_suspected"] = True
+                elif ptype == "custom_tool_call" and DELEGATION_CALL_RE.search(str(payload.get("input", ""))):
+                    info["subagent_suspected"] = True  # a nested code-mode call: tools.collaboration.spawn_agent(...)
         info["turn_models"] = sorted({m or "<missing>" for m in info["turn_models"]})
         info["turn_efforts"] = sorted({e or "<missing>" for e in info["turn_efforts"]})
         return info
+
+
+def invocation_problems(info, prov, requested):
+    """Affirmative provenance for a reviewer invocation (shared by reviews and preflight): every observation
+    must be present and agree; missing evidence is a failure, never a pass. Returns (reasons, fatal)."""
+    reasons, fatal = [], False
+    if not info.get("completed") or info.get("failed"):
+        reasons.append("no successful terminal turn event from the reviewer")
+    if not prov.get("rollout_found"):
+        return reasons + ["reviewer provenance unavailable (no session rollout for the thread)"], fatal
+    models, efforts = prov.get("turn_models") or [], prov.get("turn_efforts") or []
+    if prov.get("observed_model") != requested["model"] or not models or any(m != requested["model"] for m in models):
+        reasons.append(f"reviewer model not affirmatively {requested['model']}: {prov.get('observed_model')} {models}")
+        fatal = fatal or bool(models and any(m not in (requested["model"], "<missing>") for m in models)) or \
+            (prov.get("observed_model") not in (None, requested["model"]))
+    if prov.get("observed_effort") != requested["effort"] or not efforts or any(e != requested["effort"] for e in efforts):
+        reasons.append(f"reviewer effort not affirmatively {requested['effort']}: {prov.get('observed_effort')} {efforts}")
+        fatal = fatal or bool(efforts and any(e not in (requested["effort"], "<missing>") for e in efforts)) or \
+            (prov.get("observed_effort") not in (None, requested["effort"]))
+    if prov.get("sandbox") != "read-only" or prov.get("approval_policy") != "never":
+        reasons.append(f"reviewer sandbox/approval not affirmatively read-only/never: "
+                       f"{prov.get('sandbox')}/{prov.get('approval_policy')}")
+        fatal = fatal or prov.get("sandbox") not in (None, "read-only") or prov.get("approval_policy") not in (None, "never")
+    if prov.get("subagent_suspected"):
+        reasons.append("reviewer attempted to spawn sub-agents whose model cannot be verified")
+    return reasons, fatal
 
 
 # --------------------------------------------------------------------------- developer boundary
@@ -614,8 +663,8 @@ class CodexReviewer:
 class ClaudeDeveloper:
     """Claude Code boundary: explicit model/effort on every headless launch and resume."""
 
-    def __init__(self, cfg: dict, settings_path: Path, schema_path: Path):
-        self.cfg, self.settings_path, self.schema_path = cfg, settings_path, schema_path
+    def __init__(self, cfg: dict, settings_path: Path, schema_path: Path, schema_text: str = None):
+        self.cfg, self.settings_path, self.schema_path, self.schema_text = cfg, settings_path, schema_path, schema_text
         self.exe = resolve_exe(cfg.get("executable", "claude"))
         self.config_dir = Path(expand(cfg["config_dir"])) if cfg.get("config_dir") else None
 
@@ -702,7 +751,8 @@ class ClaudeDeveloper:
         return header + "\n".join(reversed(text))
 
     def argv(self, session_id, resume):
-        schema = json.dumps(strict_schema_copy(read_json(self.schema_path)), separators=(",", ":"))
+        source = json.loads(self.schema_text) if self.schema_text else read_json(self.schema_path)
+        schema = json.dumps(strict_schema_copy(source), separators=(",", ":"))
         args = [self.exe, "-p", "--model", self.cfg["model"], "--effort", self.cfg["effort"]]
         args += ["--resume", session_id] if resume else ["--session-id", session_id]
         return args + ["--output-format", "stream-json", "--verbose", "--permission-mode", "dontAsk",
@@ -882,6 +932,8 @@ class Controller:
         self.stop_path = self.dir / "STOP"
         self._viewer = None
         self.identity_ok = False
+        # This process uses exactly one verified version of the prompts and schemas, whatever happens on disk.
+        self.snapshot_fp, _, self.files = load_workflow(self.wf)
         self.reload()
 
     def reload(self):
@@ -919,7 +971,7 @@ class Controller:
     def developer(self):
         if self._developer is None:
             self._developer = ClaudeDeveloper(self.cfg["developer"], self.dir / "developer-settings.json",
-                                              self.wf / REPORT_SCHEMA_FILE)
+                                              self.wf / REPORT_SCHEMA_FILE, schema_text=self.files[REPORT_SCHEMA_FILE])
         return self._developer
 
     # -- state ---------------------------------------------------------------
@@ -971,7 +1023,7 @@ class Controller:
         if self.git.branch() != self.state["branch"]:
             raise Stop("PAUSED", f"worktree is on {self.git.branch()}, not the enrolled {self.state['branch']}")
         fingerprint = workflow_fingerprint(self.wf)
-        if fingerprint != self.state["workflow"]["fingerprint"]:
+        if self.snapshot_fp != self.state["workflow"]["fingerprint"] or fingerprint != self.state["workflow"]["fingerprint"]:
             raise Stop("PAUSED", f"workflow version changed ({short(self.state['workflow']['fingerprint'])} -> "
                                  f"{short(fingerprint)}); review it, then run `activate`")
         problem = self.mission_problem()
@@ -1083,6 +1135,11 @@ class Controller:
         return f"<!-- agent-review:v1 enrollment={self.state['enrollment_id']} key={key} part={index}/{total} sha256={digest} -->"
 
     def publish(self, key, body):
+        record = self.queue(key, body)
+        return self.send(key, record)
+
+    def queue(self, key, body):
+        """Persist an outgoing message (and its marker) before anything else depends on it."""
         pubs = self.state.setdefault("publications", {})
         record = pubs.get(key)
         if record is None:
@@ -1102,31 +1159,36 @@ class Controller:
                       "created_at": now_iso(), "seq": len(pubs) + 1}
             pubs[key] = record
             self.save()  # persist the outgoing message before sending
-        if record["state"] == "posted":
+        return record
+
+    def send(self, key, record):
+        if record["state"] in ("posted", "superseded"):
             return record
         number = self.state["pr"]["number"]
         for part in record["parts"]:
             if part["comment_id"]:
                 continue
             body = self.outbox_body(key, part)
-            attempts, found = 0, None
+            attempts, found, tentative = 0, None, None
             while not found:
                 attempts += 1
                 try:
                     found = self.reconcile(number, part["marker"], body)
-                    if not found:
-                        found = self.gh.post_comment(number, part["body_file"])
-                        if found.get("user") is None:  # unknown until an authenticated read confirms it
-                            found = self.reconcile(number, part["marker"], body) or found
-                        if found.get("user") != self.cfg["expected_actor"]:
-                            raise Stop("BLOCKED", f"comment {found['id']} was posted as {found.get('user')}, not the "
-                                                  f"expected {self.cfg['expected_actor']}; the gh login changed")
+                    if not found and tentative is None:
+                        tentative = self.gh.post_comment(number, part["body_file"])
+                        if tentative.get("user") not in (None, self.cfg["expected_actor"]):
+                            raise Stop("BLOCKED", f"comment {tentative['id']} was posted as {tentative.get('user')}, "
+                                                  f"not the expected {self.cfg['expected_actor']}; the gh login changed")
+                        if tentative.get("user") == self.cfg["expected_actor"]:
+                            found = tentative  # positively identified by the POST response itself
+                    if not found:  # posted but unconfirmed: only an authenticated read may establish identity
+                        raise RuntimeError("posted comment not yet confirmed by an authenticated read")
                 except Stop:
                     raise
-                except Exception as exc:  # lost response, listing failure or transient error
+                except Exception as exc:  # lost response, listing failure, lag or transient error
                     if attempts >= self.limits["publication_attempts"]:
                         raise Stop("PAUSED", f"publication of {key} failed ({exc}); the preserved message will be "
-                                             "reconciled and sent on resume")
+                                             "reconciled (never re-posted blindly) on resume")
                     self.sleep(self.limits["retry_backoff_seconds"][min(attempts - 1, 1)])
             part["comment_id"], part["url"] = found["id"], found["url"]
             self.save()
@@ -1141,6 +1203,17 @@ class Controller:
         if marker != part["marker"] or sha256_text(chunk) != part["sha256"]:
             raise Stop("BLOCKED", f"the preserved outgoing message for {key} was modified on disk")
         return body
+
+    def already_visible(self, key, record):
+        """Whether any part of a preserved message is already on the PR (recording the IDs found)."""
+        visible = False
+        for part in record["parts"]:
+            found = part["comment_id"] and {"id": part["comment_id"]} or \
+                self.reconcile(self.state["pr"]["number"], part["marker"], self.outbox_body(key, part))
+            if found:
+                part["comment_id"], part["url"] = found["id"], found.get("url", part.get("url"))
+                visible = True
+        return visible
 
     def reconcile(self, number, marker, body):
         """Find our already-posted comment: expected actor, exact marker, identical body, and no rivals."""
@@ -1191,7 +1264,7 @@ class Controller:
 
     def accept_report(self, report):
         """Validate a developer report; returns an error string for the developer, or None."""
-        errors = validate_schema(report, read_json(self.wf / REPORT_SCHEMA_FILE))
+        errors = validate_schema(report, json.loads(self.files[REPORT_SCHEMA_FILE]))
         if errors:
             return "report does not match agent-review.developer.v1: " + "; ".join(errors[:8])
         cp = self.checkpoint
@@ -1319,13 +1392,13 @@ class Controller:
             self.state["active_round"] = number
             self.save()
         elif rnd["B"] != candidate["B"]:
-            rnd.setdefault("B_history", []).append(rnd["B"])
-            rnd["B"] = candidate["B"]  # same M: the reviewed diff is unchanged; record the newer target tip
+            rnd.setdefault("B_observed", []).append({"B": candidate["B"], "at": now_iso()})  # request tuple stays fixed
         self.publish(f"r{rnd['round']:02d}-request", self.request_body(rnd))
         rnd_dir = self.dir / "rounds" / f"r{rnd['round']:02d}"
         rnd_dir.mkdir(parents=True, exist_ok=True)
         rnd["status"] = "reviewing"
         self.save()
+        self.reconcile_reviewer_attempt(rnd, rnd_dir)
         envelope = None
         while len(rnd["attempts"]) < self.limits["max_review_attempts_per_round"]:
             self.check_stop_request()
@@ -1354,12 +1427,16 @@ class Controller:
         try:
             inputs = self.write_review_inputs(rnd, rnd_dir, snapshot)
             schema = rnd_dir / "review-schema.json"
-            atomic_write_json(schema, strict_schema_copy(read_json(self.wf / REVIEW_SCHEMA_FILE)))
+            atomic_write_json(schema, strict_schema_copy(json.loads(self.files[REVIEW_SCHEMA_FILE])))
             result_path = rnd_dir / f"result-{n}.json"
             prompt = self.render("reviewer.md", self.reviewer_fields(rnd, inputs, snapshot))
             write_text(rnd_dir / f"prompt-{n}.md", prompt)
+            def on_start(pid):
+                attempt["pid"] = pid
+                self.save()
             info = self.reviewer.run(prompt, snapshot, schema, result_path, rnd_dir / f"events-{n}.jsonl",
-                                     rnd_dir / f"stderr-{n}.txt", self.cfg["reviewer"]["timeout_minutes"] * 60)
+                                     rnd_dir / f"stderr-{n}.txt", self.cfg["reviewer"]["timeout_minutes"] * 60,
+                                     on_start=on_start)
         finally:
             self.remove_snapshot(snapshot)
         prov = self.reviewer.provenance(info.get("thread_id"))
@@ -1373,6 +1450,22 @@ class Controller:
             rnd.update(status="validated", envelope_path=envelope["path"], envelope_sha256=digest)
         self.save()
         return envelope
+
+    def reconcile_reviewer_attempt(self, rnd, rnd_dir):
+        """An attempt without an end record: a live reviewer pauses; otherwise it is a failed attempt (its exit status
+        is unknown, so its output is never trusted) and its snapshot is removed."""
+        last = rnd["attempts"][-1] if rnd["attempts"] else None
+        if not last or "ended" in last:
+            return
+        if pid_alive(last.get("pid")):
+            raise Stop("PAUSED", f"reviewer attempt {last['n']} is still running (pid {last['pid']})")
+        last.update(ended=now_iso(), ok=False, fatal=False,
+                    reasons=["interrupted: the controller exited during this attempt; output without an exit status "
+                             "is not trusted"])
+        snapshot = rnd_dir / f"snapshot-{last['n']}"
+        if snapshot.exists():
+            self.remove_snapshot(snapshot)
+        self.save()
 
     def remove_snapshot(self, snapshot: Path):
         if not str(snapshot.resolve()).startswith(str(self.dir.resolve())):
@@ -1394,10 +1487,12 @@ class Controller:
         atomic_write_json(rnd_dir / "request.json", {k: rnd[k] for k in (
             "round", "request_id", "checkpoint_id", "checkpoint_type", "H", "B", "M")})
         receipts = []
-        for path, data in self.gate_receipts(rnd["H"]):
-            log = path.with_name(data["log"])
-            if log.exists() and sha256_file(log) == data["log_sha256"]:
-                receipts += [path, log]
+        for gate, (_, paths) in self.gate_status(rnd["H"]).items():  # latest receipts under the shared rule
+            for path in paths:
+                data = read_json(path)
+                log = path.with_name(str(data.get("log")))
+                if log.is_file() and sha256_file(log) == data.get("log_sha256"):  # pass or fail; never tampered
+                    receipts += [path, log]
         if self.state["mode"] == "foreground":
             # An interactive session's log mixes unrelated work; only controller-run gate receipts are supplied.
             transcript = ("# Developer tool transcript\n\nForeground session: the whole-session log is withheld because "
@@ -1447,30 +1542,17 @@ class Controller:
             reasons.append("no final structured message")
         else:
             try:
-                result, parsed = json.loads(raw.decode("utf-8")), True
+                result, parsed = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicate_keys), True
             except ValueError as exc:
                 reasons.append(f"malformed JSON: {exc}")
         if parsed:
-            errors = validate_schema(result, read_json(self.wf / REVIEW_SCHEMA_FILE))
+            errors = validate_schema(result, json.loads(self.files[REVIEW_SCHEMA_FILE]))
             reasons += [f"schema: {e}" for e in errors[:12]]
             if not errors:
                 reasons += self.semantic_problems(rnd, result)
-        if not prov["rollout_found"]:
-            reasons.append("reviewer provenance unavailable (no session rollout for the thread)")
-        else:
-            if prov["observed_model"] != requested["model"] or any(m != requested["model"] for m in prov["turn_models"]):
-                reasons.append(f"wrong reviewer model: observed {prov['observed_model']} {prov['turn_models']}, "
-                               f"required {requested['model']}")
-                fatal = True
-            if prov["observed_effort"] != requested["effort"] or any(e != requested["effort"] for e in prov["turn_efforts"]):
-                reasons.append(f"reviewer effort {prov['observed_effort']} {prov['turn_efforts']} != "
-                               f"required {requested['effort']}")
-                fatal = True
-            if prov["sandbox"] not in (None, "read-only") or prov["approval_policy"] not in (None, "never"):
-                reasons.append(f"reviewer sandbox/approval not read-only/never: {prov['sandbox']}/{prov['approval_policy']}")
-                fatal = True
-            if prov["subagent_suspected"]:
-                reasons.append("reviewer attempted to spawn sub-agents whose model cannot be verified")
+        more, more_fatal = invocation_problems(info, prov, requested)
+        reasons += more
+        fatal = fatal or more_fatal
         return {"protocol": PROTOCOL, "ok": not reasons, "fatal": fatal, "reasons": reasons,
                 "request_id": rnd["request_id"], "round": rnd["round"], "checkpoint_id": rnd["checkpoint_id"],
                 "checkpoint_type": rnd["checkpoint_type"], "repository": self.cfg["repository"],
@@ -1499,6 +1581,20 @@ class Controller:
             reasons.append("a passing decision lists required evidence gaps")
         if decision == "changes_required" and not blocking:
             reasons.append("changes_required without any finding that blocks readiness")
+        for label, text in (("decision_rationale", result["decision_rationale"]),
+                            ("summary.delivered_behavior", result["summary"]["delivered_behavior"]),
+                            ("summary.scope_reviewed", result["summary"]["scope_reviewed"])):
+            if not text.strip():
+                reasons.append(f"{label} is blank")
+        if passing and not result["evidence_assessment"]["inspected"]:
+            reasons.append("a passing decision names no inspected evidence")
+        for f in result["findings"]:
+            if f["id"] not in self.state.get("findings", {}) and \
+                    not re.fullmatch(rf"R{rnd['round']}-F[1-9]\d*", f["id"]):
+                reasons.append(f"new finding ID {f['id']!r} does not use the form R{rnd['round']}-F<n>")
+            for field in ("title", "trigger", "expected", "actual", "requested_correction"):
+                if not f[field].strip():
+                    reasons.append(f"{f['id']}: {field} is blank")
         ids = [f["id"] for f in result["findings"]]
         if len(ids) != len(set(ids)):
             reasons.append("duplicate finding IDs")
@@ -1550,13 +1646,13 @@ class Controller:
             return self.review_round()
         stale = self.freshness(rnd)
         if stale:
-            self.make_historical(rnd, envelope, stale, f"r{rnd['round']:02d}-review")
+            self.make_historical(rnd, envelope, stale)
         result = envelope["result"]
         record = self.publish(f"r{rnd['round']:02d}-review", self.review_body(rnd, envelope))
         rnd["published"] = [{"comment_id": p["comment_id"], "url": p["url"]} for p in record["parts"]]
         stale = self.freshness(rnd)  # publication may have taken minutes of retries
         if stale:
-            self.make_historical(rnd, envelope, stale, f"r{rnd['round']:02d}-review-superseded", correction=True)
+            self.make_historical(rnd, envelope, stale, correction=True)
         cp = self.checkpoint
         ledger = self.state.setdefault("findings", {})
         for a in result["prior_finding_assessments"]:
@@ -1588,6 +1684,10 @@ class Controller:
             elif stuck:
                 stop = Stop("BLOCKED", f"no progress: {', '.join(stuck)} open for "
                                        f"{self.limits['no_progress_rounds']} consecutive reviews")
+            elif self.state["rounds_completed"][cp["id"]] >= self.limits["max_review_rounds_per_checkpoint"]:
+                stop = Stop("BLOCKED", f"review-round cap reached for {cp['id']} "
+                                       f"({self.state['rounds_completed'][cp['id']]}/{self.limits['max_review_rounds_per_checkpoint']}); "
+                                       "findings are preserved for an owner-authorized extension")
             self.state["develop_context"] = "findings"
             self.transition("develop", f"round {rnd['round']} requires changes", save=False)
         elif decision == "checkpoint_passed":
@@ -1607,21 +1707,27 @@ class Controller:
             raise stop
         return decision
 
-    def make_historical(self, rnd, envelope, stale, key, correction=False):
-        normal = self.state.get("publications", {}).get(f"r{rnd['round']:02d}-review")
-        if normal and normal["state"] == "pending" and not correction:
+    def make_historical(self, rnd, envelope, stale, correction=False):
+        n = rnd["round"]
+        normal = self.state.get("publications", {}).get(f"r{n:02d}-review")
+        if normal and normal["state"] == "pending" and self.already_visible(f"r{n:02d}-review", normal):
+            normal["state"] = "posted"  # stored by GitHub before a crash, though never recorded
+        if normal and normal["state"] == "posted":
+            correction = True  # a current-verdict comment is already visible: post a correction beside it
+        elif normal:
             normal["state"] = "superseded"  # never send the current-verdict body for a stale result
-            key = f"r{rnd['round']:02d}-review-historical"
+        if correction:
+            key = f"r{n:02d}-review-superseded"
+            body = (f"### Workflow — correction — round {n} review is historical\n\nThe review posted for "
+                    f"`{short(rnd['H'])}` is not a current verdict: its comparison inputs changed before acceptance "
+                    f"({'; '.join(stale)}). It is preserved for the record.\n\n_Automated workflow status; not a human review._\n")
+        else:
+            key, body = f"r{n:02d}-review-historical", self.review_body(rnd, envelope, stale=stale)
+        self.queue(key, body)  # required operation persisted before the round is left; settled on resume
         rnd["status"], rnd["stale_reasons"] = "historical", stale
         self.state.update(active_round=None, develop_context="needs_report")
         self.transition("develop", "review became historical: " + "; ".join(stale))
-        if correction:
-            self.publish(key, f"### Workflow — correction — round {rnd['round']} review is historical\n\nThe review "
-                              f"posted above for `{short(rnd['H'])}` was published, but its comparison inputs changed "
-                              f"before acceptance ({'; '.join(stale)}). It is preserved and is not a current verdict.\n\n"
-                              "_Automated workflow status; not a human review._\n")
-        else:
-            self.publish(key, self.review_body(rnd, envelope, stale=stale))
+        self.send(key, self.state["publications"][key])
         raise Stop("PAUSED", f"the review of {short(rnd['H'])} is historical ({'; '.join(stale)}); only the "
                              "enrolled writer may push. Reconcile, then submit a report for the current candidate")
 
@@ -1721,7 +1827,7 @@ class Controller:
 
     # -- prompts -------------------------------------------------------------------
     def render(self, name, fields):
-        template = (self.wf / "prompts" / name).read_text(encoding="utf-8")
+        template = self.files[f"prompts/{name}"]
         return string.Template(template).safe_substitute(fields)
 
     def common_fields(self):
@@ -1774,10 +1880,39 @@ class Controller:
                 out.append((path, data))
         return out
 
+    def receipt_problems(self, path, data, commit):
+        gate = (self.cfg.get("gates") or {}).get(data.get("gate"))
+        log = path.with_name(str(data.get("log")))
+        problems = []
+        if not gate:
+            problems.append("gate is not declared by the project")
+        elif [a.replace("{repo_root}", self.state["repo_root"]) for a in gate["argv"]] != data.get("argv", [])[:len(gate["argv"])]:
+            problems.append("command does not match the declared gate")
+        if data.get("candidate") != commit:
+            problems.append("bound to another commit")
+        if data.get("exit_code") != 0 or data.get("worktree_unchanged") is not True or data.get("passed") is not True:
+            problems.append("did not pass")
+        if not log.is_file() or sha256_file(log) != data.get("log_sha256"):
+            problems.append("log missing or altered")
+        return problems
+
+    def gate_status(self, commit):
+        """{gate: (passed, [latest receipt paths])}. For each gate and exact argument list the newest receipt
+        supersedes older ones; a gate passes only if every such latest receipt is valid and passing."""
+        latest = {}
+        ordered = sorted(self.gate_receipts(commit), key=lambda item: (str(item[1].get("recorded_at", "")), item[0].name))
+        for path, data in ordered:  # the newest run of the same gate and arguments supersedes older ones
+            latest[(data.get("gate"), json.dumps(data.get("argv")))] = (path, data)
+        status = {}
+        for (gate, _), (path, data) in latest.items():
+            ok, paths = status.get(gate, (True, []))
+            status[gate] = (ok and not self.receipt_problems(path, data, commit), paths + [path])
+        return status
+
     def missing_gates(self, commit, checkpoint=None):
         cp = checkpoint or self.checkpoint
-        return [g for g in cp.get("required_gates", [])
-                if not any(d.get("passed") for _, d in self.gate_receipts(commit, g))]
+        status = self.gate_status(commit)
+        return [g for g in cp.get("required_gates", []) if not status.get(g, (False, []))[0]]
 
     def run_gate(self, gate_id, extra=()):
         """Run a project-declared validation gate on the clean candidate and write a receipt bound to it."""
@@ -1803,7 +1938,7 @@ class Controller:
         text, _ = sanitize(output, strict=False)
         write_text(base.with_suffix(".log"), text)
         receipt = {"schema": "agent-review.gate-receipt.v1", "gate": gate_id, "argv": argv, "candidate": head,
-                   "started": started, "duration_s": round(time.monotonic() - t0, 1), "exit_code": code,
+                   "started": started, "recorded_at": stamp, "duration_s": round(time.monotonic() - t0, 1), "exit_code": code,
                    "worktree_unchanged": clean_after, "passed": code == 0 and clean_after,
                    "log": base.with_suffix(".log").name, "log_sha256": sha256_file(base.with_suffix(".log")),
                    "output_tail": text[-3000:], "recorded_by": "agent-review controller (not model-authored)"}
@@ -1908,8 +2043,17 @@ class Controller:
         """Developer helpers (push, verify) act only for a live enrollment in development, on its own open draft
         PR. Read-only: usable while the owning controller holds the writer lock."""
         s, problems = self.state, []
-        if s["status"] in ("AWAITING_OWNER_REVIEW", "CANCELLED") or s["phase"] in ("finalize", "done"):
-            problems.append(f"enrollment is {s['status']} in phase {s['phase']}")
+        if s["status"] != "ACTIVE" or s["phase"] != "develop":
+            problems.append(f"enrollment is {s['status']} in phase {s['phase']}; helpers act only during development")
+        if not same_path(self.git.toplevel(), s["repo_root"]) or self.git.branch() != s["branch"]:
+            problems.append("not the enrolled worktree and branch")
+        if self.git.remote_url() not in self.cfg["allowed_remote_urls"]:
+            problems.append("origin is not an approved remote")
+        try:
+            if workflow_fingerprint(self.wf) != s["workflow"]["fingerprint"] or self.snapshot_fp != s["workflow"]["fingerprint"]:
+                problems.append("the installed workflow is not the version activated for this enrollment")
+        except Stop as stop:
+            problems.append(stop.reason)
         pr = self.gh.pr(s["pr"]["number"])
         problems += pr_identity_problems(pr, self.cfg["repository"], s["pr"]["number"], s["branch"], s["target"])
         if pr.get("state") != "OPEN" or not pr.get("isDraft"):
@@ -1919,14 +2063,18 @@ class Controller:
         return problems
 
     def cancel(self, reason):
+        self.assert_no_active_developer()  # never release ownership under a live developer
+        if self.runtime_active():
+            raise Stop("PAUSED", "cannot cancel while a runtime transaction lock exists; let it restore first")
         self.state.update(status="CANCELLED", status_reason=f"cancelled: {reason}")
-        self.transition("done", f"owner cancelled: {reason}")
+        self.transition("cancelled", f"owner cancelled: {reason}")  # distinct from a completed handoff
         try:
             self.verify_inputs()
             self.publish_status("CANCELLED", f"Enrollment cancelled by the owner: {reason}. History and records are "
                                              "preserved; nothing was merged or deleted.")
-        except (Stop, UsageError):
-            pass  # identity could not be established; nothing is published
+        except Exception as exc:  # the cancellation itself stands; publication is best effort
+            self.state.setdefault("notes", []).append(f"{now_iso()} cancellation status not published: {exc}")
+            self.save()
         for claim in (registry_path(self.cfg["repository"], self.state["branch"]),
                       Path(self.git("rev-parse", "--absolute-git-dir")) / "agent-review-enrollment.json"):
             if claim.exists() and read_json(claim).get("enrollment_id") == self.state["enrollment_id"]:
@@ -1956,6 +2104,8 @@ class Controller:
                 return self.finalize()
             elif phase == "done":
                 return "AWAITING_OWNER_REVIEW"
+            elif phase == "cancelled":
+                raise UsageError("enrollment was cancelled")
             else:
                 raise UsageError(f"unknown phase {phase}")
 
@@ -1970,8 +2120,17 @@ class Controller:
             active["status"] = "invalidated"
             self.state["active_round"] = None
             invalidated.append(f"round {active['round']} result")
-        if self.state.get("ready_review") and new != old and self.state.get("status") != "AWAITING_OWNER_REVIEW":
+        check_policy(self.cfg)
+        settings = self.dir / "developer-settings.json"
+        atomic_write_json(settings, compose_developer_settings(self.cfg, self.wf, self.state["enrollment_id"]))
+        self.state["developer_settings_sha256"] = sha256_file(settings)  # permissions follow the activated version
+        if self.state.get("ready_review") and new != old:
             self.state.setdefault("superseded_ready", []).append({**self.state["ready_review"], "why": "workflow activation"})
+            if self.state.get("status") == "AWAITING_OWNER_REVIEW":
+                self.state.setdefault("superseded_handoffs", []).append({**(self.state.get("handoff") or {}),
+                                                                         "why": "workflow activation"})
+                self.state.update(handoff=None, status="ACTIVE", status_reason="handoff superseded by workflow activation")
+                invalidated.append("owner-review handoff")
             self.state["ready_review"] = None
             invalidated.append("ready result")
             self.state["phase"] = "review"  # same candidate and report: a fresh review under the new rules
@@ -2053,12 +2212,40 @@ class Controller:
                    "files": [{"rel": rel, "sha256": sha256_text(text), "key": key, "text": text} for rel, text, key in files]}
         self.state["archive_pending"] = pending
         self.save()  # intent recorded before any write
-        for rel, text, _ in files:
-            path = Path(self.state["repo_root"]) / rel
+        paths = [(self.record_path(rel), text) for rel, text, _ in files]  # every destination checked first
+        for path, text in paths:
             if path.exists():
-                raise Stop("BLOCKED", f"archive record {rel} already exists")
+                raise Stop("BLOCKED", f"archive record {path.name} already exists")
+        for path, text in paths:
             write_text(path, text)
         return self.complete_archive(pending)
+
+    def record_path(self, rel):
+        """Validate an archive destination before writing: inside this PR's folder, no link or junction ancestry."""
+        root = Path(self.state["repo_root"]).resolve()
+        if not re.fullmatch(rf"{re.escape(self.transcript_folder())}/{ARCHIVE_NAME_RE}", rel):
+            raise Stop("BLOCKED", f"archive destination {rel} is outside this PR's record pattern")
+        path = root / rel
+        current = root
+        for part in Path(rel).parts[:-1]:
+            current = current / part
+            if current.is_symlink() or (hasattr(current, "is_junction") and current.is_junction()):
+                raise Stop("BLOCKED", f"archive destination ancestor {current} is a link or junction")
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise Stop("BLOCKED", f"archive destination {rel} is not a plain file path")
+        if os.path.commonpath([str(path.resolve().parent), str(root)]) != str(root):
+            raise Stop("BLOCKED", f"archive destination {rel} resolves outside the worktree")
+        return path
+
+    def archive_commit_problems(self, parent, commit, expected):
+        parents = self.git("rev-list", "--parents", "-n", "1", commit).split()[1:]
+        added = {ln.partition("\t")[2] for ln in self.git("diff", "--raw", "--no-renames", parent, commit).splitlines() if ln}
+        problems = [] if parents == [parent] else ["the archive commit's parent is not the recorded parent"]
+        if added != set(expected):
+            problems.append("the archive commit does not contain exactly the intended records")
+        ok, reasons = check_archive_only(self.git, parent, commit, self.cfg["transcript_dir"],
+                                         self.state["pr"]["number"], expected)
+        return problems + reasons
 
     def complete_archive(self, pending):
         for f in pending["files"]:  # the persisted intent itself must be intact
@@ -2070,11 +2257,7 @@ class Controller:
         if pending["commit"] is None and self.git.head() != pending["parent"]:
             # A crash between `git commit` and recording it: adopt the commit only if it is exactly ours.
             head = self.git.head()
-            parents = self.git("rev-list", "--parents", "-n", "1", head).split()[1:]
-            added = {ln.partition("\t")[2] for ln in self.git("diff", "--raw", "--no-renames", pending["parent"], head).splitlines() if ln}
-            if parents == [pending["parent"]] and added == set(expected) and check_archive_only(self.git, pending["parent"], head,
-                                                                      self.cfg["transcript_dir"],
-                                                                      self.state["pr"]["number"], expected)[0]:
+            if not self.archive_commit_problems(pending["parent"], head, expected):
                 pending["commit"] = head
                 self.save()
             else:
@@ -2084,7 +2267,7 @@ class Controller:
             if dirty - set(rels):
                 raise Stop("BLOCKED", "unexpected changes alongside an interrupted archive: " + ", ".join(sorted(dirty - set(rels))))
             for f in pending["files"]:
-                path = root / f["rel"]
+                path = self.record_path(f["rel"])
                 if not path.exists() and sha256_text(f["text"]) == f["sha256"]:
                     write_text(path, f["text"])  # finish a partially written record set from the persisted intent
                 if not path.exists() or sha256_file(path) != f["sha256"]:
@@ -2097,10 +2280,9 @@ class Controller:
         commit = pending["commit"]
         if self.git.head() != commit:
             raise Stop("BLOCKED", f"local branch moved away from archive commit {short(commit)}")
-        ok, reasons = check_archive_only(self.git, pending["parent"], commit, self.cfg["transcript_dir"],
-                                         self.state["pr"]["number"], expected)
-        if not ok:
-            raise Stop("BLOCKED", "archive commit failed its transcript-only check: " + "; ".join(reasons))
+        reasons = self.archive_commit_problems(pending["parent"], commit, expected)
+        if reasons:
+            raise Stop("BLOCKED", "archive commit failed its exact-inventory check: " + "; ".join(reasons))
         remote = self.git.remote_head(self.state["branch"])
         if remote != commit:
             if remote != pending["parent"]:
@@ -2121,6 +2303,10 @@ class Controller:
                                      f"{detail}")
         archived = self.state.setdefault("archived", {})
         archived.update(expected)
+        ledger = records_ledger_path(self.cfg["repository"], self.state["pr"]["number"])
+        known = read_json(ledger) if ledger.exists() else {}
+        known.update(expected)  # host ledger of controller-written records for this PR (re-enrollment, F19)
+        atomic_write_json(ledger, known)
         self.state["archived_keys"] = sorted(set(self.state.get("archived_keys", [])) | {f["key"] for f in pending["files"]})
         self.state.setdefault("archive_commits", []).append({"commit": commit, "source": pending["parent"],
                                                              "reason": pending["reason"]})
@@ -2128,7 +2314,7 @@ class Controller:
         self.save()
         return commit
 
-    def readiness(self, archive_head, receipt=None):
+    def readiness(self, archive_head, receipt=None, status_section=None):
         ready = self.state.get("ready_review")
         reasons, notes = [], []
         if not ready:
@@ -2144,6 +2330,8 @@ class Controller:
             reasons.append(f"PR head {short(pr['headRefOid'])} is not {short(archive_head)}")
         if pr.get("reviewRequests"):
             reasons.append("human reviewers are requested on the PR; the workflow ends without review requests")
+        if status_section and status_section not in (pr.get("body") or "").replace("\r\n", "\n"):
+            reasons.append("the PR description no longer carries the handoff's status section")
         ledger = self.state.get("findings", {})
         unresolved = sorted(fid for fid, e in ledger.items() if e["blocks_readiness"] and e["status"] != "resolved")
         if unresolved:
@@ -2155,6 +2343,14 @@ class Controller:
             reasons.append("a runtime transaction lock is present (" + ", ".join(self.cfg.get("runtime_lock_paths", []))
                            + f"); the developer reported restoration '{report.get('runtime_restoration')}'")
         missing = self.missing_publications(include_receipt=receipt)
+        try:
+            self.verify_transcripts(archive_head)  # every recorded record present and intact at the handoff head
+        except Stop as stop:
+            reasons.append(stop.reason)
+        accepted = next((r for r in self.state["rounds"] if r["round"] == ready["round"]), {})
+        if accepted.get("envelope_path") and read_json(accepted["envelope_path"]).get("workflow_fingerprint") != \
+                self.state["workflow"]["fingerprint"]:
+            reasons.append("the ready review was produced under a different workflow version")
         if missing:
             reasons.append("published records are missing or altered on the PR: " + ", ".join(missing[:5]))
         if self.state.get("last_report_for") != ready["H"]:
@@ -2255,9 +2451,9 @@ class Controller:
                          f"changed while the handoff above was being posted: {'; '.join(after)}.\n\n"
                          "_Automated workflow status; not a human review._\n")
             self.invalidate_ready("; ".join(after))
-        self.update_pr_body(f"awaiting owner review. Reviewed source `{ready['H']}`; archive head `{archive_head}` "
-                            "(transcript-only successor).", expected_head=archive_head)
-        final, _ = self.readiness(archive_head, receipt=f"final-status-{short(archive_head)}")
+        section = self.update_pr_body(f"awaiting owner review. Reviewed source `{ready['H']}`; archive head "
+                                      f"`{archive_head}` (transcript-only successor).", expected_head=archive_head)
+        final, _ = self.readiness(archive_head, receipt=f"final-status-{short(archive_head)}", status_section=section)
         if final:  # changed during the body edit: correct the index and receipt before recording anything
             self.update_pr_body(f"handoff for `{short(archive_head)}` superseded during publication ({'; '.join(final)}).")
             self.publish(f"final-status-{short(archive_head)}-superseded-late",
@@ -2265,7 +2461,7 @@ class Controller:
                          f"{'; '.join(final)}\n\n_Automated workflow status; not a human review._\n")
             self.invalidate_ready("; ".join(final))
         self.state.update(status="AWAITING_OWNER_REVIEW", status_reason=f"source {ready['H']}, archive {archive_head}",
-                          handoff={"H": ready["H"], "A": archive_head, "at": now_iso()})
+                          handoff={"H": ready["H"], "A": archive_head, "at": now_iso(), "status_section": section})
         self.transition("done", "owner review handoff posted")
         return "AWAITING_OWNER_REVIEW"
 
@@ -2291,10 +2487,11 @@ class Controller:
         return missing
 
     def settle_publications(self):
-        """Send every preserved, unsent publication before advancing (they are required operations)."""
+        """Send preserved, unsent publications before advancing (required operations). Verdicts and handoff
+        receipts are excluded: finish_round/finalize re-check their prerequisites before sending them."""
         for key, pub in list(self.state.get("publications", {}).items()):
-            if pub["state"] == "pending":
-                self.publish(key, "")
+            if pub["state"] == "pending" and not VERDICT_KEY_RE.match(key):
+                self.send(key, pub)
 
     def handoff_superseded(self):
         """None if the handoff is still current; otherwise what changed. Observation failures propagate."""
@@ -2303,7 +2500,8 @@ class Controller:
         if pr["headRefOid"] != handoff.get("A") or pr["state"] != "OPEN":
             return f"PR head {short(pr['headRefOid'])} (handoff archive {short(handoff.get('A'))}), state {pr['state']}"
         try:
-            reasons, _ = self.readiness(handoff["A"], receipt=f"final-status-{short(handoff['A'])}")
+            reasons, _ = self.readiness(handoff["A"], receipt=f"final-status-{short(handoff['A'])}",
+                                        status_section=handoff.get("status_section"))
         except Stop as stop:
             return stop.reason
         return "; ".join(reasons) or None
@@ -2322,14 +2520,20 @@ class Controller:
         pr = self.pr_view()
         if expected_head and pr["headRefOid"] != expected_head:
             self.invalidate_ready(f"PR head moved to {short(pr['headRefOid'])} before the status update")
-        start, end = "<!-- agent-review:status:start -->", "<!-- agent-review:status:end -->"
-        section = (f"{start}\n**Agent review status:** {text} Records: `{self.transcript_folder()}/`.\n{end}")
+        start, end = STATUS_START, STATUS_END
+        section = sanitize(f"{start}\n**Agent review status:** {text} Records: `{self.transcript_folder()}/`.\n{end}")[0]
         body = pr.get("body") or ""
-        body = re.sub(re.escape(start) + ".*?" + re.escape(end), lambda _: section, body, flags=re.S) \
-            if start in body else body.rstrip() + "\n\n" + section
+        if body.count(start) == 0 and body.count(end) == 0:
+            body = body.rstrip() + "\n\n" + section
+        elif body.count(start) == 1 and body.count(end) == 1 and body.index(start) < body.index(end):
+            body = body[:body.index(start)] + section + body[body.index(end) + len(end):]
+        else:
+            raise Stop("PAUSED", "the PR description's agent-review status markers are malformed; repair them by hand "
+                                 "(other PR text is never rewritten automatically)")
         path = self.dir / "outbox" / "pr-body.md"
         write_text(path, sanitize(body)[0])
         self.gh.edit_body(self.state["pr"]["number"], path)
+        return section
 
     # -- status ---------------------------------------------------------------------------
     def status(self, remote=False):
@@ -2448,12 +2652,22 @@ def guarded_push(state, cfg):
     remote = git.remote_head(branch)
     if remote and not git.is_ancestor(remote, head):
         raise UsageError("the remote branch is not an ancestor; reconcile without force")
-    base = git.fetch(state["target"])
-    for path in git("diff", "--name-only", "--diff-filter=AM", git("merge-base", head, base), head).splitlines():
-        blob = subprocess.run(["git", "-C", state["repo_root"], "show", f"{head}:{path}"], capture_output=True).stdout
-        text = blob.decode("utf-8", "ignore")
+    git.fetch(state["target"])
+    outgoing = [line.split(" ", 1) for line in
+                git("rev-list", "--objects", head, "--not", "--remotes=origin").splitlines() if line.strip()]
+    for item in outgoing:  # every newly reachable object, including intermediate file versions
+        sha, path = item[0], (item[1] if len(item) > 1 else "")
+        kind = run(["git", "-C", state["repo_root"], "cat-file", "-t", sha], check=False)
+        if kind.returncode != 0:
+            raise UsageError(f"cannot read outgoing object {sha}; refusing to push")
+        if kind.stdout.strip() != "blob":
+            continue
+        blob = subprocess.run(["git", "-C", state["repo_root"], "cat-file", "blob", sha], capture_output=True)
+        if blob.returncode != 0:
+            raise UsageError(f"cannot read outgoing blob {sha} ({path}); refusing to push")
+        text = blob.stdout.decode("utf-8", "ignore")
         if TOKEN_RE.search(text) or PEM_BEGIN_RE.search(text):
-            raise UsageError(f"possible credential in {path}; refusing to push")
+            raise UsageError(f"possible credential in {path or sha} (an outgoing version); refusing to push")
     try:
         git("push", "--quiet", "origin", f"HEAD:refs/heads/{branch}")
     except CommandError as exc:
@@ -2512,6 +2726,10 @@ def plan_for_mission(plan, mission: Path):
         return plan
     slug = re.sub(r"[^a-z0-9]+", "-", mission.stem.lower()).strip("-") or "mission"
     return {**plan, "mission_id": slug, "title": mission.stem}
+
+
+def records_ledger_path(repository, pr_number):
+    return host_dir() / "records" / f"{branch_key(repository, f'pr-{pr_number}')}.json"
 
 
 def registry_path(repository, branch):
@@ -2618,6 +2836,12 @@ def _enroll_into(folder, enrollment_id, cfg, plan, args, git, gh, mission, top, 
         "publications": {}, "archived": {}, "archived_keys": [], "archive_pending": None,
         "created_at": now_iso(), "transitions": [],
     }
+    ledger = records_ledger_path(cfg["repository"], number)
+    if ledger.exists():  # records an earlier (cancelled) enrollment wrote for this PR stay recognized
+        head = git.head()
+        for rel, digest in read_json(ledger).items():
+            if git.blob_sha256(head, rel) == digest:
+                state["archived"][rel] = digest
     atomic_write_json(folder / "state.json", state)
     claim = {"enrollment_id": enrollment_id, "dir": str(folder), "repository": cfg["repository"], "branch": branch,
              "at": now_iso()}
@@ -2667,10 +2891,10 @@ def preflight(cfg, root=HERE):
     info = rev.run('Return {"ok": true}. Run no commands.', work, schema, work / "codex.json", work / "codex.jsonl",
                    work / "codex.err", 600, skip_git=True)
     prov = rev.provenance(info["thread_id"])
+    problems, _ = invocation_problems(info, prov, rev.requested)
     out["reviewer"] = {"cli": rev.version(), "auth": rev.auth_route(), "requested": rev.requested, "run": info,
-                       "observed": prov, "ok": info["exit_code"] == 0 and prov["observed_model"] == cfg["reviewer"]["model"]
-                       and _json_file(work / "codex.json") == {"ok": True}
-                       and prov["observed_effort"] == cfg["reviewer"]["effort"] and prov["sandbox"] == "read-only"}
+                       "observed": prov, "problems": problems,
+                       "ok": info["exit_code"] == 0 and not problems and _json_file(work / "codex.json") == {"ok": True}}
     out["limitations"] = [
         "Claude: model observed from API response message metadata; effort observed from the session transcript's "
         "recorded effort setting (the init event does not report effort).",
@@ -2686,24 +2910,39 @@ def preflight(cfg, root=HERE):
 # --------------------------------------------------------------------------- install
 
 def install(dest: Path, source: Path = HERE):
-    digest, hashes = compute_fingerprint(source)
-    locks = agent_home() / "locks"
-    for lock_file in locks.glob("*.lock") if locks.exists() else []:
-        if Lock(lock_file, "install-check").held_elsewhere():
-            raise UsageError(f"an active controller holds {lock_file}; stop it before reinstalling")
-    dest.mkdir(parents=True, exist_ok=True)
-    old = dest / "MANIFEST.json"
-    if old.exists():
-        for rel in read_json(old).get("files", {}):
-            if rel not in hashes:
-                (dest / rel).unlink(missing_ok=True)
-    for rel in hashes:
-        (dest / rel).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source / rel, dest / rel)
-    commit = run(["git", "-C", str(source), "rev-parse", "HEAD"], check=False).stdout.strip()
-    dirty = run(["git", "-C", str(source), "status", "--porcelain", "--", "."], check=False).stdout.strip() != ""
-    atomic_write_json(old, {"fingerprint": digest, "files": hashes, "source_commit": commit,
-                            "source_dirty": dirty, "installed_at": now_iso()})
+    """Install atomically: build a complete staged copy, then swap directories, under a host install lock and
+    only while no controller holds a writer lock. A process that already started keeps its in-memory snapshot;
+    its next check sees the new fingerprint and pauses until `activate`."""
+    dest = Path(dest).resolve()
+    digest, hashes, _ = load_workflow(source)
+    with Lock(host_dir() / "install.lock", "install"):
+        locks = host_dir() / "locks"
+        for lock_file in locks.glob("*.lock") if locks.exists() else []:
+            if Lock(lock_file, "install-check").held_elsewhere():
+                raise UsageError(f"an active controller holds {lock_file}; stop it before reinstalling")
+        staging = dest.with_name(dest.name + ".staging")
+        shutil.rmtree(staging, ignore_errors=True)
+        for rel in hashes:
+            (staging / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source / rel, staging / rel)
+        commit = run(["git", "-C", str(source), "rev-parse", "HEAD"], check=False).stdout.strip()
+        dirty = run(["git", "-C", str(source), "status", "--porcelain", "--", "."], check=False).stdout.strip() != ""
+        atomic_write_json(staging / "MANIFEST.json", {"fingerprint": digest, "files": hashes, "source_commit": commit,
+                                                      "source_dirty": dirty, "installed_at": now_iso()})
+        if load_workflow(staging)[0] != digest:
+            raise UsageError("staged installation does not match its source")
+        retired = None
+        if dest.exists():
+            retired = dest.with_name(f"{dest.name}.retired-{dt.datetime.now().strftime('%Y%m%d%H%M%S%f')}")
+            os.replace(dest, retired)
+        try:
+            os.replace(staging, dest)
+        except OSError:
+            if retired:
+                os.replace(retired, dest)  # put the previous complete version back
+            raise
+        if retired:
+            shutil.rmtree(retired, ignore_errors=True)
     return digest
 
 
