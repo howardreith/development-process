@@ -192,7 +192,11 @@ storage (a UNC/device path or a mapped network drive), and any path whose
 registry folder, claim file, state directory components or `state.json` is a
 symbolic link, junction or other reparse point are reported the same way
 without being read (links are refused conservatively, whatever their target;
-a linked registry folder makes `list` refuse with exit 4). A state file whose
+paths with `..` segments are refused, and a path with a missing component is
+reported missing without being opened). A registry folder that is linked,
+remote or cannot be enumerated (for example, listing permission denied) makes
+`list` refuse with exit 4 rather than print `[]`; an absent registry prints
+`[]`. A state file whose
 `enrollment_id` differs from the claim's is reported without copying any of
 its fields. `pr` is a positive integer or null even if the state file holds
 something else. Cancelled

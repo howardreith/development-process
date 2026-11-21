@@ -4070,11 +4070,18 @@ def remote_path_reason(text):
 FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 
 
-def local_read_problem(path):
-    """Why opening path could leave local storage, or None. Nothing is followed: the path string and drive table
-    are checked first (remote_path_reason), then every existing component from the root down is examined with
-    lstat, which does not traverse links, so a parent is known to be a plain local directory before its child is
-    examined. Any symbolic link, junction or other reparse point is refused conservatively, whatever its target."""
+PATH_MISSING = "missing"  # inspect_local_path: a component does not exist, so the path was not fully inspected
+
+
+def inspect_local_path(path):
+    """None when every component of path exists and is a plain local entry, so opening exactly this path stays on
+    local storage; PATH_MISSING when a component does not exist (the path must then not be opened: Windows could
+    normalize the missing part away and reach components that were never inspected); otherwise the reason it
+    could leave local storage. Nothing is followed: the path string and drive table are checked first
+    (remote_path_reason), '..' segments are refused (the effective path must be the inspected one), then every
+    component from the root down is examined with lstat, which does not traverse links, so a parent is known to be
+    a plain local directory before its child is examined. Any symbolic link, junction or other reparse point is
+    refused conservatively, whatever its target."""
     text = str(path)
     remote = remote_path_reason(text)
     if remote:
@@ -4082,13 +4089,15 @@ def local_read_problem(path):
     path = Path(text)
     if not path.is_absolute():
         return f"{text} is a relative path"
+    if ".." in path.parts:
+        return f"{text} contains a '..' segment; only canonical paths are read"
     current = Path(path.anchor)
     for part in path.parts[1:]:
         current = current / part
         try:
             info = os.lstat(current)
         except FileNotFoundError:
-            return None  # nothing below exists to be redirected; the read reports the missing file
+            return PATH_MISSING
         except OSError as exc:
             return f"{current} cannot be inspected without following it: {exc}"
         if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT:
@@ -4102,7 +4111,9 @@ def _text(value):
 
 def _list_row(entry):
     row = dict(LIST_ROW)
-    problem = local_read_problem(entry)
+    problem = inspect_local_path(entry)
+    if problem == PATH_MISSING:
+        return {**row, "error": f"claim {entry.name} disappeared while listing; it was not read"}
     if problem:
         return {**row, "error": f"claim {entry.name} was not read: {problem}; list reads local files only"}
     try:
@@ -4123,7 +4134,9 @@ def _list_row(entry):
         return {**row, "error": f"claim {entry.name} names a relative state directory ({folder}) that cannot be "
                                 "resolved independently of the working directory; it was not read"}
     state_path = Path(folder) / "state.json"
-    problem = local_read_problem(state_path)
+    problem = inspect_local_path(state_path)
+    if problem == PATH_MISSING:  # reported without opening: an uninspected path is never read
+        return {**row, "error": f"state file is missing: {state_path}"}
     if problem:
         return {**row, "error": f"state file {state_path} was not read: {problem}; list inspects local state only "
                                 "and did not access it"}
@@ -4157,11 +4170,19 @@ def list_enrollments():
     access to paths on network storage or behind links. A damaged claim or state file is reported (status
     "unknown" with an error) instead of failing the whole listing."""
     folder = host_dir() / "registry"
-    problem = local_read_problem(folder)
+    problem = inspect_local_path(folder)
+    if problem == PATH_MISSING:  # nothing was ever enrolled on this machine
+        return []
     if problem:  # the registry itself is not an enrollment: refuse rather than enumerate a possibly remote folder
         raise UsageError(f"host registry {folder} was not read: {problem}; list reads local files only")
+    try:  # os.scandir raises scan errors (Path.glob would silently yield nothing and report an empty registry)
+        with os.scandir(folder) as scan:
+            entries = sorted(folder / e.name for e in scan if e.name.lower().endswith(".json"))
+    except OSError as exc:
+        raise UsageError(f"host registry {folder} cannot be enumerated: {type(exc).__name__}: {exc}; "
+                         "the enrollments it holds cannot be listed")
     rows = []
-    for entry in sorted(folder.glob("*.json")) if folder.is_dir() else []:
+    for entry in entries:
         try:
             rows.append(_list_row(entry))
         except Exception as exc:  # last resort: one damaged enrollment never hides the others

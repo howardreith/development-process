@@ -3850,7 +3850,7 @@ def forbid_processes_and_network(test, forbidden=()):
     from unittest import mock
     attempts = []
     real_read_json = ar.read_json
-    blocked = [os.path.normcase(str(p)) for p in forbidden]
+    blocked = [os.path.normcase(os.path.normpath(str(p))) for p in forbidden]
 
     def refuse(what):
         def _refuse(*args, **kwargs):
@@ -3862,7 +3862,8 @@ def forbid_processes_and_network(test, forbidden=()):
         text = str(path).replace("/", "\\")
         if text.startswith("\\\\") and not re.match(r"\\\\[?.]\\[A-Za-z]:", text):  # \\?\C:\ is a local drive
             return refuse(f"to read network path {path}")()
-        if any(os.path.normcase(str(path)).startswith(prefix) for prefix in blocked):
+        effective = os.path.normcase(os.path.normpath(str(path)))  # what the OS opens after collapsing '..'
+        if any(effective.startswith(prefix) for prefix in blocked):
             return refuse(f"to read through a link: {path}")()
         return real_read_json(path)
     with mock.patch.object(subprocess, "Popen", side_effect=refuse("a process")), \
@@ -3871,6 +3872,50 @@ def forbid_processes_and_network(test, forbidden=()):
             mock.patch.object(ar, "read_json", guarded_read_json):
         yield
     test.assertEqual([], attempts)
+
+
+def set_windows_privilege(name, enabled):
+    """Enable or disable a privilege in this process's own token; returns whether it was enabled before, or None
+    if the token does not hold it. Test setup only (real OS state, nothing simulated)."""
+    import ctypes
+    from ctypes import wintypes
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class LUID(ctypes.Structure):
+        _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+    class LUID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Luid", LUID), ("Attributes", wintypes.DWORD)]
+
+    class TOKEN_PRIVILEGES(ctypes.Structure):
+        _fields_ = [("PrivilegeCount", wintypes.DWORD), ("Privileges", LUID_AND_ATTRIBUTES * 1)]
+    enabled_flag = 0x2  # SE_PRIVILEGE_ENABLED
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.LookupPrivilegeValueW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.POINTER(LUID)]
+    advapi32.AdjustTokenPrivileges.argtypes = [wintypes.HANDLE, wintypes.BOOL, ctypes.POINTER(TOKEN_PRIVILEGES),
+                                               wintypes.DWORD, ctypes.POINTER(TOKEN_PRIVILEGES),
+                                               ctypes.POINTER(wintypes.DWORD)]
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), 0x20 | 0x8, ctypes.byref(token)):  # ADJUST|QUERY
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        luid = LUID()
+        if not advapi32.LookupPrivilegeValueW(None, name, ctypes.byref(luid)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        new = TOKEN_PRIVILEGES(1, (LUID_AND_ATTRIBUTES * 1)(LUID_AND_ATTRIBUTES(luid, enabled_flag if enabled else 0)))
+        old, size = TOKEN_PRIVILEGES(), wintypes.DWORD(0)
+        if not advapi32.AdjustTokenPrivileges(token, False, ctypes.byref(new), ctypes.sizeof(old), ctypes.byref(old),
+                                              ctypes.byref(size)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if ctypes.get_last_error() == 1300:  # ERROR_NOT_ALL_ASSIGNED: the token does not hold this privilege
+            return None
+        if old.PrivilegeCount == 0:  # already in the requested state
+            return enabled
+        return bool(old.Privileges[0].Attributes & enabled_flag)
+    finally:
+        kernel32.CloseHandle(token)
 
 
 class ListCommandTests(Base):
@@ -4101,6 +4146,71 @@ class ListCommandTests(Base):
             self.assertEqual(ar.EXIT_USAGE, ar.main(["list"]))
         self.assertEqual("", out.getvalue())
         self.assertIn("reparse point", err.getvalue())
+
+    @unittest.skipUnless(os.name == "nt", "junctions are Windows filesystem links")
+    def test_noncanonical_or_missing_paths_are_never_opened(self):
+        """R1-F4 (round 3): Windows collapses `missing\\..` lexically, so `<root>\\missing\\..\\junction` would
+        open through a junction the component walk never reached. '..' segments are refused, and a missing component
+        stops the walk without opening the path (reported as missing). The tripwire compares normalized paths."""
+        import _winapi
+        env = self.env
+        target = Path(self.state_dir("target", json.dumps({"enrollment_id": "c-dotdot", "status": "ACTIVE",
+                                                           "pr": {"number": 5}})))
+        junction = env.root / "junction"
+        _winapi.CreateJunction(str(target), str(junction))
+        self.addCleanup(os.rmdir, junction)
+        self.claim("c-dotdot", str(env.root) + r"\missing\..\junction")
+        self.claim("c-dotdot-local", str(env.root) + r"\missing\..\other-state\target")  # refused, though local
+        self.claim("c-missing", str(env.root / "nope" / "x"))
+        rows = self.listed([junction, env.root / "nope", env.root / "missing"])
+        for name in ("c-dotdot", "c-dotdot-local"):
+            self.assertEqual(("unknown", None), (rows[name]["status"], rows[name]["pr"]), name)
+            self.assertIn("'..' segment", rows[name]["error"])
+        self.assertEqual(("unknown", None), (rows["c-missing"]["status"], rows["c-missing"]["pr"]))
+        self.assertIn("state file is missing", rows["c-missing"]["error"])
+
+    def test_unreadable_registry_is_refused_not_reported_empty(self):
+        """R3-F1: when the registry's attributes are readable but listing its contents is denied, list refuses
+        with a registry diagnostic and a nonzero exit instead of printing []. Absent and readable-empty registries
+        still print [] (test_empty_registry_prints_an_empty_array)."""
+        registry = ar.host_dir() / "registry"
+        self.assertTrue(list(registry.glob("*.json")))  # populated: the fixture's real enrollment claim
+        if os.name == "nt":
+            # An elevated token may hold SeBackupPrivilege enabled, which bypasses the DACL for directory opens;
+            # disable it in this test process for the duration (restored in cleanup) so the deny ACE applies.
+            previous = set_windows_privilege("SeBackupPrivilege", False)
+            if previous:
+                self.addCleanup(set_windows_privilege, "SeBackupPrivilege", True)
+            user = subprocess.run(["whoami"], check=True, capture_output=True, text=True).stdout.strip()
+            subprocess.run(["icacls", str(registry), "/deny", f"{user}:(RD)"], check=True, capture_output=True)
+            self.addCleanup(subprocess.run, ["icacls", str(registry), "/remove:d", user], check=True,
+                            capture_output=True)
+        else:
+            if os.geteuid() == 0:
+                self.skipTest("root bypasses directory permissions")
+            os.chmod(registry, 0o300)  # search and write, no read: entries cannot be listed
+            self.addCleanup(os.chmod, registry, 0o755)
+        with self.assertRaises(PermissionError):
+            os.listdir(registry)  # the condition under test really holds
+        self.assertTrue(registry.is_dir())  # while its metadata stays readable
+        with forbid_processes_and_network(self), contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(ar.EXIT_USAGE, ar.main(["list"]))
+        self.assertEqual("", out.getvalue())
+        self.assertIn("cannot be enumerated", err.getvalue())
+        self.assertIn("registry", err.getvalue())
+
+    def test_registry_that_is_not_a_directory_is_refused(self):
+        """R3-F1: any scan error is a refusal, not an empty listing."""
+        from unittest import mock
+        host = self.env.root / "file-host"
+        host.mkdir()
+        (host / "registry").write_text("not a directory", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"AGENT_REVIEW_HOST_DIR": str(host)}), forbid_processes_and_network(self), \
+                contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(ar.EXIT_USAGE, ar.main(["list"]))
+        self.assertEqual("", out.getvalue())
+        self.assertIn("cannot be enumerated", err.getvalue())
 
     def test_symbolic_links_to_state_or_claim_files_are_refused(self):
         """R1-F4 (round 2): a symbolic link as state.json or as a registry claim file is refused from lstat alone
