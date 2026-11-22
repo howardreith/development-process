@@ -165,13 +165,26 @@ does (`"required_gates": ["unit"]`).
 
 ## Running a mission
 
+Normal interactive work is **foreground**: the owner's main Claude conversation
+is the developer (see [Foreground development](#foreground-development-the-default-for-interactive-work)).
+Use a separate headless developer only when the owner explicitly asks for
+unattended work. Always pass `--mode` explicitly (the CLI default remains
+`headless` for compatibility with existing scripts).
+
 ```powershell
 git -C C:/Dev/<repo> worktree add -b claude/<feature> <worktree> origin/<default>
 # commit the mission file (or a first change) and push it
+# Interactive (default): run from the Claude session that will develop; it becomes the enrolled developer
+python $ar enroll  --project <name> --worktree <worktree> --plan single --mission <MISSION.md> --mode foreground
+python $ar status  --enrollment <id>      # foreground_session.problems must be [] (model, effort, permission mode)
+# ... develop in the conversation, commit, push, verify, then:
+python $ar review  --enrollment <id> --report <report.json>   # one Codex review; prints the accepted review
+python $ar finalize --enrollment <id>     # after ready_for_owner_review: archive and owner handoff
+# Unattended, only on the owner's explicit request:
 python $ar enroll  --project <name> --worktree <worktree> --plan single --mission <MISSION.md> --mode headless
 python $ar run     --enrollment <id>      # develop → verify → review → correct → … → owner handoff
 python $ar list                          # every enrollment on this machine (read-only)
-python $ar status  --enrollment <id> [--remote]
+python $ar status  --enrollment <id> [--remote | --instructions]
 python $ar stop    --enrollment <id> --reason "..."
 python $ar resume  --enrollment <id> --reason "what changed" [--max-rounds N] [--guidance <file> | --amend-mission <file>]
 python $ar cancel  --enrollment <id> --reason "..."
@@ -206,6 +219,75 @@ its fields. `pr` is a positive integer or null even if the state file holds
 something else. Cancelled
 enrollments release their claim and are not listed. Use `status --enrollment
 <id>` for the full detail of one enrollment.
+
+### Foreground development (the default for interactive work)
+
+In foreground mode the owner's main interactive Claude session (Opus, high
+effort) is the developer. It investigates, edits, tests and corrects in the
+conversation the owner is reading; the controller still owns publication,
+review rounds, gate receipts, archives and the handoff. Ordinary review
+iterations need no owner relay.
+
+**The cycle, as the session runs it:**
+
+1. Enroll from the developing session with `--mode foreground` (the enrollment
+   binds to `CLAUDE_CODE_SESSION_ID`). Enrollment first verifies the session's
+   CLI-recorded transcript (next paragraph) and refuses, creating nothing, if
+   it does not match the owner policy. `status` shows the same check as
+   `foreground_session`.
+2. Develop in the worktree: commit, `push --enrollment <id>` (guarded helper),
+   `verify --enrollment <id> --gate <id>` for every required gate.
+3. Write the developer report (schema `agent-review.developer.v1`, with a
+   disposition for every pending finding) to a file and run
+   `review --enrollment <id> --report <file>`. Run it as a background task and
+   follow the live log (below) while Codex reviews.
+4. The command prints the accepted review on stdout under `review`: `round`,
+   `decision`, `candidate` (the reviewed commit), `review_reference` (the PR
+   comment URL), `structured_review` (the private envelope path),
+   `continuation` (the reviewer's `decision_rationale`, unchanged, including
+   its `Continuation for Claude`), `findings`, `pending_findings`,
+   `prior_finding_assessments`, the instruction bindings and `next`. The
+   session explains the correction batch to the owner in a few lines and
+   continues implementing it; the structured findings stay the authoritative
+   record. Progress never goes to stdout, so the result always parses as JSON.
+5. Repeat until `ready_for_owner_review`, then `finalize`. The configured
+   review-round limit, no-progress rule, dispositions, gates, GitHub history
+   and the owner merge boundary are unchanged.
+
+**Session verification (models, effort, permissions).** A foreground session
+runs under the owner's own Claude Code settings and interactive approvals. The
+enrollment's hash-pinned headless permission profile is **not** applied to it.
+What the controller verifies instead, from the session's CLI-recorded
+transcript, at enrollment, at every `review --report` and in `status`:
+every main-thread turn's model matches `allowed_model_pattern` (Opus), every
+turn's effort is the policy effort (`high`), and the recorded permission mode
+is present and is not `bypassPermissions`. A mismatch refuses enrollment
+(nothing created) or stops a review `BLOCKED` before any reviewer launch. The
+guarded `push` and `verify` helpers enforce their own rules whatever the
+session's settings are, and the developer provenance in each review request
+names the recorded models, effort and permission modes.
+
+**Live output.** Reviewer activity (the commands Codex runs, their exit codes
+and its messages; never reasoning) and every line of gate output are appended,
+as they happen, to the enrollment's private live log, whose path `status` prints
+as `live_log` (`<state>/<enrollment>/live.log`). In an interactive terminal the same lines also go to stderr.
+Gate receipts, their logs and digests, reviewer event files and envelopes are
+unchanged and remain the only evidence; the live log is progress for people.
+Claude Code shows a tool's output only when the tool finishes, so in the
+conversation the session follows the live log with a monitor while the
+command runs in the background; the owner can watch it directly:
+
+```powershell
+Get-Content -Wait -Tail 40 <live_log path from status>
+```
+
+**Owner task changes from the session.** The owner tells the session; it saves
+the exact text outside the worktree as pending and applies it with
+`resume --enrollment <id> --reason "..." --amend-mission <file>` between its own
+commands (no `stop` needed in foreground). The command prints the full
+effective task, including the amendments text and its digest, which is the
+delivery to the developer; Codex receives the same document byte-exact. See
+[Owner amendments](#owner-amendments-resume---amend-mission-file).
 
 ### The owner's experience and the supervisor's duties
 
@@ -302,7 +384,7 @@ supervisor never claims an agent saw text that only the supervisor received.
 
 #### Amendment rules
 
-- **Supported boundaries (headless only).** A headless enrollment that is
+- **Supported boundaries.** A headless enrollment that is
   `BLOCKED` or `PAUSED` in `develop`, `review` or `finalize`, or that is
   `AWAITING_OWNER_REVIEW` on its still-open draft PR (or stopped `BLOCKED`/
   `PAUSED` in `done` with that handoff still recorded, for example after an
@@ -320,8 +402,25 @@ supervisor never claims an agent saw text that only the supervisor received.
   selection, text the publication sanitizer would refuse, a replay of a saved
   file that was already applied at any earlier revision (it never reinstates
   an older instruction over a later one), or a combination with
-  `--max-rounds`, `--resend-undelivered` or `--guidance`. Foreground
-  enrollments are refused.
+  `--max-rounds`, `--resend-undelivered` or `--guidance`.
+- **Foreground boundary.** In a foreground enrollment the interactive session
+  is the developer and runs every command itself, so between its commands the
+  enrollment is idle while `ACTIVE`: an amendment is also accepted `ACTIVE` in
+  `develop`, `review` or `finalize`, with no `stop`. Every other check above
+  applies: a running `review` or `finalize` holds the writer lock (the
+  amendment is refused, exit 4, nothing changed), a running `push`/`verify`
+  holds the helper lock, and a reviewer attempt without a recorded end is
+  refused. The command publishes the queued corrections (for example a
+  superseded handoff) before it returns, and prints the effective task under
+  `effective_task`: the mission path and sha256, and the amendments `revision`,
+  `sha256`, precedence note and full `text`. `status --instructions` prints the
+  same, read-only, at any time. A foreground report is bound to the selected
+  amendments only when the session's CLI-recorded transcript shows a tool
+  result containing that revision's sha256 at or after its capture; otherwise
+  `review --report` is refused with the command to display it. `status`
+  reports that observation as `amendments.selected.shown_in_foreground_session_at`.
+  Approach-only `--guidance` stays headless-only: in foreground the owner
+  gives approach guidance to the session directly.
 - **Capture.** The file is validated like a guidance document (at most 64 KiB,
   UTF-8, not blank). Under the writer and helper locks, the controller builds
   the next cumulative document: the current revision's verified bytes (or a
@@ -350,8 +449,8 @@ supervisor never claims an agent saw text that only the supervisor received.
   receipt retired by a public correction, a `reopened` notice and a PR status
   update. The `STOP` file is consumed only
   once this save succeeds. `status.pending_publications` lists only records
-  still to be sent or whose POST outcome is unknown: retired (`superseded`)
-  and `withdrawn` records are settled and are not listed.
+  still to be sent or whose POST outcome is unknown. Retired (superseded) and
+  withdrawn records are omitted once every POST outcome is known.
   The report binding is cleared and the phase returns to `develop` without
   launching any model. Findings, `rounds_completed`, developer invocations,
   limits, models, permissions and gates are untouched: nothing is refunded or
@@ -456,9 +555,9 @@ either agent.
 | A transient blocker is resolved; mission and approach are unchanged | Ordinary `resume --reason ...`. The reason is an audit note, not agent instruction. |
 | The owner supplies the agreed task as chat text | Save it verbatim as the mission file and enroll once with it; do not reword or expand it. |
 | The approach should change while meeting the same acceptance criteria | In the supported idle state, `resume --reason ... --guidance FILE`; then check `status` (`guidance.selected`) and, as the run continues, the `latest_developer_invocation` and `latest_review_round` bindings. |
-| The owner changes the task's scope or acceptance criteria | Save the exact instruction as pending, `stop`, wait for the stopped state, then `resume --reason ... --amend-mission FILE` (above). Same enrollment, branch, PR and counters. |
+| The owner changes the task's scope or acceptance criteria | Save the exact instruction as pending, `stop`, wait for the stopped state, then `resume --reason ... --amend-mission FILE` (above). Foreground: no `stop`; apply it between the session's own commands, then show the printed effective task before the next report. Same enrollment, branch, PR and counters. |
 | Permissions, models, required gates, budgets or project policy must change | Use the existing explicit operation under the owner's actual authorization (`resume --max-rounds`, re-enrollment, between-run `activate`). Neither guidance nor an amendment applies these changes. |
-| An instruction arrives while an agent is working | Save it as pending, `stop`, wait until `status` shows the run stopped (not `ACTIVE`, `developer_running` false, `lock_holder` null), then apply it (`--amend-mission` for a task change, `--guidance` for an approach change in `develop`). There is no live injection into a running agent. |
+| An instruction arrives while an agent is working | Save it as pending, `stop`, wait until `status` shows the run stopped (not `ACTIVE`, `developer_running` false, `lock_holder` null), then apply it (`--amend-mission` for a task change, `--guidance` for an approach change in `develop`). Foreground: wait for the running `review`/`finalize`/`verify` command to return (its locks refuse the amendment meanwhile), then apply it. There is no live injection into a running agent. |
 | The background run exits | Inspect its result. At `AWAITING_OWNER_REVIEW`, verify with `status --remote` and notify the owner here (item 6 above); otherwise report the exact stop and the next decision. |
 | A budget is exhausted, or the same approach has repeatedly failed | Report the concrete blocker, the actual counters, and the specific owner decision that can advance the run (below). No automatic resume or cap increase. |
 
@@ -730,7 +829,7 @@ which run the candidate's own code. Do not reinstall or activate the controlling
 | GitHub | The existing `gh` login (ADMIN on every onboarded repository) is reused; no new tokens, Actions, webhooks or status writes. The token is not branch-limited, so the controller enforces repository, PR number, same-repository head, head/base, draft state, the actor at every mutation, and the author of every posted comment. |
 | Push | Repository wrapper where configured (Gunslinger, Buff Planner), otherwise the guarded helper: live enrollment in development, open draft PR, enrolled branch matching the project's prefix, clean tree, every effective push URL approved, fast-forward, no credential patterns in the feature diff, never force. |
 | Headless developer | `settings/developer.base.json` + project extras, composed and hash-pinned per enrollment; `--permission-mode dontAsk`. Reads anywhere; edits only inside the worktree; git inspection/add/`commit -m/-F` (no amend/no-verify); the `push` (when no wrapper) and `verify` helpers for its own enrollment; the project's validation commands. Denied: direct push, `gh`, history rewriting, network fetchers, every other controller subcommand, edits to transcripts, `.claude/`, `AGENTS.md`, `CLAUDE.md`, plus per-project deploy/publish/production paths. The prompt lists the allowed prefixes. Running tests and builds the developer writes is inherent to development; the boundary is no blanket shell, no bypass mode and no GitHub writes. |
-| Foreground session | User-level allowances in `~/.claude-personal/settings.json` for the controller's `status`, `review`, `finalize`, `archive`, `stop` and `push` subcommands (owner-authorized 2026-11-20). `run`, `resume`, `enroll`, `activate`, `install`, `cancel` and `init-project` stay owner-initiated. |
+| Foreground session | The owner's own Claude Code settings and interactive approvals; the enrollment's headless permission profile is **not** applied. User-level allowances in `~/.claude-personal/settings.json` cover the controller's `status`, `review`, `finalize`, `archive`, `stop` and `push` subcommands (owner-authorized 2026-11-20). `run`, `resume` (including `--amend-mission`), `enroll`, `activate`, `install`, `cancel` and `init-project` stay owner-initiated. The controller verifies the session's recorded model, effort and permission mode (not `bypassPermissions`) at enrollment, at every review and in `status`. |
 | Reviewer | Read-only filesystem sandbox, restricted network, approvals `never`, user config ignored (no MCP servers, plugins, hooks), connectors/browser/computer-use/image generation disabled; any sub-agent call invalidates the review. `~/.codex/config.toml` is untouched. |
 
 ## Recovery

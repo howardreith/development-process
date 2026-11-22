@@ -295,6 +295,14 @@ shell or API permissions. Helpers accept validated data and fixed operations,
 not arbitrary command strings. Project-specific permissions must not overwrite
 global preferences or managed restrictions.
 
+A foreground (interactive) developer session runs under the owner's own Claude
+Code settings and approvals; the hash-pinned headless permission profile is not
+applied to it, and the controller does not claim otherwise. It verifies instead,
+from the session's CLI-recorded transcript, at enrollment, at every review and
+in status: Opus on every main-thread turn, the policy effort on every turn, and
+a recorded permission mode other than `bypassPermissions`. The guarded push and
+verify helpers keep enforcing their own rules regardless of session settings.
+
 The reviewer uses a read-only source sandbox, narrowly scoped tools, and no
 responsibility for publishing or applying fixes. A filesystem sandbox alone
 does not prevent write-capable external connectors from acting; inspect the
@@ -324,6 +332,36 @@ against the same session or worktree at once. The controller may use an
 existing foreground Claude session for development or own a headless session;
 document which mode is implemented. If setup itself is running in Claude, avoid
 recursively launching a second setup writer.
+
+Both modes are implemented. **Foreground is the default for interactive work**:
+the owner's main Claude conversation is the developer (enrolled with
+`--mode foreground` from that session), so the owner sees the investigation,
+edits, commands and explanations as they happen. A headless developer is used
+only when the owner explicitly asks for unattended work. In foreground:
+
+- The developing session submits each candidate with `review --report`. The
+  command returns the accepted review on stdout (verdict, the reviewer's
+  `decision_rationale` with its `Continuation for Claude` taken unchanged from
+  the authenticated envelope, the public review reference, the reviewed
+  candidate, the structured findings and the next step). The session explains
+  the correction batch to the owner briefly and continues; ordinary rounds need
+  no owner relay. Progress never mixes into that result.
+- Reviewer activity (commands, exit codes, messages; never reasoning) and gate
+  output are written line by line to the enrollment's private live log while
+  they run. Receipts, logs, digests, event files and envelopes are unchanged
+  and remain the evidence. Where the user interface shows tool output only on
+  completion, the session follows the live log with a monitor and the owner
+  can tail the same file.
+- An owner task change is applied from the session with
+  `resume --amend-mission` between its own commands. The running command's
+  locks refuse it meanwhile. Its output carries the full effective task with
+  the amendments digest, and the report binding requires CLI-recorded evidence
+  that this output reached the session. Codex receives the amendments document
+  byte-exact, and the existing freshness rules make older reports, reviews,
+  ready results and handoffs ineligible.
+- Section 9's verification of the session (models, effort, permission mode)
+  replaces the headless permission profile, which is not applied to an
+  interactive session.
 
 Suggested initial limits: five completed review rounds per checkpoint, bounded
 per-process deadlines, and a separately recorded overall mission budget chosen

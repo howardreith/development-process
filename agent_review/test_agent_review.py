@@ -202,7 +202,8 @@ class FakeDeveloper:
 
     def __init__(self, env):
         self.env, self.script, self.calls, self.sessions = env, [], [], set()
-        self.foreground = {"models": [OPUS], "efforts": ["high"]}
+        self.foreground = {"models": [OPUS], "efforts": ["high"], "permission_modes": ["default"]}
+        self.shown = []  # SIMULATED tool results in the foreground session's transcript: (timestamp, text)
 
     @property
     def requested(self):
@@ -213,6 +214,17 @@ class FakeDeveloper:
 
     def session_provenance(self, session_id, since=None):
         return {"found": True, "session_id": session_id, "source": "SIMULATED", **self.foreground}
+
+    def session_shown(self, session_id, needle, since_iso):
+        since = ar.parse_iso(since_iso)
+        for stamp, text in self.shown:
+            if needle in text and (not since or ar.parse_iso(stamp) >= since):
+                return stamp
+        return None
+
+    def show(self, text):
+        """Simulate a command's output reaching the foreground session (a CLI-recorded tool result)."""
+        self.shown.append((ar.now_iso(), text))
 
     def tool_transcript(self, session_id, since_iso):
         return f"# Developer tool transcript (SIMULATED)\n\nsession {session_id} since {since_iso}\n"
@@ -295,7 +307,8 @@ class Env:
         self.mission = root / "mission.md"
         self.mission.write_text(mission_text or "# Fixture mission\n", encoding="utf-8")
         self.gh, self.reviewer, self.developer = FakeGitHub(self), FakeReviewer(), FakeDeveloper(self)
-        self.dir, _ = ar.enroll(self.args(mode=mode, max_rounds=max_rounds), github=self.gh, root=self.wf)
+        self.dir, _ = ar.enroll(self.args(mode=mode, max_rounds=max_rounds), github=self.gh, root=self.wf,
+                                developer=self.developer)
 
     def args(self, **overrides):
         base = dict(project=str(self.wf / "projects" / "test.json"), worktree=str(self.work),
@@ -959,15 +972,15 @@ class TargetValidationTests(Base):
         args = env.args(state_root=str(env.root / "state2"))
         git(env.work, "remote", "set-url", "origin", "https://github.com/someone/else.git")
         with self.assertRaises(ar.UsageError):
-            ar.enroll(args, github=env.gh, root=env.wf)
+            ar.enroll(args, github=env.gh, root=env.wf, developer=env.developer)
         git(env.work, "remote", "set-url", "origin", str(env.origin))
         git(env.work, "checkout", "--quiet", "-b", "feature/not-allowed")
         with self.assertRaises(ar.UsageError):
-            ar.enroll(args, github=env.gh, root=env.wf)
+            ar.enroll(args, github=env.gh, root=env.wf, developer=env.developer)
         git(env.work, "checkout", "--quiet", env.branch)
         env.gh.pr_overrides = {"viewer": "mallory"}
         with self.assertRaises(ar.UsageError):
-            ar.enroll(args, github=env.gh, root=env.wf)
+            ar.enroll(args, github=env.gh, root=env.wf, developer=env.developer)
         env.gh.pr_overrides = {}
         good = env.gh.pr(7)
         self.assertEqual([], ar.pr_identity_problems(good, "owner/repo", 7, env.branch, "master"))
@@ -994,13 +1007,13 @@ class TargetValidationTests(Base):
             os.environ["AGENT_REVIEW_HOME"] = original
         os.environ["AGENT_REVIEW_HOME"] = str(env.root / "other-home")
         with self.assertRaises(ar.UsageError) as refused:
-            ar.enroll(env.args(), github=env.gh, root=env.wf)
+            ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
         self.assertIn("active enrollment", str(refused.exception))
 
     def test_second_enrollment_for_active_branch_is_refused_across_state_roots(self):
         env = self.env
         with self.assertRaises(ar.UsageError) as refused:
-            ar.enroll(env.args(state_root=str(env.root / "elsewhere")), github=env.gh, root=env.wf)
+            ar.enroll(env.args(state_root=str(env.root / "elsewhere")), github=env.gh, root=env.wf, developer=env.developer)
         self.assertIn("active enrollment", str(refused.exception))
 
     def test_configuration_comes_from_the_installed_root_and_owner_policy(self):
@@ -1034,7 +1047,7 @@ class TargetValidationTests(Base):
         env.developer.foreground = {"models": [OPUS], "efforts": ["high", "low"]}
         with self.assertRaises(ar.Stop):
             ctl.accept_report(report(env, "phase-1"))
-        env.developer.foreground = {"models": [OPUS], "efforts": ["high"]}
+        env.developer.foreground = {"models": [OPUS], "efforts": ["high"], "permission_modes": ["default"]}
         self.assertIsNone(ctl.accept_report(report(env, "phase-1")))
         self.assertEqual(FOREGROUND_SESSION, ctl.state["last_report_provenance"]["session_id"])
 
@@ -1529,7 +1542,7 @@ class RoundTwoRegressionTests(Base):
         ctl.verify_inputs()
         self.assertEqual("CANCELLED", ctl.cancel("owner decision"))
         self.assertIn("Workflow — cancelled", env.gh.headings()[-1])
-        folder, state = ar.enroll(env.args(), github=env.gh, root=env.wf)  # the branch can be enrolled again
+        folder, state = ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)  # the branch can be enrolled again
         self.assertNotEqual(state["enrollment_id"], ctl.state["enrollment_id"])
         self.assertTrue((ctl.dir / "state.json").exists())
 
@@ -2048,7 +2061,7 @@ class DevProcRoundOneTests(CrashFixture, Base):
         self.to_finalize(ctl)
         self.assertEqual("AWAITING_OWNER_REVIEW", ctl.finalize())
         ctl.cancel("start over")
-        folder, state = ar.enroll(env.args(), github=env.gh, root=env.wf)
+        folder, state = ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
         self.assertTrue(state["archived"])
         again = ar.Controller(folder, github=env.gh, reviewer=env.reviewer, developer=env.developer,
                               sleep=lambda s: None, workflow_root=env.wf)
@@ -2274,7 +2287,7 @@ class DevProcRoundTwoTests(CrashFixture, Base):
         git(env.work, "rm", "--quiet", first)
         git(env.work, "commit", "--quiet", "-m", "lose a record")
         with self.assertRaises(ar.UsageError) as refused:
-            ar.enroll(env.args(), github=env.gh, root=env.wf)
+            ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
         self.assertIn("integrity", str(refused.exception))
 
     def test_partially_visible_review_is_retired_not_marked_posted(self):
@@ -2489,7 +2502,7 @@ class DevProcRoundThreeTests(CrashFixture, Base):
         ctl = self.handed_off()
         ledger = ar.records_ledger_path("owner/repo", 7)
         ledger.unlink()  # as for an enrollment completed before the ledger existed
-        folder, state = ar.enroll(env.args(), github=env.gh, root=env.wf)
+        folder, state = ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
         self.assertEqual(ctl.state["archived"], state["archived"])
 
     def test_unauthenticated_legacy_findings_block_dispatch(self):
@@ -4073,7 +4086,7 @@ class ListCommandTests(Base):
         saved = os.getcwd()
         self.addCleanup(os.chdir, saved)
         os.chdir(env.root)
-        folder, state = ar.enroll(env.args(state_root="rel-root"), github=env.gh, root=env.wf)
+        folder, state = ar.enroll(env.args(state_root="rel-root"), github=env.gh, root=env.wf, developer=env.developer)
         enrollment = state["enrollment_id"]
         claim = ar.read_json(ar.registry_path("owner/repo", env.branch))
         self.assertEqual(str(env.root / "rel-root" / enrollment), claim["dir"])  # resolved at enrollment (R13-F1)
@@ -4288,7 +4301,7 @@ class EnrollmentOwnershipTests(Base):
         saved = os.getcwd()
         self.addCleanup(os.chdir, saved)
         os.chdir(first)
-        folder, state = ar.enroll(env.args(state_root="relative-state"), github=env.gh, root=env.wf)
+        folder, state = ar.enroll(env.args(state_root="relative-state"), github=env.gh, root=env.wf, developer=env.developer)
         self.assertTrue(folder.is_absolute())
         self.assertEqual((first / "relative-state").resolve(), folder.parent)
         before = self.claims()
@@ -4298,7 +4311,7 @@ class EnrollmentOwnershipTests(Base):
         self.assertEqual(folder, ar.find_enrollment(state["enrollment_id"]))
         self.assertTrue((ar.find_enrollment(state["enrollment_id"]) / "state.json").is_file())
         with self.assertRaises(ar.UsageError) as refused:
-            ar.enroll(env.args(state_root="relative-state"), github=env.gh, root=env.wf)
+            ar.enroll(env.args(state_root="relative-state"), github=env.gh, root=env.wf, developer=env.developer)
         self.assertIn("active enrollment", str(refused.exception))
         self.assertEqual(before, self.claims())  # both original claims intact
         self.assertFalse((second / "relative-state").exists() and any((second / "relative-state").iterdir()))
@@ -4310,7 +4323,7 @@ class EnrollmentOwnershipTests(Base):
         hidden = env.root / "hidden-state.json"
         state_file.rename(hidden)  # absolute claim, prior state unavailable (the developer may still be running)
         with self.assertRaises(ar.UsageError) as refused:
-            ar.enroll(env.args(state_root=str(env.root / "elsewhere")), github=env.gh, root=env.wf)
+            ar.enroll(env.args(state_root=str(env.root / "elsewhere")), github=env.gh, root=env.wf, developer=env.developer)
         self.assertIn("cannot be verified", str(refused.exception))
         self.assertIn("missing", str(refused.exception))
         self.assertEqual(before, self.claims())
@@ -4320,7 +4333,7 @@ class EnrollmentOwnershipTests(Base):
             with self.subTest(label):
                 state_file.write_text(text, encoding="utf-8")
                 with self.assertRaises(ar.UsageError) as refused:
-                    ar.enroll(env.args(state_root=str(env.root / "elsewhere")), github=env.gh, root=env.wf)
+                    ar.enroll(env.args(state_root=str(env.root / "elsewhere")), github=env.gh, root=env.wf, developer=env.developer)
                 self.assertIn("cannot be verified", str(refused.exception))
                 self.assertEqual(before, self.claims())
         hidden.replace(state_file)
@@ -4329,7 +4342,7 @@ class EnrollmentOwnershipTests(Base):
             with self.subTest(label):
                 ar.atomic_write_json(reg, claim)
                 with self.assertRaises(ar.UsageError) as refused:
-                    ar.enroll(env.args(state_root=str(env.root / "elsewhere")), github=env.gh, root=env.wf)
+                    ar.enroll(env.args(state_root=str(env.root / "elsewhere")), github=env.gh, root=env.wf, developer=env.developer)
                 self.assertIn("cannot be verified", str(refused.exception))
         reg.write_bytes(before[reg])
         self.assertEqual(before, self.claims())
@@ -4988,7 +5001,7 @@ class ResumeGuidanceTests(Base):
             ctl = env.controller()
             ctl.verify_inputs()
             ctl.cancel("owner re-enrolls the branch")
-            ar.enroll(env.args(), github=env.gh, root=env.wf)  # a new enrollment now owns the branch
+            ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)  # a new enrollment now owns the branch
             original = {**ar.read_json(state_path), "status": "BLOCKED", "phase": "develop"}  # simulated stale state
             refused(expect="does not name enrollment")
 
@@ -6188,7 +6201,11 @@ class OwnerAmendmentTests(OwnerFlowFixture, Base):
         for label, changes, expect in (  # every simulated state is labeled; the command path is real
                 ("ACTIVE (a run that has not stopped)", {"status": "ACTIVE"}, "safe stopping boundary"),
                 ("cancelled", {"status": "CANCELLED", "phase": "cancelled"}, "not permitted"),
-                ("foreground mode", {"mode": "foreground", "foreground_session": FOREGROUND_SESSION}, "headless"),
+                # foreground amendments are supported between the session's commands (ForegroundDevelopmentTests);
+                # a foreground enrollment outside every supported boundary is still refused
+                ("foreground mode outside a safe boundary", {"mode": "foreground", "foreground_session": FOREGROUND_SESSION,
+                                                             "status": "ACTIVE", "phase": "done"},
+                 "safe stopping boundary"),
                 ("live developer", {"developer": {**original["developer"], "active_pid": os.getpid()}}, "still running"),
                 ("unreturned developer launch", {"developer": unreturned}, "no recorded return"),
                 ("reviewer attempt without an end", {"phase": "review", "rounds": reviewing, "active_round": 1},
@@ -6755,6 +6772,278 @@ class UnitTests(unittest.TestCase):
             ar.check_policy(stale)
         for name in ("black-tentacles", "agent-review-setup"):
             self.assertEqual("final", ar.load_plan(name)["checkpoints"][-1]["type"])
+
+
+GATE_LIVE_SCRIPT = """import pathlib, sys, time
+marker = 'GATE-LIVE-' + 'MARKER-7f3'
+print(marker, flush=True)
+logs = pathlib.Path(sys.argv[1]).parent / 'state'
+deadline, seen = time.time() + 20, False
+while time.time() < deadline and not seen:
+    seen = any(('| ' + marker) in p.read_text(encoding='utf-8') for p in logs.glob('*/live.log'))
+    time.sleep(0.05)
+print('seen' if seen else 'not-seen', flush=True)
+print('stderr-line', file=sys.stderr, flush=True)
+sys.exit(0 if seen else 3)
+"""
+
+
+class LiveReviewer(FakeReviewer):
+    """Simulated Codex that streams one command event into its events file, then waits (bounded) until that
+    activity is visible in the enrollment's live log before it exits. Records whether it was seen while running."""
+
+    def __init__(self, live_path):
+        super().__init__()
+        self.live_path, self.seen_while_running = Path(live_path), []
+
+    def run(self, prompt, workdir, schema, result_path, events_path, *args, **kwargs):
+        with open(events_path, "a", encoding="utf-8") as out:  # SIMULATED `codex exec --json` event
+            out.write(json.dumps({"type": "item.started", "item": {"type": "command_execution",
+                                                                   "command": "rg -n REVIEW-LIVE-MARKER feature.txt"}})
+                      + "\n")
+            out.write(json.dumps({"type": "item.reasoning", "item": {"type": "reasoning", "text": "PRIVATE-THOUGHT"}})
+                      + "\n")
+        deadline, seen = time.time() + 10, False
+        while time.time() < deadline and not seen:
+            seen = self.live_path.is_file() and \
+                "Codex ▸ $ rg -n REVIEW-LIVE-MARKER feature.txt" in self.live_path.read_text(encoding="utf-8")
+            time.sleep(0.05)
+        self.seen_while_running.append(seen)
+        return super().run(prompt, workdir, schema, result_path, events_path, *args, **kwargs)
+
+
+class ForegroundDevelopmentTests(OwnerFlowFixture, Base):
+    """Foreground (main-conversation) development: the enrolled interactive session develops, `review --report`
+    returns the accepted review for it to continue from, reviewer activity and gate output are readable while they
+    run, owner amendments are applied from the session and reach both roles, and the session's recorded model,
+    effort and permission mode are verified. Claude, Codex and GitHub are the labeled simulations above."""
+    mode = "foreground"
+    A1 = "Owner amendment (simulated): also add docs/usage.md describing the feature.\n"
+
+    def fg_env(self, **cfg):
+        plan = {"schema_version": "agent-review.plan.v1", "mission_id": "fixture", "title": "Fixture mission",
+                "checkpoints": [{"id": "final", "type": "final", "scope": "s", "exit_conditions": ["e"]}]}
+        env = Env("foreground", plan=plan, cfg_overrides=cfg or None)
+        self.addCleanup(env.cleanup)
+        return env
+
+    def review_cmd(self, env, checkpoint="final", dispositions=(), ctl=None):
+        """The foreground `review --report FILE` command path; returns (exit code, stdout JSON, stderr text)."""
+        path = env.root / f"report-{uuid.uuid4().hex[:6]}.json"
+        path.write_text(json.dumps(report(env, checkpoint, dispositions)), encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+            code = ar.review_command(ctl or env.controller(), str(path))
+        return code, json.loads(out.getvalue()), err.getvalue()  # stdout is the result alone: it parses as JSON
+
+    def finalize_cmd(self, env):
+        ctl = env.controller()
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            code = ar.guarded(ctl, "finalize", ctl.finalize, honor_stop=True)
+        return code, json.loads(out.getvalue())
+
+    def resume(self, ctl, *args, **kw):
+        with contextlib.redirect_stderr(io.StringIO()):
+            return super().resume(ctl, *args, **kw)
+
+    def live_text(self, env):
+        return (env.dir / "live.log").read_text(encoding="utf-8")
+
+    def test_the_session_develops_reviews_and_continues_from_the_returned_review_to_the_handoff(self):
+        env = self.fg_env()
+        head = env.commit("feature.txt", "v2\n", "feature v2")
+        env.push()
+        env.reviewer.script = [{"decision": "changes_required", "findings": [finding("R1-F1")],  # simulated Codex
+                                "override": {"decision_rationale": self.CONTINUATION}},
+                               {"decision": "ready_for_owner_review", "assessments": [("R1-F1", "fix_verified")]}]
+        code, out, err = self.review_cmd(env)
+        self.assertEqual((ar.EXIT_OK, "changes_required"), (code, out["result"]))
+        state = self.state(env)
+        r1, review = state["rounds"][0], out["review"]
+        self.assertEqual((1, "changes_required", head), (review["round"], review["decision"], review["candidate"]))
+        self.assertEqual(self.CONTINUATION, review["continuation"])  # the reviewer's text, unchanged
+        self.assertEqual([p["url"] for p in r1["published"]], review["review_reference"])
+        self.assertTrue(review["review_reference"])
+        self.assertEqual(r1["envelope_path"], review["structured_review"])
+        self.assertEqual((["R1-F1"], ["R1-F1"]), ([f["id"] for f in review["findings"]], review["pending_findings"]))
+        self.assertIn("dispose of every pending finding", review["next"])
+        self.assertEqual(str(env.dir / "live.log"), out["live_log"])
+        self.assertNotIn("review round 1 attempt 1", json.dumps(out))  # progress never mixes into the result
+        live = self.live_text(env)
+        self.assertIn(f"review round 1 accepted on {head[:10]}: changes_required; pending findings: R1-F1", live)
+        self.assertIn("DISTINCTIVE-CONTINUATION-5c1e", live)  # the final review text is readable too
+        # the same session corrects the candidate and submits it again; no owner relay is involved
+        fix = env.commit("feature.txt", "rewritten\n", "rewrite feature.txt (R1-F1)")
+        env.push()
+        code, out, _ = self.review_cmd(env, dispositions=[fixed("R1-F1", fix)])
+        self.assertEqual((ar.EXIT_OK, "ready_for_owner_review"), (code, out["result"]))
+        self.assertEqual((2, fix, []), (out["review"]["round"], out["review"]["candidate"],
+                                        out["review"]["pending_findings"]))
+        self.assertIn("Run `finalize`", out["review"]["next"])
+        code, out = self.finalize_cmd(env)
+        self.assertEqual((ar.EXIT_OK, "AWAITING_OWNER_REVIEW"), (code, out["status"]))
+        self.assertEqual({"final": 2}, self.state(env)["rounds_completed"])
+        expected = ["Claude Opus — review request — round 1", "Codex GPT-6.2 Astra — review — round 1",
+                    "Claude Opus — finding dispositions — round 1", "Claude Opus — review request — round 2",
+                    "Codex GPT-6.2 Astra — review — round 2", "Workflow — awaiting owner review"]
+        headings = env.gh.headings()
+        self.assertEqual(len(expected), len(headings), headings)
+        for want, got in zip(expected, headings):
+            self.assertIn(want, got)
+        self.assertTrue(env.controller().status(remote=True)["handoff_current"])
+
+    def test_reviewer_activity_is_readable_in_the_live_log_before_the_reviewer_exits(self):
+        env = self.fg_env()
+        env.reviewer = LiveReviewer(env.dir / "live.log")
+        env.reviewer.script = [{"decision": "ready_for_owner_review"}]
+        env.commit("feature.txt", "v2\n", "feature v2")
+        env.push()
+        code, out, _ = self.review_cmd(env)
+        self.assertEqual((ar.EXIT_OK, "ready_for_owner_review"), (code, out["result"]))
+        self.assertEqual([True], env.reviewer.seen_while_running)  # visible while the simulated reviewer ran
+        live = self.live_text(env)
+        self.assertNotIn("PRIVATE-THOUGHT", live)  # reasoning items are never shown
+        self.assertIn("review round 1 attempt 1 ended: valid result, decision ready_for_owner_review", live)
+        events = (env.dir / "rounds" / "r01" / "events-1.jsonl").read_text(encoding="utf-8")
+        self.assertIn("thread.started", events)  # the event file stays the private record
+
+    def test_gate_output_is_readable_before_the_gate_finishes_and_the_receipt_is_unchanged(self):
+        env = self.fg_env(gates={"unit": {"argv": [sys.executable, "-u", "{repo_root}/../gate_live.py", "{repo_root}"],
+                                          "timeout_minutes": 2}}, required_gates=["unit"])
+        (env.root / "gate_live.py").write_text(GATE_LIVE_SCRIPT, encoding="utf-8")
+        ctl = env.controller()
+        with contextlib.redirect_stderr(io.StringIO()):
+            receipt = ctl.run_gate("unit")
+        # the gate exits 0 only if it saw its own first line in the live log while it was still running
+        self.assertEqual((0, True), (receipt["exit_code"], receipt["passed"]), receipt.get("output_tail"))
+        log = ctl.dir / "evidence" / receipt["log"]
+        self.assertEqual("GATE-LIVE-MARKER-7f3\nseen\nstderr-line\n", log.read_text(encoding="utf-8"))  # stdout, then stderr
+        self.assertEqual(ar.sha256_file(log), receipt["log_sha256"])
+        live = self.live_text(env)
+        for line in ("gate unit | GATE-LIVE-MARKER-7f3", "gate unit | seen", "gate unit | stderr-line",
+                     f"gate unit finished on {receipt['candidate'][:10]}: exit 0"):
+            self.assertIn(line, live)
+        self.assertEqual([], ctl.missing_gates(receipt["candidate"]))  # still a valid receipt for readiness
+
+    def test_an_owner_amendment_from_the_session_reaches_both_roles_and_stale_results_never_satisfy_readiness(self):
+        env = self.fg_env()
+        mission = env.mission.read_bytes()
+        enrollment = self.state(env)["enrollment_id"]
+        head = env.commit("feature.txt", "v2\n", "feature v2")
+        env.push()
+        pending = self.doc(env, "owner-update-1.md", self.A1)  # saved as pending, outside the worktree
+        with self.subTest("refused while a review command holds the writer lock"):
+            before = self.state_bytes(env)
+            with env.controller().lock("review"):
+                with self.assertRaises(ar.UsageError):
+                    self.resume(env.controller(), "apply owner update", amendment=pending)
+            self.assertEqual(before, self.state_bytes(env))
+            self.assertFalse((env.dir / "amendments").exists())
+        with self.subTest("refused while a push/verify helper holds the helper lock"):
+            before = self.state_bytes(env)
+            with env.controller().helper_lock("verify"):
+                with self.assertRaises(ar.UsageError):
+                    self.resume(env.controller(), "apply owner update", amendment=pending)
+            self.assertEqual(before, self.state_bytes(env))
+        env.reviewer.script = [{"decision": "ready_for_owner_review"}]
+        self.assertEqual("ready_for_owner_review", self.review_cmd(env)[1]["result"])
+        self.assertEqual("AWAITING_OWNER_REVIEW", self.finalize_cmd(env)[1]["status"])
+        before = self.state(env)
+        old_ready, reviews = before["ready_review"], len(env.reviewer.calls)
+        head = before["handoff"]["A"]  # the branch head at the handoff: source plus its archive commit
+        # applied at the existing owner-review handoff of the same enrollment
+        code, out = self.resume(env.controller(), "owner amends the task", amendment=pending)
+        self.assertEqual(ar.EXIT_OK, code)
+        self.assertEqual("ACTIVE (foreground: continue with `review --report`)", out["result"])
+        task = out["effective_task"]
+        data, rec = (env.dir / "amendments" / f"{task['amendments']['sha256']}.md").read_bytes(), \
+            self.state(env)["amendments"]["revisions"][-1]
+        self.assertEqual((1, rec["sha256"]), (task["amendments"]["revision"], task["amendments"]["sha256"]))
+        self.assertEqual(data.decode("utf-8"), task["amendments"]["text"])
+        self.assertEqual(head, git(env.origin, "rev-parse", f"refs/heads/{env.branch}"))  # unchanged source
+        self.assertIn(self.A1, task["amendments"]["text"])
+        self.assertEqual(before["mission"]["sha256"], task["mission_sha256"])  # the original mission is unchanged
+        state = self.state(env)
+        self.assertEqual((None, None, "develop", "ACTIVE"), (state["ready_review"], state["handoff"], state["phase"],
+                                                             state["status"]))
+        self.assertEqual(before["rounds_completed"], state["rounds_completed"])  # nothing refunded or charged
+        self.assertEqual(reviews, len(env.reviewer.calls))  # no obsolete review was launched
+        self.assertEqual(1, len(self.headings_with(env, "Workflow — reopened")))
+        self.assertIsNone(env.controller().status()["amendments"]["selected"]["shown_in_foreground_session_at"])
+        with self.subTest("an earlier ready result cannot satisfy the amended task"):
+            stale = self.state(env)
+            stale.update(ready_review=old_ready, phase="finalize", last_report_for=old_ready["H"])  # labeled tamper
+            ar.atomic_write_json(env.dir / "state.json", stale)
+            with self.assertRaises(ar.Stop) as stop:
+                env.controller().finalize()
+            self.assertIn("owner amendments changed", stop.exception.reason)
+            restored = self.state(env)
+            restored.update(status="ACTIVE", phase="develop")  # labeled: the stop above bypassed the command path
+            ar.atomic_write_json(env.dir / "state.json", restored)
+        with self.subTest("a report before the amended task was shown to the session is refused"):
+            with self.assertRaises(ar.UsageError) as refused:
+                self.review_cmd(env)
+            self.assertIn("has not been displayed in this session", str(refused.exception))
+            self.assertEqual(reviews, len(env.reviewer.calls))
+        with contextlib.redirect_stdout(io.StringIO()) as shown:  # the read-only re-display path
+            self.assertEqual(ar.EXIT_OK, ar.main(["status", "--enrollment", enrollment, "--instructions"], root=env.wf))
+        self.assertEqual(task, json.loads(shown.getvalue())["effective_task"])
+        env.developer.show(json.dumps(out))  # SIMULATED: the resume output reached the session's transcript
+        self.assertTrue(env.controller().status()["amendments"]["selected"]["shown_in_foreground_session_at"])
+        # a fresh report on the unchanged source is reviewed under the amended task
+        env.reviewer.script += [{"decision": "ready_for_owner_review"}]
+        code, out, _ = self.review_cmd(env)
+        self.assertEqual((ar.EXIT_OK, "ready_for_owner_review"), (code, out["result"]))
+        changed = git(env.work, "diff", "--name-only", head, out["review"]["candidate"]).splitlines()
+        self.assertTrue(all(p.startswith("docs/agent-reviews/pr-7/") for p in changed), changed)  # source unchanged
+        self.assertEqual(1, out["review"]["amendment_revision"])
+        call = env.reviewer.calls[-1]
+        self.assertEqual((data, mission), (call["amendments"], call["mission"]))  # Codex got both, byte-exact
+        state = self.state(env)
+        self.assertEqual({"amendment_revision": 1, "amendment_sha256": rec["sha256"]}, state["last_report_amendments"])
+        self.assertEqual("AWAITING_OWNER_REVIEW", self.finalize_cmd(env)[1]["status"])
+        state = self.state(env)
+        self.assertEqual((1, rec["sha256"]), (state["ready_review"]["amendment_revision"],
+                                              state["ready_review"]["amendment_sha256"]))
+        self.assertEqual({"final": 2}, state["rounds_completed"])
+        self.assertEqual(2, len(self.headings_with(env, "Workflow — awaiting owner review")))
+        self.assertTrue(env.controller().status(remote=True)["handoff_current"])
+
+    def test_the_sessions_recorded_model_effort_and_permission_mode_are_verified(self):
+        env = self.fg_env()
+        states = sorted(p.name for p in (env.root / "state").iterdir())
+        comments = len(env.gh.comments_list)
+        good = dict(env.developer.foreground)
+        for label, prov, expect in (
+                ("permissions skipped", {**good, "permission_modes": ["default", "bypassPermissions"]},
+                 "skip permission checks"),
+                ("permission mode not recorded", {**good, "permission_modes": []}, "permission mode is not recorded"),
+                ("another model", {**good, "models": [OPUS, "claude-sonnet-5-5"]}, "sonnet"),
+                ("another effort", {**good, "efforts": ["high", "low"]}, "effort")):
+            with self.subTest(label):
+                env.developer.foreground = prov
+                with self.assertRaises(ar.UsageError) as refused:  # before any claim, state or PR is touched
+                    ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
+                self.assertIn("foreground enrollment refused; nothing was created", str(refused.exception))
+                self.assertIn(expect, str(refused.exception))
+                self.assertEqual(states, sorted(p.name for p in (env.root / "state").iterdir()))
+                self.assertEqual(comments, len(env.gh.comments_list))
+                status = env.controller().status()["foreground_session"]
+                self.assertTrue(any(expect in p for p in status["problems"]), status)
+        env.developer.foreground = good
+        status = env.controller().status()["foreground_session"]
+        self.assertEqual(([], ["default"]), (status["problems"], status["permission_modes"]))
+        self.assertIn("headless permission profile is not applied", status["permissions"])
+        env.commit("feature.txt", "v2\n", "feature v2")
+        env.push()
+        env.developer.foreground = {**good, "permission_modes": ["bypassPermissions"]}
+        code, out = None, None
+        with contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()):
+            path = env.root / "report.json"
+            path.write_text(json.dumps(report(env, "final")), encoding="utf-8")
+            code = ar.review_command(env.controller(), str(path))
+        self.assertEqual(ar.EXIT_BLOCKED, code)
+        self.assertIn("skip permission checks", json.loads(stdout.getvalue())["reason"])
+        self.assertEqual([], env.reviewer.calls)  # no review of work from an unverified session
 
 
 if __name__ == "__main__":

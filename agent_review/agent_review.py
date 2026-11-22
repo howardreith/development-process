@@ -24,6 +24,7 @@ import stat
 import string
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -115,6 +116,15 @@ class CommandError(Exception):
 
 def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_iso(value):
+    """An aware UTC datetime from an ISO-8601 timestamp (with or without fractional seconds); None if unparsable."""
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -266,6 +276,155 @@ def sanitize(text: str, strict: bool = True):
     for variant in {home, home.replace("\\", "/"), home.replace("\\", "\\\\")}:
         text = re.sub(re.escape(variant), "~", text, flags=re.I)
     return text, count
+
+
+class LiveLog:
+    """Readable progress for people and for the interactive developer: one line per observable action, appended to
+    the enrollment's private `live.log` (flushed per line, so `Get-Content -Wait` / `tail -f` shows it while a
+    reviewer or gate is still running) and echoed to stderr when stderr is an interactive terminal (tools that show
+    output only on completion, and in-process callers, read the file instead). It is never evidence: gate receipts
+    and logs, reviewer event files, envelopes and state stay the records. Lines are sanitized like local model
+    inputs; reasoning content is never written."""
+
+    def __init__(self, path, echo=None):
+        self.path, self.echo = Path(path), echo
+        self._lock = threading.Lock()
+
+    def line(self, text):
+        text, _ = sanitize(str(text), strict=False)
+        stamp = dt.datetime.now(dt.timezone.utc).strftime("%H:%M:%SZ")
+        rows = [f"[{stamp}] {row}" for row in (text.rstrip("\n").split("\n") or [""])]
+        with self._lock:
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with open(self.path, "a", encoding="utf-8") as out:
+                    out.write("\n".join(rows) + "\n")
+            except OSError:
+                pass  # progress is best effort; it never decides an outcome
+            echo = self.echo if self.echo is not None else getattr(sys.stderr, "isatty", lambda: False)()
+            if echo:
+                try:
+                    sys.stderr.write("\n".join(rows) + "\n")
+                    sys.stderr.flush()
+                except (OSError, ValueError, UnicodeEncodeError):
+                    pass
+
+
+def one_line(text, limit=240) -> str:
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def render_codex_event(event) -> list:
+    """Observable reviewer activity from one `codex exec --json` event: commands run, their exit codes and the
+    reviewer's messages. Reasoning items are not shown."""
+    if not isinstance(event, dict):
+        return []
+    kind, item = event.get("type"), event.get("item") if isinstance(event.get("item"), dict) else {}
+    if kind == "item.started" and item.get("type") == "command_execution":
+        return ["Codex ▸ $ " + one_line(item.get("command"), 300)]
+    if kind == "item.completed" and item.get("type") == "command_execution":
+        return [f"   ↳ exit {item.get('exit_code')}: " + one_line(item.get("aggregated_output"), 200)]
+    if kind == "item.completed" and item.get("type") == "agent_message":
+        return ["Codex: " + one_line(item.get("text"), 600)]
+    if kind == "turn.completed":
+        usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+        return [f"Codex turn completed (input {usage.get('input_tokens')}, output {usage.get('output_tokens')} tokens)"]
+    if kind in ("turn.failed", "error"):
+        return ["Codex error: " + one_line(event.get("message") or event.get("error"), 300)]
+    return []
+
+
+class EventTail(threading.Thread):
+    """Follows a JSON-lines file another process is writing and renders each complete line to a LiveLog. `finish()`
+    drains what remains; malformed lines are skipped (the file itself stays the record)."""
+
+    def __init__(self, path, live, render, interval=0.5):
+        super().__init__(daemon=True)
+        self.path, self.live, self.render, self.interval = Path(path), live, render, interval
+        self._stop, self._offset, self._partial = threading.Event(), 0, b""
+
+    def _drain(self):
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(self._offset)
+                data = f.read()
+        except OSError:
+            return
+        self._offset += len(data)
+        *complete, self._partial = (self._partial + data).split(b"\n")
+        for raw in complete:
+            try:
+                rows = self.render(json.loads(raw.decode("utf-8", "replace")))
+            except ValueError:
+                continue
+            for row in rows:
+                self.live.line(row)
+
+    def run(self):
+        while not self._stop.wait(self.interval):
+            self._drain()
+
+    def finish(self):
+        self._stop.set()
+        self.join(timeout=5)
+        self._drain()
+
+
+def stream_process(argv, cwd, timeout_s, on_line):
+    """Run argv with stdout and stderr read concurrently, calling on_line(text) for each line as it arrives. Returns
+    (exit code or None on timeout, stdout text, stderr text): the same separate streams `run` captures, so a receipt
+    built from them is unchanged. On timeout the process tree is terminated."""
+    proc = subprocess.Popen([str(a) for a in argv], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace")
+    chunks = {"out": [], "err": []}
+
+    def pump(stream, key):
+        for row in iter(stream.readline, ""):
+            chunks[key].append(row)
+            on_line(row.rstrip("\r\n"))
+        stream.close()
+    readers = [threading.Thread(target=pump, args=(proc.stdout, "out"), daemon=True),
+               threading.Thread(target=pump, args=(proc.stderr, "err"), daemon=True)]
+    for reader in readers:
+        reader.start()
+    try:
+        proc.wait(timeout=timeout_s)
+        code = proc.returncode
+    except subprocess.TimeoutExpired:
+        kill_tree(proc)
+        proc.wait()
+        code = None
+    for reader in readers:
+        reader.join(timeout=10)
+    return code, "".join(chunks["out"]), "".join(chunks["err"])
+
+
+# A foreground session runs under the owner's own Claude Code settings and interactive approvals: the enrollment's
+# hash-pinned headless permission profile is NOT applied to it. What the controller verifies instead, from the CLI-
+# recorded session transcript, is the model and effort of every main-thread turn and the recorded permission mode; a
+# mode that skips permission checks entirely is refused. The guarded push and verify helpers keep enforcing their own
+# rules (branch, clean tree, approved remote, gate definitions) whatever the session's settings are.
+FOREGROUND_REFUSED_PERMISSION_MODES = ("bypassPermissions",)
+
+
+def foreground_session_problems(prov, dev_cfg):
+    """Why a foreground session's CLI-recorded provenance does not match the owner policy ([] when it does)."""
+    problems = []
+    if not prov.get("found"):
+        problems.append(f"the transcript of Claude session {prov.get('session_id')} was not found")
+    models = prov.get("models") or []
+    if not models or any(not re.match(dev_cfg["allowed_model_pattern"], m) for m in models):
+        problems.append(f"foreground session models {models} are not all {dev_cfg['model']}")
+    if prov.get("efforts") != [dev_cfg["effort"]]:
+        problems.append(f"foreground session effort {prov.get('efforts')} != {dev_cfg['effort']}")
+    modes = prov.get("permission_modes") or []
+    if not modes:
+        problems.append("the foreground session's permission mode is not recorded in its transcript")
+    elif any(m in FOREGROUND_REFUSED_PERMISSION_MODES for m in modes):
+        problems.append(f"the foreground session ran with permission mode(s) {modes}, which skip permission checks; "
+                        "use a session with normal permission prompts (or auto mode)")
+    return problems
 
 
 def normalize_body(text: str) -> str:
@@ -859,8 +1018,9 @@ class ClaudeDeveloper:
 
     def session_provenance(self, session_id, since=None, after=None):
         """CLI-recorded models (main thread) and effort settings for a session transcript; with since (an ISO
-        prefix), only records of the current invocation count."""
-        models, efforts, paths = set(), set(), self._transcripts(session_id)
+        prefix), only records of the current invocation count. Also the permission modes the CLI recorded for the
+        session (`permission-mode` records and each user turn's `permissionMode`)."""
+        models, efforts, modes, paths = set(), set(), set(), self._transcripts(session_id)
         for path in paths:
             data = path.read_bytes()
             if after is not None:
@@ -881,8 +1041,34 @@ class ClaudeDeveloper:
                     model = (obj.get("message") or {}).get("model")
                     if model and model != "<synthetic>":
                         models.add(model)
+                if obj.get("type") in ("permission-mode", "user") and not obj.get("isSidechain") and \
+                        isinstance(obj.get("permissionMode"), str):
+                    modes.add(obj["permissionMode"])
         return {"found": bool(paths), "session_id": session_id, "models": sorted(models), "efforts": sorted(efforts),
+                "permission_modes": sorted(modes),
                 "source": "Claude Code session transcript (CLI-recorded; not model-authored)"}
+
+    def session_shown(self, session_id, needle, since_iso):
+        """When (transcript timestamp) a tool result in the session's main thread first contained `needle`, at or
+        after `since_iso`; None if never. CLI-recorded evidence that a command's output reached the session."""
+        since = parse_iso(since_iso)
+        for path in self._transcripts(session_id):
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if needle not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(obj, dict) or obj.get("type") != "user" or obj.get("isSidechain"):
+                    continue
+                stamp = parse_iso(obj.get("timestamp"))
+                if not stamp or (since and stamp < since):
+                    continue
+                for item in (obj.get("message") or {}).get("content") or []:
+                    if isinstance(item, dict) and item.get("type") == "tool_result" and needle in json.dumps(item):
+                        return obj.get("timestamp")
+        return None
 
     def tool_transcript(self, session_id, since_iso, limit_chars=150000):
         """CLI-recorded shell commands and their outputs from the developer session since ``since_iso``.
@@ -1113,6 +1299,8 @@ GUIDANCE_SCOPE = ("It supplies the owner's approach within the enrolled mission.
 AMENDMENTS_MAX_BYTES = 256 * 1024
 AMENDMENT_STATES = {("BLOCKED", "develop"), ("PAUSED", "develop"), ("BLOCKED", "review"), ("PAUSED", "review"),
                     ("BLOCKED", "finalize"), ("PAUSED", "finalize"), ("AWAITING_OWNER_REVIEW", "done")}
+# a foreground enrollment between the interactive session's own commands (see amendment_refusal)
+FOREGROUND_AMENDMENT_STATES = {("ACTIVE", "develop"), ("ACTIVE", "review"), ("ACTIVE", "finalize")}
 AMENDMENTS_HEADER = ("# Owner amendments to the mission\n\n"
                      "Cumulative record kept by the agent-review controller. Each owner message below was applied by the "
                      "owner through `resume --amend-mission` and is preserved verbatim, in order, between its labeled "
@@ -1230,6 +1418,17 @@ class Controller:
                                               self.wf / REPORT_SCHEMA_FILE, schema_text=self.files[REPORT_SCHEMA_FILE])
             self._developer.helper_token = self.state["developer"].get("helper_token")
         return self._developer
+
+    @property
+    def live_path(self):
+        return self.dir / "live.log"
+
+    @property
+    def live(self):
+        """Readable progress (reviewer activity, gate output, outcomes); never evidence. See LiveLog."""
+        if getattr(self, "_live", None) is None:
+            self._live = LiveLog(self.live_path)
+        return self._live
 
     # -- state ---------------------------------------------------------------
     def save(self):
@@ -1562,6 +1761,77 @@ class Controller:
                 f"----- BEGIN REVIEWER CONTINUATION (round {rnd['round']}, response sha256 "
                 f"{rnd.get('response_sha256')}) -----\n{rationale}\n----- END REVIEWER CONTINUATION -----\n")
 
+    def effective_task(self):
+        """The effective task as delivered to a foreground developer: the enrolled mission (path and hash; its text is
+        the agreed baseline) and the selected cumulative owner amendments in full, under their revision and digest.
+        The digest identifies the captured bytes; output transport may adjust line endings."""
+        rec, text = self.require_guidance(self.current_binding("amendments"), "amendments")
+        mission = self.state["mission"]
+        return {"mission": mission.get("path"), "mission_sha256": mission.get("sha256"),
+                "mission_snapshot": mission.get("snapshot"),
+                "amendments": None if not rec else {
+                    "revision": rec["revision"], "sha256": rec["sha256"], "captured_at": rec.get("captured_at"),
+                    "precedence": "The original mission plus these owner amendments in order. Later amendments "
+                                  "supersede conflicting earlier requirements; requirements they do not change still "
+                                  "apply. Amendments never change models, permissions, required gates or budgets.",
+                    "text": text}}
+
+    def foreground_amendments_binding(self):
+        """((revision, sha256), None) for a foreground report under the selected amendments, or ((None, None), error).
+        The binding records that the amended task reached the developer, so it requires CLI-recorded evidence: a tool
+        result in the enrolled session's transcript, at or after the capture, containing the selection's digest
+        (printed with the full text by `resume --amend-mission` and `status --instructions`)."""
+        current = self.current_binding("amendments")
+        if current == (None, None):
+            return current, None
+        rec = self.guidance_record("amendments")
+        shown = self.developer.session_shown(self.state["foreground_session"], rec["sha256"], rec.get("captured_at"))
+        if not shown:
+            return (None, None), (
+                f"the amended task (owner amendment revision {rec['revision']}, sha256 {rec['sha256']}) has not been "
+                f"displayed in this session since it was applied at {rec.get('captured_at')}; run `status --enrollment "
+                f"{self.state['enrollment_id']} --instructions`, read the amendments, then submit the report again")
+        return current, None
+
+    def review_outcome(self):
+        """The latest accepted review, for the foreground developer to continue from: verdict, the reviewer's
+        `decision_rationale` (its continuation) taken unchanged from the authenticated, validated envelope, the public
+        review reference, the reviewed candidate, the structured findings and the next step. None before any
+        accepted round. A missing or altered envelope is reported, never reconstructed."""
+        accepted = [r for r in self.state.get("rounds", []) if r.get("status") == "accepted"]
+        if not accepted:
+            return None
+        rnd = accepted[-1]
+        path = Path(rnd.get("envelope_path") or "")
+        raw = path.read_bytes() if rnd.get("envelope_path") and path.is_file() else None
+        out = {"round": rnd["round"], "checkpoint": rnd.get("checkpoint_id"), "decision": rnd.get("decision"),
+               "candidate": rnd["H"], "review_reference": [p["url"] for p in rnd.get("published") or [] if p.get("url")],
+               "structured_review": rnd.get("envelope_path"), "pending_findings": sorted(self.state.get("pending_findings", [])),
+               **dict(zip(("guidance_revision", "amendment_revision"),
+                          (b[0] for b in self.instructions_of(rnd))))}
+        if raw is None or sha256_bytes(raw) != rnd.get("envelope_sha256"):
+            out["problem"] = ("the accepted review envelope is missing or altered in private state; restore the "
+                              "preserved result under supervision (its digest is recorded in the round)")
+            return out
+        result = json.loads(raw)["result"]
+        out["continuation"] = result.get("decision_rationale")
+        out["findings"] = [{k: f.get(k) for k in ("id", "priority", "category", "blocks_readiness", "title",
+                                                   "requested_correction", "requested_evidence", "location")}
+                           for f in result.get("findings") or []]
+        out["prior_finding_assessments"] = result.get("prior_finding_assessments") or []
+        phase, decision = self.state.get("phase"), rnd.get("decision")
+        if decision == "changes_required":
+            out["next"] = ("Address the continuation: dispose of every pending finding (fixed with commits, or rebutted "
+                           "on the evidence), commit, `push`, run the required gates with `verify`, then submit "
+                           "`review --report <file>` for the corrected candidate.")
+        elif phase == "finalize":
+            out["next"] = "Run `finalize` to archive the records and post the owner-review handoff."
+        elif phase == "done":
+            out["next"] = "Owner review: the handoff is recorded."
+        else:
+            out["next"] = "Continue with the next checkpoint, then submit `review --report <file>`."
+        return out
+
     def guidance_target_problem(self, expected_id=None):
         """The owner-selected enrollment ID, the loaded state, its directory and both ownership claims must all name
         the same enrollment (a misdirected registry entry must not steer guidance to another enrollment)."""
@@ -1767,11 +2037,13 @@ class Controller:
         delivery of uncertain outcome. A stopped round, validated result, ready result or handoff is superseded by
         the application itself; no model is launched to reach develop. Returns the cumulative document to capture."""
         s, option = self.state, "--amend-mission"
-        if s["mode"] != "headless":
-            raise UsageError(f"{option} is supported only for headless enrollments; this enrollment uses foreground mode "
-                             "(give the interactive session the instruction directly). Nothing was captured or changed")
         stopped_handoff = s["phase"] == "done" and s["status"] in GUIDANCE_STATUSES and bool(s.get("handoff"))
-        if (s["status"], s["phase"]) not in AMENDMENT_STATES and not stopped_handoff:
+        # foreground: the enrolled interactive session is the developer and runs every command itself, so between its
+        # commands an ACTIVE enrollment is idle. A running `review`/`finalize` holds the writer lock (this command
+        # cannot even be admitted), a running push/verify helper holds the helper lock (checked by admission), and an
+        # unended reviewer attempt is refused below.
+        foreground_idle = s["mode"] == "foreground" and (s["status"], s["phase"]) in FOREGROUND_AMENDMENT_STATES
+        if (s["status"], s["phase"]) not in AMENDMENT_STATES and not stopped_handoff and not foreground_idle:
             raise UsageError(f"{option} is accepted only at a safe stopping boundary: a BLOCKED or PAUSED enrollment in "
                              "the develop, review or finalize phase, or an owner-review handoff (AWAITING_OWNER_REVIEW, "
                              "or stopped after it with the handoff still recorded); this enrollment is "
@@ -2262,12 +2534,9 @@ class Controller:
             raise UsageError(f"foreground reports must come from the enrolled Claude session {expected}; "
                              f"this process reports session {current}")
         prov = self.developer.session_provenance(expected)
-        allowed = re.compile(self.cfg["developer"]["allowed_model_pattern"])
-        if not prov["found"] or not prov["models"] or any(not allowed.match(m) for m in prov["models"]):
-            raise Stop("BLOCKED", f"foreground session models {prov['models']} are not all "
-                                  f"{self.cfg['developer']['model']} (transcript found: {prov['found']})")
-        if prov["efforts"] != [self.cfg["developer"]["effort"]]:
-            raise Stop("BLOCKED", f"foreground session effort {prov['efforts']} != {self.cfg['developer']['effort']}")
+        problems = foreground_session_problems(prov, self.cfg["developer"])
+        if problems:
+            raise Stop("BLOCKED", "; ".join(problems) + f" (transcript found: {prov.get('found')})")
         return prov
 
     def accept_report(self, report):
@@ -2286,6 +2555,10 @@ class Controller:
             if self.state["mode"] == "headless" else (None, None)
         provenance = self.verify_foreground_developer() if self.state["mode"] == "foreground" else \
             (self.state["developer"].get("log") or [{}])[-1]
+        if self.state["mode"] == "foreground":
+            report_amendments, error = self.foreground_amendments_binding()
+            if error:
+                return error
         # every stored report keeps the instructions its returning invocation was given (history, never freshness)
         bindings = {"guidance_revision": report_binding[0], "guidance_sha256": report_binding[1],
                     "amendment_revision": report_amendments[0], "amendment_sha256": report_amendments[1]}
@@ -2515,14 +2788,22 @@ class Controller:
             def on_start(pid):
                 attempt["pid"] = pid  # the process-start record: from here on the attempt counts as launched
                 self.save()
+            events = rnd_dir / f"events-{n}.jsonl"
+            req = reviewer.requested
+            self.live.line(f"review round {rnd['round']} attempt {n}: Codex {req.get('model')}/{req.get('effort')} "
+                           f"(read-only) is reviewing candidate {short(rnd['H'])}; its activity follows")
+            tail = EventTail(events, self.live, render_codex_event)
+            tail.start()
             try:
-                info = reviewer.run(prompt, snapshot, schema, result_path, rnd_dir / f"events-{n}.jsonl",
+                info = reviewer.run(prompt, snapshot, schema, result_path, events,
                                     rnd_dir / f"stderr-{n}.txt", self.cfg["reviewer"]["timeout_minutes"] * 60,
                                     on_start=on_start)
             except OSError as exc:  # stream setup or process creation failed before any process started
                 if "pid" in attempt:
                     raise
                 not_launched(exc, "reviewer launch setup")
+            finally:
+                tail.finish()
         finally:
             self.remove_snapshot(snapshot)
         prov = self.reviewer.provenance(info.get("thread_id"), since=attempt_started_epoch - 60)
@@ -2532,6 +2813,9 @@ class Controller:
         digest = sha256_file(envelope["path"])
         attempt.update({"ended": now_iso(), "ok": envelope["ok"], "fatal": envelope["fatal"],
                         "reasons": envelope["reasons"], "thread_id": info.get("thread_id"), "envelope_sha256": digest})
+        self.live.line(f"review round {rnd['round']} attempt {n} ended: " + (
+            f"valid result, decision {(envelope.get('result') or {}).get('decision')}" if envelope["ok"] else
+            "rejected (" + "; ".join(envelope["reasons"])[:400] + ")"))
         if envelope["ok"]:  # promote in the same write that records the attempt: no window for a duplicate review
             rnd.update(status="validated", envelope_path=envelope["path"], envelope_sha256=digest)
         elif envelope["fatal"]:  # the blocking outcome is persisted with the attempt that caused it
@@ -2952,8 +3236,9 @@ class Controller:
         if not prov:
             return "not recorded"
         if "models" in prov:
-            return (f"foreground session `{prov.get('session_id')}`: models {prov['models']}, effort {prov['efforts']} "
-                    "(CLI-recorded transcript)")
+            return (f"foreground session `{prov.get('session_id')}`: models {prov['models']}, effort {prov['efforts']}, "
+                    f"permission modes {prov.get('permission_modes') or 'not recorded'} (CLI-recorded transcript; the "
+                    "headless permission profile does not apply to a foreground session)")
         return (f"headless session `{self.state['developer']['session_id']}`: init `{prov.get('init_model')}`, "
                 f"API models {prov.get('main_models')}, effort {prov.get('observed_effort')}")
 
@@ -3238,12 +3523,16 @@ class Controller:
         pending.parent.mkdir(parents=True, exist_ok=True)
         write_text(pending, json.dumps({"gate": gate_id, "argv": argv, "candidate": head, "started": started,
                                         "pid": os.getpid()}) + "\n")  # visible to every readiness check until done
-        try:
-            proc = run(argv, cwd=self.state["repo_root"], check=False, timeout=gate.get("timeout_minutes", 30) * 60)
-            code, output = proc.returncode, proc.stdout + proc.stderr
-        except subprocess.TimeoutExpired as exc:
-            code, output = None, f"timed out after {exc.timeout}s"
+        live, timeout_s = self.live, gate.get("timeout_minutes", 30) * 60
+        live.line(f"gate {gate_id} started on {short(head)} (live output follows; the receipt is the record): "
+                  + " ".join(argv))
+        # each output line is shown as it arrives; the receipt is built exactly as before from stdout then stderr
+        code, out, err = stream_process(argv, self.state["repo_root"], timeout_s,
+                                        lambda row: live.line(f"gate {gate_id} | {row}"))
+        output = out + err if code is not None else f"timed out after {timeout_s}s"
         clean_after = self.git.head() == head and self.git.clean()
+        live.line(f"gate {gate_id} finished on {short(head)}: exit {code}, worktree unchanged {clean_after}, "
+                  f"{round(time.monotonic() - t0, 1)} s")
         stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         base = self.dir / "evidence" / (f"gate-{gate_id}-{head[:12]}-d{gate_definition_id(gate)}-a{argv_id(argv)}-{stamp}")
         text, _ = sanitize(output, strict=False)
@@ -3678,6 +3967,9 @@ class Controller:
     def _continue_after_resume(self):
         if self.state["mode"] == "headless":
             return self.run_loop()
+        # foreground has no loop: queued public work (for example an amendment's handoff-superseded corrections) is
+        # sent now, so the PR never keeps showing a superseded handoff as current until the session's next command
+        self.settle_publications()
         if self.state["phase"] == "review":
             result = self.review_round()
             if result == "needs_report":  # stay ACTIVE: the developer's next step is an ordinary report
@@ -4367,6 +4659,19 @@ class Controller:
             review = {"round": rnd["round"], "status": rnd.get("status"), **bound(rnd), "latest_attempt": attempt}
         return {"selected": selected, "latest_developer_invocation": developer, "latest_review_round": review}
 
+    def foreground_session_status(self):
+        """The enrolled interactive session's CLI-recorded provenance against the owner policy (read-only)."""
+        try:
+            prov = self.developer.session_provenance(self.state["foreground_session"])
+        except (OSError, ValueError) as exc:
+            return {"session_id": self.state["foreground_session"], "problems": [f"transcript unreadable: {exc}"]}
+        return {"session_id": self.state["foreground_session"], "models": prov.get("models"),
+                "efforts": prov.get("efforts"), "permission_modes": prov.get("permission_modes"),
+                "problems": foreground_session_problems(prov, self.cfg["developer"]),
+                "permissions": "the owner's interactive Claude Code settings and approvals; the enrollment's headless "
+                               "permission profile is not applied to a foreground session",
+                "source": prov.get("source")}
+
     def status(self, remote=False):
         s = self.state
         lock = self.lock("status")
@@ -4399,6 +4704,17 @@ class Controller:
         }
         out["guidance"] = self.guidance_status()
         out["amendments"] = self.guidance_status("amendments")
+        out["live_log"] = str(self.live_path)  # readable progress (tail it); never evidence
+        if s["mode"] == "foreground":
+            out["foreground_session"] = self.foreground_session_status()
+            try:
+                rec = self.guidance_record("amendments")
+            except Stop:
+                rec = None  # already reported as an integrity problem in `amendments.selected`
+            if rec and isinstance(out["amendments"].get("selected"), dict):
+                # the developer is this session: delivery is a tool result in its transcript showing the digest
+                out["amendments"]["selected"]["shown_in_foreground_session_at"] = self.developer.session_shown(
+                    s["foreground_session"], rec["sha256"], rec.get("captured_at"))
         if remote and s["status"] == "AWAITING_OWNER_REVIEW":
             try:
                 moved = self.handoff_superseded()
@@ -4673,7 +4989,7 @@ def prior_claim_state(claim: Path):
     return old
 
 
-def enroll(args, github=None, root=HERE):
+def enroll(args, github=None, root=HERE, developer=None):
     cfg = load_project(args.project, root)
     if cfg.get("enrollment_allowed") is False:  # the repository's own instructions forbid this workflow's actions
         raise UsageError(f"project {cfg['project_id']} does not allow enrollment: {cfg.get('enrollment_blocked_reason')}")
@@ -4694,6 +5010,12 @@ def enroll(args, github=None, root=HERE):
         if not foreground_session:
             raise UsageError("foreground enrollment must be run from the Claude session that will develop "
                              "(CLAUDE_CODE_SESSION_ID is not set)")
+        # the interactive session is the developer: its recorded model, effort and permission mode must match the
+        # owner policy before anything is created (the headless permission profile does not apply to it)
+        developer = developer or ClaudeDeveloper(cfg["developer"], None, root / REPORT_SCHEMA_FILE)
+        problems = foreground_session_problems(developer.session_provenance(foreground_session), cfg["developer"])
+        if problems:
+            raise UsageError("foreground enrollment refused; nothing was created: " + "; ".join(problems))
     mission = Path(args.mission).resolve()
     if not mission.is_file():
         raise UsageError(f"mission not found: {mission}")
@@ -5333,10 +5655,11 @@ COMMAND_STATUSES = {"run": {"ACTIVE"}, "review": {"ACTIVE"}, "finalize": {"ACTIV
                     "activate": {"ACTIVE", "PAUSED", "BLOCKED", "AWAITING_OWNER_REVIEW"}}
 
 
-def guarded(controller, command, fn, mutate=True, honor_stop=False, precheck=None):
+def guarded(controller, command, fn, mutate=True, honor_stop=False, precheck=None, extra=None):
     """Run fn under the single-writer lock with reloaded state and the pre-mutation guard. Status eligibility and
     the host/worktree claims are re-checked after locking, so a stale process cannot act on old authority. A
-    precheck refusal (UsageError), like those checks, leaves the state file untouched."""
+    precheck refusal (UsageError), like those checks, leaves the state file untouched. extra(result), when given,
+    adds keys to the printed result (stdout); progress never goes to stdout."""
     with controller.lock(command):
         controller.reload()
         allowed = COMMAND_STATUSES.get(command)
@@ -5353,7 +5676,7 @@ def guarded(controller, command, fn, mutate=True, honor_stop=False, precheck=Non
             if honor_stop:
                 controller.check_stop_request()
             result = fn()
-            print(json.dumps({"result": result, **controller.status()}, indent=2))
+            print(json.dumps({"result": result, **controller.status(), **((extra and extra(result)) or {})}, indent=2))
             return EXIT_OK
         except UsageError as exc:
             if not isinstance(exc, RefusedUnchanged):
@@ -5397,13 +5720,49 @@ def resume_command(controller, reason, max_rounds=None, resend_undelivered=False
         except (CommandError, subprocess.TimeoutExpired, OSError) as exc:
             raise UsageError(f"{INSTRUCTION_KINDS[kind]['option']} refused before any change: the enrolled worktree "
                              f"{controller.state['repo_root']} cannot be used ({exc}). Nothing was captured or changed")
+    # foreground: the enrolled session is the developer, so the applied amendment is delivered in this command's
+    # output (the full effective task with its digest), which its transcript records
+    extra = (lambda _result: {"effective_task": controller.effective_task()})         if amendment is not None and controller.state["mode"] == "foreground" else None
     try:
         return guarded(controller, "resume",
                        lambda: controller.resume(reason, max_rounds, resend_undelivered, guidance=guidance,
                                                  amendment=amendment),
-                       precheck=precheck)
+                       precheck=precheck, extra=extra)
     finally:
         controller.release_guidance_admission()  # never left held, whatever happened before capture
+
+
+def review_command(controller, report_path):
+    """Foreground `review --report FILE`: admit the interactive developer's report and run one review round under the
+    writer lock. The accepted result (verdict, the reviewer's continuation, the review reference, the candidate,
+    findings and the next step) is printed on stdout under `review`, so the session continues from it; progress
+    (reviewer activity) goes to stderr and the enrollment's live log only."""
+    if controller.state["mode"] != "foreground":
+        raise UsageError("headless enrollments are driven by `run`")
+
+    def _review():
+        if controller.state["phase"] == "review":
+            result = controller.review_round()
+        elif controller.state["phase"] == "develop":
+            error = controller.admit_report(read_json(report_path), "developer submitted a checkpoint report")
+            if error:
+                raise UsageError(error)
+            result = controller.review_round()
+        else:
+            raise UsageError(f"phase is {controller.state['phase']}; nothing to review")
+        if result == "needs_report":
+            raise Stop("PAUSED", "the submitted report does not match the current candidate; submit again")
+        return result
+
+    def _outcome(result):
+        outcome = controller.review_outcome()
+        if outcome:  # the final review text also goes to the readable live log (progress, not the record)
+            controller.live.line(f"review round {outcome['round']} accepted on {short(outcome['candidate'])}: "
+                                 f"{outcome['decision']}; pending findings: "
+                                 f"{', '.join(outcome['pending_findings']) or 'none'}\n"
+                                 + (outcome.get("continuation") or outcome.get("problem") or ""))
+        return {"review": outcome, "live_log": str(controller.live_path)}
+    return guarded(controller, "review", _review, honor_stop=True, extra=_outcome)
 
 
 def main(argv=None, root=HERE):
@@ -5466,6 +5825,8 @@ def main(argv=None, root=HERE):
             p.add_argument("--reason", required=True)
         if name == "status":
             p.add_argument("--remote", action="store_true", help="also check whether a handoff is still current")
+            p.add_argument("--instructions", action="store_true",
+                           help="print the effective task (mission and selected owner amendments in full)")
         if name == "resume":
             p.add_argument("--max-rounds", type=int)
             p.add_argument("--reason", required=True,
@@ -5569,6 +5930,13 @@ def main(argv=None, root=HERE):
                                   **({"guidance": document} if kind == "guidance" else {"amendment": document}))
         controller = Controller(find_enrollment(args.enrollment), workflow_root=root)
         if args.command == "status":
+            if getattr(args, "instructions", False):  # read-only; prints the amendments text with its digest
+                try:
+                    print(json.dumps({"enrollment": controller.state["enrollment_id"],
+                                      "effective_task": controller.effective_task()}, indent=2))
+                except Stop as stop:
+                    raise UsageError(f"the effective task cannot be shown: {stop.reason}")
+                return EXIT_OK
             print(json.dumps(controller.status(remote=args.remote), indent=2))
             return EXIT_OK
         if args.command == "stop":
@@ -5595,23 +5963,7 @@ def main(argv=None, root=HERE):
         if args.command == "run":
             return guarded(controller, "run", controller.run_loop)
         if args.command == "review":
-            if controller.state["mode"] != "foreground":
-                raise UsageError("headless enrollments are driven by `run`")
-
-            def _review():
-                if controller.state["phase"] == "review":
-                    result = controller.review_round()
-                elif controller.state["phase"] == "develop":
-                    error = controller.admit_report(read_json(args.report), "developer submitted a checkpoint report")
-                    if error:
-                        raise UsageError(error)
-                    result = controller.review_round()
-                else:
-                    raise UsageError(f"phase is {controller.state['phase']}; nothing to review")
-                if result == "needs_report":
-                    raise Stop("PAUSED", "the submitted report does not match the current candidate; submit again")
-                return result
-            return guarded(controller, "review", _review, honor_stop=True)
+            return review_command(controller, args.report)
         if args.command == "finalize":
             def _finalize():
                 if controller.state["phase"] != "finalize":
