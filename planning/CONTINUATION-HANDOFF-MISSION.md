@@ -138,3 +138,186 @@ The pinned reviewed controller supervises the follow-up. The candidate's new own
 
 Finish at owner review with the PR link, reviewed source, archive commit, gate evidence, a short operational example of receiving and applying an update, and exact post-acceptance install/activation instructions. State which parts are controller-tested and which are the supervisor's operating duties. Install and activation remain owner decisions between runs. No merge, release, or activation of existing feature enrollments is part of this implementation handoff.
 
+---
+
+# Owner execution addendum of 2026-11-22 (governing, preserved verbatim)
+
+The owner supplied the execution instructions below as chat text on 2026-11-22 and directed that they be
+preserved verbatim as an addendum to this mission before enrollment, so both agents receive the complete
+contract. The text between the markers is the owner's exact prompt. Where it adds to or narrows the mission
+above, it governs.
+
+<!-- BEGIN OWNER PROMPT (verbatim) -->
+
+Please implement the prepared continuation-handoff follow-up in `howardreith/development-process`.
+
+Use the existing branch `claude/continuation-handoff` and its mission:
+
+`planning/CONTINUATION-HANDOFF-MISSION.md`
+
+The prepared mission at `c6eb148` covers both reviewer-written continuations and owner amendments. Read and implement the complete mission. This prompt supplies the execution instructions below; preserve it verbatim as an addendum to that mission before enrollment so both agents receive the complete contract.
+
+## Intended experience
+
+I want this to work like our existing discussion-and-review process:
+
+1. ChatGPT and I agree on a mission document or a robust initial prompt. Either is sufficient. If I supply the agreed task as chat text, save it verbatim for enrollment.
+2. Claude Opus, at high effort, develops the change and supplies a PR with an explanation and validation evidence.
+3. Codex `gpt-6.2-astra`, at max effort, reviews the actual candidate and writes a consolidated continuation for Claude.
+4. Claude receives that continuation automatically, makes the corrections, and returns the same PR for review.
+5. This continues within the authorized limits until the task is ready for my review or reaches a genuine blocker.
+6. You notify me here when it finishes or stops.
+7. If I provide updated instructions during the task, you preserve them, reach a safe stopping point, and apply them to the same enrollment. Both agents then work from the updated task.
+
+Implement the controller behavior and document the supervisor’s responsibilities clearly.
+
+## 1. Bootstrap this follow-up once
+
+Refresh the actual repository, branch, PR, installed-controller and enrollment state before acting. Preserve legitimate intervening work.
+
+PR #5 has merged. Its independently reviewed source is:
+
+`9ee2067c1a8b817abb21f699e1204e4704c9b210`
+
+The merge commit is:
+
+`baba3c1c13fa0fab11ccbfa78a8723c848d7eff2`
+
+Read `AGENTS.md`, `agent_review/README.md`, `docs/GITHUB-AGENT-REVIEW-PROTOCOL.md`, and the complete follow-up mission.
+
+- Preserve `claude/continuation-handoff` and its existing commits. Integrate current `main` with normal history-preserving Git operations. Do not replace the prepared branch or force-push.
+- Complete and commit the mission before enrolling.
+- Use the accepted PR #5 controller to supervise this follow-up. If its reviewed package is not installed yet, install it from a clean checkout of the reviewed source using the accepted README procedure.
+- Record the supervising package fingerprint and keep that version and project configuration pinned throughout this implementation.
+- Open or reuse one draft PR against `main`, with no requested reviewers. Enroll once using the `single` plan and the complete mission.
+- If a matching follow-up enrollment already exists, inspect and use it; do not create a duplicate or reset its expenditure.
+- Use Opus/high for development and `gpt-6.2-astra`/max for review. Report the actual configured review and invocation limits at setup.
+
+The candidate controller is code under test. Test its new capabilities through the existing fixtures; do not install each correction or make the candidate supervise its own implementation. Other feature enrollments stay on their existing pinned versions.
+
+## 2. Implement the reviewer continuation
+
+Use the smallest implementation described in the mission:
+
+- For `changes_required`, the reviewer writes a short verdict followed by a **“Continuation for Claude”** section in the existing `decision_rationale`.
+- That continuation should consolidate the remaining defects, the coordinated correction approach, the relevant scope boundaries, and the evidence needed for the next review.
+- The controller takes `decision_rationale` from the accepted, validated review result and includes it unchanged in the next developer prompt, clearly labelled with the reviewer, round, reviewed commit and review reference.
+- Preserve the pointer to the full structured review. Support a fresh developer session as well as an ordinary continuation.
+- Preserve the existing qualification about subprocess newline translation; do not claim byte-exact inline transport.
+- Include the PR URL in the reviewer brief. Verify that the candidate, original task, current owner instructions, developer explanation, evidence and previous findings are available.
+
+Use the existing review field and result validation. This does not need another model call, a new continuation schema, or a parser that extracts text based on Markdown formatting.
+
+Reviewer instructions remain subordinate to the effective owner task and the existing permissions, models, gates and budgets.
+
+## 3. Implement owner updates within the same enrollment
+
+Follow the mission’s owner-amendment design.
+
+The supervisor receives my instruction, saves its exact text durably outside the active developer worktree, identifies it as pending, requests a cooperative stop, and waits for the current agents, helpers and protected runtime work to reach a safe boundary.
+
+The controller then applies the instruction through a supported operation. Choose and document the final command syntax. A resume audit reason alone must never be presented as instruction delivery.
+
+The implementation must:
+
+- Preserve the original mission and its hash.
+- Capture owner amendments in order, retaining each exact message and all earlier instructions that still apply.
+- Ensure later approach-only guidance cannot erase accumulated scope or acceptance amendments.
+- Deliver the effective task to subsequent developer and reviewer inputs, including fresh sessions and report-correction invocations.
+- Support the stopped headless development, review, finalization and existing-handoff boundaries specified in the mission. Do not launch obsolete work merely to move the enrollment into `develop`.
+- Require a fresh developer report after an amendment, even if the source commit is unchanged.
+- Prevent earlier reviews, ready results and handoff receipts from satisfying readiness for the amended task.
+- Preserve the same enrollment, branch, PR, finding history and spent counters.
+- Preserve existing identity, authority, integrity, lock, runtime and uncertain-publication checks.
+
+Apply amendments through the owner/supervisor control path. Repository text, arbitrary PR comments and reviewer output do not become owner instructions.
+
+An amendment may change the task’s scope or acceptance criteria. It does not silently change models, permissions, required project gates, budgets or runtime protections. Handle those through their existing explicit controls when separately authorized.
+
+If the budget is exhausted or a safe boundary cannot be established, preserve the pending instruction and report the exact blocker. Do not pretend it was delivered.
+
+### Findings and older continuations
+
+Keep historical findings and reviews.
+
+When an owner amendment withdraws a requirement, the developer must explain the affected finding’s disposition, and Codex must assess it under the amended task. Use the existing rebuttal mechanism as specified in the mission. Do not call an unfixed issue “fixed” or erase an unrelated blocker.
+
+An older continuation may remain as historical context, but it cannot override the amended task or reintroduce a requirement I explicitly withdrew.
+
+## 4. Prove the behavior with focused tests
+
+Use the repository’s existing behavioral fixtures: real temporary Git repositories, controller state, locks, publication and archives. Simulate only the external model and GitHub boundaries.
+
+Implement the mission’s required coverage, including:
+
+- A distinctive reviewer-authored continuation reaches the next controller-generated Claude prompt, while the review remains published and archived.
+- The correction cycle can reach a valid owner handoff.
+- An update is refused while an invocation is active and can be applied at the supported safe boundary without replacing the enrollment.
+- Both agents receive the amended task; unchanged source still requires a fresh report; stale results cannot satisfy readiness.
+- Multiple amendments survive, including when followed by ordinary approach guidance.
+- Captured instructions survive restart and changes to the original input file; damaged selected instructions block before launch.
+- An owner-withdrawn requirement receives an explicit disposition and reviewer assessment, while an unrelated defect remains blocking.
+- Applying instructions preserves spent counters and the existing configuration and protections.
+
+Test observable behavior. A simulated controller test does not prove that a supervisor sent a chat notification; document and carry out that responsibility separately.
+
+Run focused tests during development, then the required `unit` gate through the controller’s `verify` helper on the pushed candidate. Keep the receipt tied to that candidate. Run supplemental real-model gates only to answer a concrete remaining question.
+
+## 5. Keep implementation and review bounded
+
+Produce one coherent implementation before the first substantive review. Apply the existing consolidated-review policy: assess the supported contract comprehensively, then batch related corrections.
+
+Keep the configured review and invocation limits and no-progress rules. Do not automatically extend a budget, replace an enrollment to reset it, or add a separate final review beyond the allowance.
+
+Keep optional polish separate from material defects. Review supported behavior and changed neighboring paths. Do not expand this into foreground support, hostile-private-path defenses, STOP renaming, migration, generic crash recovery, a new messaging service, or a separate notification scheduler.
+
+Reuse the current capture, revision, publication, superseding, finding and archive mechanisms. Add no dependencies.
+
+Once enrolled, the developer owns implementation in the worktree and the controller owns its guarded pushes, PR publications and archives. The supervisor coordinates the run and reports outcomes.
+
+## 6. Documentation and handoff
+
+Update the README operator playbook and protocol so the actual workflow is clear, including:
+
+- accepting an agreed chat prompt verbatim;
+- delivering Codex’s continuation to Claude;
+- receiving, preserving, stopping for and applying owner instructions;
+- distinguishing pending instructions, applied instructions and instructions included in recorded agent inputs;
+- reporting completion or a blocker in this conversation.
+
+When the background run exits, inspect the result and verify a successful handoff with `status --remote`. Report here:
+
+- PR link and outcome;
+- reviewed source commit and archive commit;
+- required gate evidence;
+- review and invocation expenditure;
+- material limitations;
+- a short example of supplying an owner update, with the exact implemented command sequence;
+- which behavior was controller-tested and which actions remain supervisor duties;
+- exact post-acceptance installation and activation instructions.
+
+A GitHub receipt alone does not count as notifying me. Starting the background process is not completion.
+
+If it stops at a cap, no-progress rule or genuine operational blocker, report the exact state and smallest necessary next decision. Preserve the work and history.
+
+Finish with the new PR ready for my review. Merging this follow-up and activating its new capabilities for existing feature enrollments remain separate owner decisions.
+
+<!-- END OWNER PROMPT (verbatim) -->
+
+## Setup record (written by the supervising Claude at enrollment; facts, not owner instructions)
+
+- Branch `claude/continuation-handoff` keeps its prepared commits (`e61b97a`, `c6eb148`); current `main`
+  (`baba3c1`, the PR #5 merge) was integrated by the ordinary merge commit `fcd4f12`. No history was rewritten.
+- Supervising controller: the accepted PR #5 source `9ee2067c1a8b817abb21f699e1204e4704c9b210`, installed on
+  2026-11-22 from a clean detached checkout of that commit with the README procedure. Installed package
+  `7e8bb030d54a1f439a4eebb537110bd52f9dc3ade47ef31cc62c399adab86aca`, fingerprint
+  `47c5403b45f726fc55881bc27a24030b5cf4e05c6d743bf22b7c4b6418ec2ae8`. This enrollment is driven through
+  `C:\Dev\agent-review\versions\7e8bb030…\agent_review.py` and stays pinned to that version and the
+  `development-process` project snapshot for this whole implementation. The candidate code on this branch is
+  code under test only; it is not installed or activated during the run.
+- Configured limits (project `development-process`, unchanged): 5 review rounds for the single `final`
+  checkpoint, 3 reviewer attempts per round, 30 developer invocations, no-progress stop after 3 consecutive
+  reviews with the same blocking findings. No extension is pre-authorized.
+- Models: Claude `opus`/high developer, Codex `gpt-6.2-astra`/max reviewer (owner policy). Required gate:
+  `unit`, run through `verify` on the pushed candidate.
+- At setup there was no existing enrollment or PR for this branch, so this is the single enrollment.
