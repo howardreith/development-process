@@ -168,8 +168,10 @@ does (`"required_gates": ["unit"]`).
 Normal interactive work is **foreground**: the owner's main Claude conversation
 is the developer (see [Foreground development](#foreground-development-the-default-for-interactive-work)).
 Use a separate headless developer only when the owner explicitly asks for
-unattended work. Always pass `--mode` explicitly (the CLI default remains
-`headless` for compatibility with existing scripts).
+unattended work. An omitted `--mode` selects foreground when `enroll` runs inside an
+interactive Claude session (that session becomes the developer); outside one it
+is refused, so an omission never silently selects a separate headless developer.
+Unattended runs always pass `--mode headless` explicitly.
 
 ```powershell
 git -C C:/Dev/<repo> worktree add -b claude/<feature> <worktree> origin/<default>
@@ -235,8 +237,12 @@ iterations need no owner relay.
    CLI-recorded transcript (next paragraph) and refuses, creating nothing, if
    it does not match the owner policy. `status` shows the same check as
    `foreground_session`.
-2. Develop in the worktree: commit, `push --enrollment <id>` (guarded helper),
-   `verify --enrollment <id> --gate <id>` for every required gate.
+2. Develop in the worktree: commit, push through the project's push route
+   (its own repository wrapper where the project config sets `push_command`,
+   for example the Kingmaker Gunslinger and Buff Planner wrappers; otherwise
+   the guarded helper `push --enrollment <id>`), then run
+   `verify --enrollment <id> --gate <id>` for every required gate. The review
+   result's `next` names the route that applies.
 3. Write the developer report (schema `agent-review.developer.v1`, with a
    disposition for every pending finding) to a file and run
    `review --enrollment <id> --report <file>`. Run it as a background task and
@@ -267,6 +273,15 @@ guarded `push` and `verify` helpers enforce their own rules whatever the
 session's settings are, and the developer provenance in each review request
 names the recorded models, effort and permission modes.
 
+Limits of this check: it reads what the CLI recorded. Every logical main-thread
+turn (records sharing a message id; CLI-generated `<synthetic>` messages are
+not model turns) must carry both a model and an effort, and every recorded
+permission mode must be one of `default`, `acceptEdits`, `plan`, `auto` or
+`dontAsk`; an empty or unknown mode, a turn without either observation, or
+`bypassPermissions` is refused. A permission mode says how the CLI asks for
+approval; it does not show which allowances or denials the owner configured in
+their settings, which remain the owner's responsibility.
+
 **Live output.** Reviewer activity (the commands Codex runs, their exit codes
 and its messages; never reasoning) and every line of gate output are appended,
 as they happen, to the enrollment's private live log, whose path `status` prints
@@ -277,16 +292,48 @@ Claude Code shows a tool's output only when the tool finishes, so in the
 conversation the session follows the live log with a monitor while the
 command runs in the background; the owner can watch it directly:
 
+Gate streaming keeps the evidence rules: a receipt passes only when the gate
+process has exited and both of its output streams reached their end within the
+gate's deadline (a descendant still holding a pipe is waited for; otherwise the
+receipt is a nonpassing timeout); on a timeout nothing is terminated while a
+configured runtime lock exists, so a restoration reaches its safe boundary
+first; and each stream is redacted before it is shown, so a multiline private
+key block never reaches the live log or terminal (the receipt log is redacted
+as a whole, as before).
+
 ```powershell
 Get-Content -Wait -Tail 40 <live_log path from status>
+```
+
+**Watching any enrollment, including running headless jobs.** `watch
+--enrollment <id>` is a read-only live view that needs no lock and writes
+nothing, so it is safe beside a running controller of any installed version:
+it follows the latest headless developer stream (`developer/stream-NNN.jsonl`:
+tool calls, result excerpts, Claude's messages, never thinking), the current
+review round's reviewer events (`rounds/rNN/events-K.jsonl`) and gate
+markers/receipts, and prints a status line with the role, candidate commit,
+round count, elapsed time, latest observable action and any blocker, plus a
+notice when no new agent event has arrived for `--stall-minutes` (default 10;
+a running process is not proof of progress). `--once` prints one observation;
+`--log FILE` also appends the feed to a file the owner can tail:
+
+```powershell
+python $ar watch --enrollment <id> --log C:/Dev/<id>-live.log
+Get-Content -Wait -Tail 40 C:/Dev/<id>-live.log
 ```
 
 **Owner task changes from the session.** The owner tells the session; it saves
 the exact text outside the worktree as pending and applies it with
 `resume --enrollment <id> --reason "..." --amend-mission <file>` between its own
-commands (no `stop` needed in foreground). The command prints the full
-effective task, including the amendments text and its digest, which is the
-delivery to the developer; Codex receives the same document byte-exact. See
+commands (no `stop` needed in foreground; another session is refused while the
+enrollment is ACTIVE). The command prints the full effective task: the
+amendments text, then a delivery marker naming the enrollment, revision and
+digest, plus the `report_citation` the next report must carry in
+`evidence_refs`. Delivery counts only when one successful tool result in the
+session contained both the complete text and the marker; the next report must
+cite the revision, so a report written before the change cannot be reused.
+Codex receives the same document byte-exact. An amendment after the last
+allowed round is recorded but stops `BLOCKED` until a separate owner extension. See
 [Owner amendments](#owner-amendments-resume---amend-mission-file).
 
 ### The owner's experience and the supervisor's duties

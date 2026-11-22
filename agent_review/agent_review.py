@@ -342,7 +342,8 @@ class EventTail(threading.Thread):
     def __init__(self, path, live, render, interval=0.5):
         super().__init__(daemon=True)
         self.path, self.live, self.render, self.interval = Path(path), live, render, interval
-        self._stop, self._offset, self._partial = threading.Event(), 0, b""
+        # not `_stop`: threading.Thread has an internal `_stop()` method that join() calls (CPython 3.12+)
+        self._halt, self._offset, self._partial = threading.Event(), 0, b""
 
     def _drain(self):
         try:
@@ -362,42 +363,83 @@ class EventTail(threading.Thread):
                 self.live.line(row)
 
     def run(self):
-        while not self._stop.wait(self.interval):
+        while not self._halt.wait(self.interval):
             self._drain()
 
     def finish(self):
-        self._stop.set()
-        self.join(timeout=5)
-        self._drain()
+        self._halt.set()
+        if self.is_alive():
+            self.join()  # bounded: the loop exits within one interval once halted
+        self._drain()  # only after the thread has stopped: no concurrent reader
 
 
-def stream_process(argv, cwd, timeout_s, on_line):
-    """Run argv with stdout and stderr read concurrently, calling on_line(text) for each line as it arrives. Returns
-    (exit code or None on timeout, stdout text, stderr text): the same separate streams `run` captures, so a receipt
-    built from them is unchanged. On timeout the process tree is terminated."""
+PEM_END_RE = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY-----")
+
+
+class StreamRedactor:
+    """Redaction for one output stream shown line by line. A private-key block spanning lines is withheld from its
+    BEGIN line through its END line (one placeholder is shown), so its body lines never reach progress output even
+    though no single body line looks like a credential; other lines get the usual credential and home-path redaction.
+    A block without an END line withholds the rest of that stream."""
+
+    def __init__(self):
+        self.in_block = False
+
+    def __call__(self, row):
+        if self.in_block:
+            if PEM_END_RE.search(row):
+                self.in_block = False
+            return None
+        if PEM_BEGIN_RE.search(row):
+            self.in_block = not PEM_END_RE.search(row)
+            return "[REDACTED-CREDENTIAL]"
+        return sanitize(row, strict=False)[0]
+
+
+def stream_process(argv, cwd, timeout_s, on_line, may_terminate=lambda: True):
+    """Run argv with stdout and stderr read concurrently; on_line(text) receives each line as it arrives, redacted per
+    stream (StreamRedactor). Returns (exit code, stdout text, stderr text): the same separate, unredacted streams `run`
+    captures, so a receipt built from them is unchanged. Output counts as complete only when the process has exited
+    AND both streams reached end of file (descendants can keep a pipe open) within the deadline; otherwise the result
+    is a timeout (exit code None). On a timeout the process tree is terminated only once may_terminate() allows it
+    (a configured runtime restoration is never interrupted); a descendant that already left the gate's process tree
+    cannot always be reached and is no longer waited for."""
+    deadline = time.monotonic() + timeout_s
     proc = subprocess.Popen([str(a) for a in argv], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace")
     chunks = {"out": [], "err": []}
 
     def pump(stream, key):
+        redact = StreamRedactor()
         for row in iter(stream.readline, ""):
             chunks[key].append(row)
-            on_line(row.rstrip("\r\n"))
+            shown = redact(row.rstrip("\r\n"))
+            if shown is not None:
+                on_line(shown)
         stream.close()
     readers = [threading.Thread(target=pump, args=(proc.stdout, "out"), daemon=True),
                threading.Thread(target=pump, args=(proc.stderr, "err"), daemon=True)]
     for reader in readers:
         reader.start()
+    remaining = lambda: max(0.0, deadline - time.monotonic())  # noqa: E731
     try:
-        proc.wait(timeout=timeout_s)
-        code = proc.returncode
+        proc.wait(timeout=remaining())
+        for reader in readers:  # descendants may still hold a pipe: wait for both ends of file, within the deadline
+            reader.join(timeout=remaining())
+        complete = not any(reader.is_alive() for reader in readers)
     except subprocess.TimeoutExpired:
+        complete = False
+    if complete:
+        return proc.returncode, "".join(chunks["out"]), "".join(chunks["err"])
+    while not may_terminate():  # a protected runtime restoration reaches its safe boundary first
+        time.sleep(2)
+    if proc.poll() is None:
         kill_tree(proc)
-        proc.wait()
-        code = None
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=30)
     for reader in readers:
-        reader.join(timeout=10)
-    return code, "".join(chunks["out"]), "".join(chunks["err"])
+        reader.join(timeout=5)
+    return None, "".join(chunks["out"]), "".join(chunks["err"])
 
 
 # A foreground session runs under the owner's own Claude Code settings and interactive approvals: the enrollment's
@@ -406,6 +448,9 @@ def stream_process(argv, cwd, timeout_s, on_line):
 # mode that skips permission checks entirely is refused. The guarded push and verify helpers keep enforcing their own
 # rules (branch, clean tree, approved remote, gate definitions) whatever the session's settings are.
 FOREGROUND_REFUSED_PERMISSION_MODES = ("bypassPermissions",)
+# the Claude Code permission modes the controller recognizes; an empty or unknown recorded mode is not identifiable.
+# A mode says how the CLI asks for approval; it does not show which allowances the owner configured.
+FOREGROUND_KNOWN_PERMISSION_MODES = ("default", "acceptEdits", "plan", "auto", "dontAsk")
 
 
 def foreground_session_problems(prov, dev_cfg):
@@ -418,12 +463,17 @@ def foreground_session_problems(prov, dev_cfg):
         problems.append(f"foreground session models {models} are not all {dev_cfg['model']}")
     if prov.get("efforts") != [dev_cfg["effort"]]:
         problems.append(f"foreground session effort {prov.get('efforts')} != {dev_cfg['effort']}")
+    if prov.get("turns_missing_metadata"):  # every logical main-thread turn must carry both observations
+        problems.append(f"{prov['turns_missing_metadata']} main-thread turn(s) of the foreground session lack a "
+                        f"recorded model or effort (for example {prov.get('incomplete_turns')})")
     modes = prov.get("permission_modes") or []
     if not modes:
         problems.append("the foreground session's permission mode is not recorded in its transcript")
     elif any(m in FOREGROUND_REFUSED_PERMISSION_MODES for m in modes):
         problems.append(f"the foreground session ran with permission mode(s) {modes}, which skip permission checks; "
                         "use a session with normal permission prompts (or auto mode)")
+    elif any(m not in FOREGROUND_KNOWN_PERMISSION_MODES for m in modes):
+        problems.append(f"the foreground session recorded unidentifiable permission mode(s) {modes}")
     return problems
 
 
@@ -1021,6 +1071,7 @@ class ClaudeDeveloper:
         prefix), only records of the current invocation count. Also the permission modes the CLI recorded for the
         session (`permission-mode` records and each user turn's `permissionMode`)."""
         models, efforts, modes, paths = set(), set(), set(), self._transcripts(session_id)
+        turns = {}  # one logical main-thread turn can span several CLI records (same message id)
         for path in paths:
             data = path.read_bytes()
             if after is not None:
@@ -1035,27 +1086,37 @@ class ClaudeDeveloper:
                 if since and str(obj.get("timestamp") or "") < since:
                     continue
                 if obj.get("type") == "assistant" and not obj.get("isSidechain"):
+                    message = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+                    turn = turns.setdefault(message.get("id") or obj.get("requestId") or obj.get("uuid") or len(turns),
+                                            {"models": set(), "efforts": set(), "synthetic": False})
                     for key in ("effort", "perTurnEffort"):
-                        if isinstance(obj.get(key), str):
+                        if isinstance(obj.get(key), str) and obj[key]:
                             efforts.add(obj[key])
-                    model = (obj.get("message") or {}).get("model")
-                    if model and model != "<synthetic>":
+                            turn["efforts"].add(obj[key])
+                    model = message.get("model")
+                    if model == "<synthetic>":
+                        turn["synthetic"] = True  # a CLI-generated message, not a model turn
+                    elif isinstance(model, str) and model:
                         models.add(model)
+                        turn["models"].add(model)
                 if obj.get("type") in ("permission-mode", "user") and not obj.get("isSidechain") and \
-                        isinstance(obj.get("permissionMode"), str):
-                    modes.add(obj["permissionMode"])
+                        "permissionMode" in obj:
+                    mode = obj["permissionMode"]
+                    modes.add(mode if isinstance(mode, str) else repr(mode))  # empty/odd values stay visible
+        real = {k: t for k, t in turns.items() if t["models"] or not t["synthetic"]}
+        incomplete = [str(k) for k, t in real.items() if not t["models"] or not t["efforts"]]
         return {"found": bool(paths), "session_id": session_id, "models": sorted(models), "efforts": sorted(efforts),
-                "permission_modes": sorted(modes),
+                "permission_modes": sorted(modes), "turns": len(real), "turns_missing_metadata": len(incomplete),
+                "incomplete_turns": incomplete[:5],
                 "source": "Claude Code session transcript (CLI-recorded; not model-authored)"}
 
-    def session_shown(self, session_id, needle, since_iso):
-        """When (transcript timestamp) a tool result in the session's main thread first contained `needle`, at or
-        after `since_iso`; None if never. CLI-recorded evidence that a command's output reached the session."""
+    def session_delivered(self, session_id, needles, since_iso):
+        """When (transcript timestamp) one successful (not `is_error`) tool result in the session's main thread first
+        contained every string in `needles`, at or after `since_iso`; None if never. CLI-recorded evidence that one
+        complete command output reached the session. Raises OSError if a transcript cannot be read."""
         since = parse_iso(since_iso)
         for path in self._transcripts(session_id):
             for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-                if needle not in line:
-                    continue
                 try:
                     obj = json.loads(line)
                 except ValueError:
@@ -1063,10 +1124,16 @@ class ClaudeDeveloper:
                 if not isinstance(obj, dict) or obj.get("type") != "user" or obj.get("isSidechain"):
                     continue
                 stamp = parse_iso(obj.get("timestamp"))
-                if not stamp or (since and stamp < since):
+                content = (obj.get("message") or {}).get("content") if isinstance(obj.get("message"), dict) else None
+                if not stamp or (since and stamp < since) or not isinstance(content, list):
                     continue
-                for item in (obj.get("message") or {}).get("content") or []:
-                    if isinstance(item, dict) and item.get("type") == "tool_result" and needle in json.dumps(item):
+                for item in content:
+                    if not isinstance(item, dict) or item.get("type") != "tool_result" or item.get("is_error"):
+                        continue
+                    body = item.get("content")
+                    if isinstance(body, list):
+                        body = "\n".join(str(b.get("text", "")) for b in body if isinstance(b, dict))
+                    if isinstance(body, str) and all(n in body for n in needles):
                         return obj.get("timestamp")
         return None
 
@@ -1774,31 +1841,88 @@ class Controller:
                     "precedence": "The original mission plus these owner amendments in order. Later amendments "
                                   "supersede conflicting earlier requirements; requirements they do not change still "
                                   "apply. Amendments never change models, permissions, required gates or budgets.",
-                    "text": text}}
+                    "report_citation": self.amendment_citation(rec),
+                    "text": text,
+                    # last, after the full text: an output cut short never carries it (see foreground_delivery)
+                    "delivery_marker": self.delivery_marker(rec)}}
 
-    def foreground_amendments_binding(self):
+    def amendment_citation(self, rec):
+        """The exact `evidence_refs` entry a foreground report prepared under these amendments must carry."""
+        return f"prepared under owner amendments revision {rec['revision']} sha256 {rec['sha256']}"
+
+    def delivery_marker(self, rec):
+        return (f"agent-review effective task delivered: enrollment {self.state['enrollment_id']}, owner amendments "
+                f"revision {rec['revision']}, sha256 {rec['sha256']}")
+
+    def foreground_delivery(self, rec):
+        """(timestamp or None, problem or None): whether the selected amendments reached the enrolled foreground session
+        as content. Evidence is one successful tool result in its CLI-recorded transcript, at or after the capture,
+        containing both the complete captured text (JSON-encoded exactly as `effective_task` output prints it) and the
+        delivery marker naming this enrollment, revision and digest, which is printed after the text. A digest alone
+        (for example in `status` or a refusal), a failed command or a truncated display does not qualify."""
+        data = self.read_guidance_snapshot(rec["sha256"], "amendments")
+        if data is None:
+            return None, self.guidance_problem(rec, "amendments")
+        needles = (json.dumps(data.decode("utf-8")), json.dumps(self.delivery_marker(rec)))
+        try:
+            return self.developer.session_delivered(self.state["foreground_session"], needles,
+                                                    rec.get("captured_at")), None
+        except (OSError, ValueError) as exc:
+            return None, f"the foreground session transcript could not be read ({type(exc).__name__}: {exc})"
+
+    def foreground_amendments_binding(self, report):
         """((revision, sha256), None) for a foreground report under the selected amendments, or ((None, None), error).
-        The binding records that the amended task reached the developer, so it requires CLI-recorded evidence: a tool
-        result in the enrolled session's transcript, at or after the capture, containing the selection's digest
-        (printed with the full text by `resume --amend-mission` and `status --instructions`)."""
+        The binding records that the amended task reached the developer and that this report was prepared for it:
+        the content must have been delivered to the session (foreground_delivery) and the report must cite the
+        revision and digest in `evidence_refs` (amendment_citation), so an earlier report cannot be relabeled."""
         current = self.current_binding("amendments")
         if current == (None, None):
             return current, None
         rec = self.guidance_record("amendments")
-        shown = self.developer.session_shown(self.state["foreground_session"], rec["sha256"], rec.get("captured_at"))
-        if not shown:
+        shown, problem = self.foreground_delivery(rec)
+        if problem or not shown:
             return (None, None), (
                 f"the amended task (owner amendment revision {rec['revision']}, sha256 {rec['sha256']}) has not been "
-                f"displayed in this session since it was applied at {rec.get('captured_at')}; run `status --enrollment "
-                f"{self.state['enrollment_id']} --instructions`, read the amendments, then submit the report again")
+                f"verifiably displayed in this session since it was applied at {rec.get('captured_at')}"
+                + (f" ({problem})" if problem else "") + f"; run `status --enrollment {self.state['enrollment_id']} "
+                "--instructions`, read the amendments, then submit a report prepared under them")
+        if self.amendment_citation(rec) not in (report.get("evidence_refs") or []):
+            return (None, None), (
+                f"this report does not say it was prepared under owner amendments revision {rec['revision']}: a report "
+                "written before the task changed cannot be reused; add this exact entry to `evidence_refs` once the "
+                f"report reflects the amended task: \"{self.amendment_citation(rec)}\"")
         return current, None
 
-    def review_outcome(self):
-        """The latest accepted review, for the foreground developer to continue from: verdict, the reviewer's
-        `decision_rationale` (its continuation) taken unchanged from the authenticated, validated envelope, the public
-        review reference, the reviewed candidate, the structured findings and the next step. None before any
-        accepted round. A missing or altered envelope is reported, never reconstructed."""
-        accepted = [r for r in self.state.get("rounds", []) if r.get("status") == "accepted"]
+    def accepted_rounds(self):
+        return {r["round"] for r in self.state.get("rounds", []) if r.get("status") == "accepted"}
+
+    def newly_accepted_review(self, before):
+        """Output keys for a foreground command that may accept a review round: under `review`, the outcome of the
+        round this command accepted (the latest of those not in `before`, the set taken under the lock when the command
+        began), or None with a note when it accepted none, so an earlier verdict is never presented as current. The
+        accepted verdict and continuation also go to the live log."""
+        new = sorted(self.accepted_rounds() - set(before or ()))
+        if not new:
+            return {"review": None, "review_note": "no review round was accepted by this command"}
+        outcome = self.review_outcome(new[-1])
+        self.live.line(f"review round {outcome['round']} accepted on {short(outcome['candidate'])}: "
+                       f"{outcome['decision']}; pending findings: {', '.join(outcome['pending_findings']) or 'none'}\n"
+                       + (outcome.get("continuation") or outcome.get("problem") or ""))
+        return {"review": {**outcome, "accepted_in_this_command": True}}
+
+    def push_instruction(self):
+        """How this project's developer pushes: its repository wrapper when one is configured, else the guarded helper."""
+        if self.cfg.get("push_command"):
+            return "push with the project's own repository push wrapper (its configured `push_command`)"
+        return f"push with `push --enrollment {self.state['enrollment_id']}`"
+
+    def review_outcome(self, round_no=None):
+        """An accepted review (round `round_no`, or the latest), for the foreground developer to continue from: verdict,
+        the reviewer's `decision_rationale` (its continuation) taken unchanged from the authenticated, validated
+        envelope, the public review reference, the reviewed candidate, the structured findings and the next step.
+        None without such a round. A missing or altered envelope is reported, never reconstructed."""
+        accepted = [r for r in self.state.get("rounds", []) if r.get("status") == "accepted"
+                    and (round_no is None or r["round"] == round_no)]
         if not accepted:
             return None
         rnd = accepted[-1]
@@ -1819,11 +1943,16 @@ class Controller:
                                                    "requested_correction", "requested_evidence", "location")}
                            for f in result.get("findings") or []]
         out["prior_finding_assessments"] = result.get("prior_finding_assessments") or []
-        phase, decision = self.state.get("phase"), rnd.get("decision")
-        if decision == "changes_required":
+        phase, decision, status = self.state.get("phase"), rnd.get("decision"), self.state.get("status")
+        if status in ("BLOCKED", "PAUSED"):  # accepted and charged, then stopped: the owner decides what comes next
+            out["next"] = (f"The enrollment is {status}: {self.state.get('status_reason')}. An owner decision is needed "
+                           "before development continues (for example a budget extension with `resume --max-rounds N`"
+                           " after the round cap); the continuation above stays the reviewer's proposal.")
+        elif decision == "changes_required":
             out["next"] = ("Address the continuation: dispose of every pending finding (fixed with commits, or rebutted "
-                           "on the evidence), commit, `push`, run the required gates with `verify`, then submit "
-                           "`review --report <file>` for the corrected candidate.")
+                           f"on the evidence), commit, {self.push_instruction()}, run the required gates with `verify "
+                           f"--enrollment {self.state['enrollment_id']} --gate <id>`, then submit `review --report "
+                           "<file>` for the corrected candidate.")
         elif phase == "finalize":
             out["next"] = "Run `finalize` to archive the records and post the owner-review handoff."
         elif phase == "done":
@@ -2043,6 +2172,14 @@ class Controller:
         # cannot even be admitted), a running push/verify helper holds the helper lock (checked by admission), and an
         # unended reviewer attempt is refused below.
         foreground_idle = s["mode"] == "foreground" and (s["status"], s["phase"]) in FOREGROUND_AMENDMENT_STATES
+        if foreground_idle and os.environ.get("CLAUDE_CODE_SESSION_ID") != s.get("foreground_session"):
+            # ordinary editing holds no controller lock, so only the enrolled session itself knows it is between
+            # commands; another terminal must not change the task under it
+            raise UsageError(f"{option} refused: while a foreground enrollment is ACTIVE only its enrolled Claude session "
+                             f"({s.get('foreground_session')}) may apply an amendment, between its own commands; this "
+                             f"process reports session {os.environ.get('CLAUDE_CODE_SESSION_ID')}. Give the instruction "
+                             "to that session, or apply it once the enrollment is stopped. Nothing was captured or "
+                             "changed")
         if (s["status"], s["phase"]) not in AMENDMENT_STATES and not stopped_handoff and not foreground_idle:
             raise UsageError(f"{option} is accepted only at a safe stopping boundary: a BLOCKED or PAUSED enrollment in "
                              "the develop, review or finalize phase, or an owner-review handoff (AWAITING_OWNER_REVIEW, "
@@ -2556,7 +2693,7 @@ class Controller:
         provenance = self.verify_foreground_developer() if self.state["mode"] == "foreground" else \
             (self.state["developer"].get("log") or [{}])[-1]
         if self.state["mode"] == "foreground":
-            report_amendments, error = self.foreground_amendments_binding()
+            report_amendments, error = self.foreground_amendments_binding(report)
             if error:
                 return error
         # every stored report keeps the instructions its returning invocation was given (history, never freshness)
@@ -3528,7 +3665,8 @@ class Controller:
                   + " ".join(argv))
         # each output line is shown as it arrives; the receipt is built exactly as before from stdout then stderr
         code, out, err = stream_process(argv, self.state["repo_root"], timeout_s,
-                                        lambda row: live.line(f"gate {gate_id} | {row}"))
+                                        lambda row: live.line(f"gate {gate_id} | {row}"),
+                                        may_terminate=lambda: not self.runtime_active())
         output = out + err if code is not None else f"timed out after {timeout_s}s"
         clean_after = self.git.head() == head and self.git.clean()
         live.line(f"gate {gate_id} finished on {short(head)}: exit {code}, worktree unchanged {clean_after}, "
@@ -3970,6 +4108,14 @@ class Controller:
         # foreground has no loop: queued public work (for example an amendment's handoff-superseded corrections) is
         # sent now, so the PR never keeps showing a superseded handoff as current until the session's next command
         self.settle_publications()
+        if self.state["phase"] in ("develop", "review") and self.budget_exhausted():
+            # the same rule headless applies before dispatching development: an amendment applied after the last
+            # allowed round stays recorded (and its corrections published) but authorizes no further work
+            raise Stop("BLOCKED", f"review-round budget for {self.checkpoint['id']} is exhausted "
+                                  f"({self.state['rounds_completed'].get(self.checkpoint['id'], 0)}/"
+                                  f"{self.limits['max_review_rounds_per_checkpoint']}); the owner amendment is applied "
+                                  "but no further development is authorized without an explicit owner extension "
+                                  "(`resume --max-rounds N`)")
         if self.state["phase"] == "review":
             result = self.review_round()
             if result == "needs_report":  # stay ACTIVE: the developer's next step is an ordinary report
@@ -4712,9 +4858,11 @@ class Controller:
             except Stop:
                 rec = None  # already reported as an integrity problem in `amendments.selected`
             if rec and isinstance(out["amendments"].get("selected"), dict):
-                # the developer is this session: delivery is a tool result in its transcript showing the digest
-                out["amendments"]["selected"]["shown_in_foreground_session_at"] = self.developer.session_shown(
-                    s["foreground_session"], rec["sha256"], rec.get("captured_at"))
+                # the developer is this session: the same content observation report admission uses
+                shown, problem = self.foreground_delivery(rec)
+                out["amendments"]["selected"]["shown_in_foreground_session_at"] = shown
+                if problem:
+                    out["amendments"]["selected"]["foreground_delivery_problem"] = problem
         if remote and s["status"] == "AWAITING_OWNER_REVIEW":
             try:
                 moved = self.handoff_superseded()
@@ -4989,7 +5137,20 @@ def prior_claim_state(claim: Path):
     return old
 
 
+def resolve_enroll_mode(mode):
+    """An omitted --mode selects foreground in an interactive Claude session (the session that runs `enroll` develops);
+    elsewhere it is refused, so an omission can never silently select a separate headless developer."""
+    if mode:
+        return mode
+    if os.environ.get("CLAUDE_CODE_SESSION_ID"):
+        return "foreground"
+    raise UsageError("--mode was omitted outside an interactive Claude session: run `enroll` from the Claude session "
+                     "that will develop (foreground), or pass --mode headless explicitly for unattended development. "
+                     "Nothing was created")
+
+
 def enroll(args, github=None, root=HERE, developer=None):
+    args.mode = resolve_enroll_mode(getattr(args, "mode", None))  # first: a refusal touches nothing
     cfg = load_project(args.project, root)
     if cfg.get("enrollment_allowed") is False:  # the repository's own instructions forbid this workflow's actions
         raise UsageError(f"project {cfg['project_id']} does not allow enrollment: {cfg.get('enrollment_blocked_reason')}")
@@ -5478,6 +5639,154 @@ def init_project(args, root=HERE, github_factory=GitHub):
 
 # --------------------------------------------------------------------------- CLI
 
+# --------------------------------------------------------------------------- watch (read-only live view)
+
+def render_claude_event(event) -> list:
+    """Observable developer activity from one headless `claude -p --output-format stream-json` event: tool calls,
+    the first part of their results, Claude's visible messages and the invocation's return. Thinking is not shown."""
+    if not isinstance(event, dict):
+        return []
+    kind, rows = event.get("type"), []
+    message = event.get("message") if isinstance(event.get("message"), dict) else {}
+    content = message.get("content") if isinstance(message.get("content"), list) else []
+    if kind == "assistant":
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text" and str(item.get("text", "")).strip():
+                rows.append("Claude: " + one_line(item["text"], 600))
+            elif item.get("type") == "tool_use":
+                args = item.get("input") if isinstance(item.get("input"), dict) else {}
+                what = args.get("command") or args.get("file_path") or args.get("pattern") or args.get("description")
+                rows.append(f"Claude ▸ {item.get('name')}: " + one_line(what if what is not None else args, 300))
+    elif kind == "user":
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "tool_result":
+                body = item.get("content")
+                if isinstance(body, list):
+                    body = " ".join(str(b.get("text", "")) for b in body if isinstance(b, dict))
+                rows.append(f"   ↳ {'ERROR ' if item.get('is_error') else ''}" + one_line(body, 200))
+    elif kind == "result":
+        rows.append(f"developer invocation returned: {event.get('subtype')}")
+    return rows
+
+
+def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes=10.0, now=None):
+    """Follow one enrollment read-only: its state.json (no lock), the latest developer stream (headless), the latest
+    review round's reviewer event files and the gate markers/receipts. Emits readable rows: agent actions as they
+    appear, a status line (role, candidate, round, elapsed time, latest observable action, blocker) when something
+    changes and about once a minute, and a stall notice when no new agent event arrived for `stall_minutes` (a running
+    process is not proof of progress). Works for enrollments of older pinned versions too; nothing is written."""
+    folder, offsets, seen = Path(folder), {}, {"event": None, "action": None, "stall": False, "line": None, "beat": 0.0}
+    now = now or (lambda: dt.datetime.now(dt.timezone.utc))
+
+    def ago(stamp):
+        if not stamp:
+            return "?"
+        secs = int((now() - stamp).total_seconds())
+        return f"{secs // 3600}h{secs % 3600 // 60:02d}m" if secs >= 3600 else f"{secs // 60}m{secs % 60:02d}s"
+
+    def follow(path, render, backfill):
+        try:
+            size, mtime = path.stat().st_size, dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc)
+        except OSError:
+            return
+        start = offsets.get(path)
+        with open(path, "rb") as f:
+            if start is None:  # first sight: show only the last few events for context
+                data = f.read()
+                rows = data.split(b"\n")
+                offsets[path] = size - len(rows[-1])
+                lines = rows[:-1][-backfill:] if backfill else []
+            elif size > start:
+                f.seek(start)
+                data = f.read()
+                cut = data.rfind(b"\n")
+                if cut < 0:
+                    return
+                offsets[path] = start + cut + 1
+                lines = data[:cut].split(b"\n")
+            else:
+                lines = []
+        for raw in lines:
+            try:
+                rendered = render(json.loads(raw.decode("utf-8", "replace")))
+            except ValueError:
+                continue
+            for row in rendered:
+                emit(sanitize(row, strict=False)[0])
+                seen["action"] = one_line(row, 160)
+        if seen["event"] is None or mtime > seen["event"]:
+            seen["event"] = mtime  # the file's last write: the latest observable agent event
+            seen["stall"] = False
+
+    while True:
+        try:
+            state = read_json(folder / "state.json")
+        except (OSError, ValueError) as exc:
+            emit(f"state unreadable: {type(exc).__name__}: {exc}")
+            if once:
+                return
+            time.sleep(interval)
+            continue
+        dev, rounds = state.get("developer") or {}, state.get("rounds") or []
+        launch, last = dev.get("launch") or {}, (rounds[-1] if rounds else {})
+        n = dev.get("invocations") or 0
+        if n:
+            follow(folder / "developer" / f"stream-{n:03d}.jsonl", render_claude_event, 15)
+        for attempt in last.get("attempts") or []:
+            follow(folder / "rounds" / f"r{int(last['round']):02d}" / f"events-{attempt.get('n')}.jsonl",
+                   render_codex_event, 15)
+        open_attempt = [a for a in last.get("attempts") or [] if not a.get("ended")]
+        role, since = "no agent running (controller or the foreground session)", None
+        if open_attempt:
+            role, since = f"reviewer Codex, round {last.get('round')}", parse_iso(open_attempt[-1].get("started"))
+        elif launch and not launch.get("returned"):
+            role, since = f"developer Claude, invocation {launch.get('n')}", parse_iso(launch.get("at"))
+        gate = None
+        receipts = set()
+        for path in sorted((folder / "evidence").glob("gate-*.json")) if (folder / "evidence").exists() else []:
+            with contextlib.suppress(OSError, ValueError):
+                r = read_json(path)
+                receipts.add((r.get("gate"), r.get("candidate"), r.get("started")))
+        for path in sorted((folder / "evidence").glob("gate-*.pending")) if (folder / "evidence").exists() else []:
+            with contextlib.suppress(OSError, ValueError):
+                g = read_json(path)
+                started = parse_iso(g.get("started"))
+                if (g.get("gate"), g.get("candidate"), g.get("started")) not in receipts and started and \
+                        (now() - started).total_seconds() < 3 * 3600:
+                    gate = g
+        head = "?"
+        with contextlib.suppress(Exception):
+            head = Git(state["repo_root"]).head()[:12]
+        limit = (state.get("limits") or {}).get("max_review_rounds_per_checkpoint", "?")
+        done = sum((state.get("rounds_completed") or {}).values()) if isinstance(state.get("rounds_completed"), dict) \
+            else "?"
+        line = (f"{state.get('status')}/{state.get('phase')} | {role}" + (f" for {ago(since)}" if since else "")
+                + f" | candidate {head} (last reviewed {str(last.get('H') or '-')[:12]}: {last.get('decision') or '-'})"
+                + f" | rounds {done}/{limit} | developer invocations {dev.get('invocations')}"
+                + (f" | gate {gate.get('gate')} running on {str(gate.get('candidate'))[:12]} for "
+                   f"{ago(parse_iso(gate.get('started')))}" if gate else "")
+                + f" | latest action: {seen['action'] or 'none observed'} ({ago(seen['event'])} ago)"
+                + (f" | blocker: {one_line(state.get('status_reason'), 300)}"
+                   if state.get("status") in ("BLOCKED", "PAUSED") else ""))
+        key = line.split(" | latest action")[0]
+        if once or key != seen["line"] or time.monotonic() - seen["beat"] >= 60:
+            emit(line)
+            seen["line"], seen["beat"] = key, time.monotonic()
+        quiet = (now() - seen["event"]).total_seconds() if seen["event"] else None
+        if state.get("status") == "ACTIVE" and quiet is not None and quiet >= stall_minutes * 60 and not seen["stall"]:
+            emit(f"no new agent events for {ago(seen['event'])}; a running process is not proof of progress")
+            seen["stall"] = True
+        if once:
+            return
+        if state.get("status") in ("AWAITING_OWNER_REVIEW", "BLOCKED", "PAUSED", "CANCELLED") and \
+                not open_attempt and not (launch and not launch.get("returned")):
+            emit("the enrollment is not active; watch ends")
+            return
+        time.sleep(interval)
+
+
 def find_enrollment(value):
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", value or ""):
         raise UsageError("pass an enrollment ID (as printed by enroll), not a path")
@@ -5655,7 +5964,7 @@ COMMAND_STATUSES = {"run": {"ACTIVE"}, "review": {"ACTIVE"}, "finalize": {"ACTIV
                     "activate": {"ACTIVE", "PAUSED", "BLOCKED", "AWAITING_OWNER_REVIEW"}}
 
 
-def guarded(controller, command, fn, mutate=True, honor_stop=False, precheck=None, extra=None):
+def guarded(controller, command, fn, mutate=True, honor_stop=False, precheck=None, extra=None, extra_on_stop=None):
     """Run fn under the single-writer lock with reloaded state and the pre-mutation guard. Status eligibility and
     the host/worktree claims are re-checked after locking, so a stale process cannot act on old authority. A
     precheck refusal (UsageError), like those checks, leaves the state file untouched. extra(result), when given,
@@ -5696,7 +6005,13 @@ def guarded(controller, command, fn, mutate=True, honor_stop=False, precheck=Non
                  "why": f"{stop.status}: {stop.reason}"})
             controller.save()
             controller.publish_status(stop.status, public)
-            print(json.dumps({"stopped": stop.status, "reason": stop.reason, **controller.status()}, indent=2))
+            more = {}
+            if extra_on_stop:  # for example a review accepted (and charged) before the stop
+                try:
+                    more = extra_on_stop(None) or {}
+                except (Stop, OSError, ValueError, KeyError, TypeError) as exc:
+                    more = {"extra_problem": f"{type(exc).__name__}: {getattr(exc, 'reason', exc)}"}
+            print(json.dumps({"stopped": stop.status, "reason": stop.reason, **controller.status(), **more}, indent=2))
             return EXIT_BLOCKED if stop.status == "BLOCKED" else EXIT_PAUSED
 
 
@@ -5720,14 +6035,25 @@ def resume_command(controller, reason, max_rounds=None, resend_undelivered=False
         except (CommandError, subprocess.TimeoutExpired, OSError) as exc:
             raise UsageError(f"{INSTRUCTION_KINDS[kind]['option']} refused before any change: the enrolled worktree "
                              f"{controller.state['repo_root']} cannot be used ({exc}). Nothing was captured or changed")
-    # foreground: the enrolled session is the developer, so the applied amendment is delivered in this command's
-    # output (the full effective task with its digest), which its transcript records
-    extra = (lambda _result: {"effective_task": controller.effective_task()})         if amendment is not None and controller.state["mode"] == "foreground" else None
+    foreground = controller.state["mode"] == "foreground"
+    before = {}
+
+    def _resume():
+        before["accepted"] = controller.accepted_rounds()  # under the lock: a preserved review may be published now
+        return controller.resume(reason, max_rounds, resend_undelivered, guidance=guidance, amendment=amendment)
+
+    def _extra(_result):
+        out = controller.newly_accepted_review(before.get("accepted")) if foreground else {}
+        if foreground and amendment is not None:
+            # the enrolled session is the developer: the applied amendment is delivered in this command's output
+            # (the full effective task, then its delivery marker), which the session's transcript records
+            out["effective_task"] = controller.effective_task()
+        return out
+
+    def _extra_on_stop(_result):  # a recovered review can be accepted before a stop; an amendment is not delivered
+        return controller.newly_accepted_review(before.get("accepted")) if foreground else {}
     try:
-        return guarded(controller, "resume",
-                       lambda: controller.resume(reason, max_rounds, resend_undelivered, guidance=guidance,
-                                                 amendment=amendment),
-                       precheck=precheck, extra=extra)
+        return guarded(controller, "resume", _resume, precheck=precheck, extra=_extra, extra_on_stop=_extra_on_stop)
     finally:
         controller.release_guidance_admission()  # never left held, whatever happened before capture
 
@@ -5739,9 +6065,19 @@ def review_command(controller, report_path):
     (reviewer activity) goes to stderr and the enrollment's live log only."""
     if controller.state["mode"] != "foreground":
         raise UsageError("headless enrollments are driven by `run`")
+    before = {}
 
     def _review():
+        before["accepted"] = controller.accepted_rounds()  # under the lock, before anything can be accepted
         if controller.state["phase"] == "review":
+            active = controller.active()
+            if not (active and active["status"] == "validated"):  # a new reviewer attempt: the enrolled session only
+                caller = os.environ.get("CLAUDE_CODE_SESSION_ID")
+                if caller != controller.state.get("foreground_session"):
+                    raise UsageError(f"review refused: only the enrolled foreground session "
+                                     f"({controller.state.get('foreground_session')}) may start a review attempt; this "
+                                     f"process reports session {caller}. (An already validated result is published by "
+                                     "any owner `resume`.)")
             result = controller.review_round()
         elif controller.state["phase"] == "develop":
             error = controller.admit_report(read_json(report_path), "developer submitted a checkpoint report")
@@ -5754,18 +6090,18 @@ def review_command(controller, report_path):
             raise Stop("PAUSED", "the submitted report does not match the current candidate; submit again")
         return result
 
-    def _outcome(result):
-        outcome = controller.review_outcome()
-        if outcome:  # the final review text also goes to the readable live log (progress, not the record)
-            controller.live.line(f"review round {outcome['round']} accepted on {short(outcome['candidate'])}: "
-                                 f"{outcome['decision']}; pending findings: "
-                                 f"{', '.join(outcome['pending_findings']) or 'none'}\n"
-                                 + (outcome.get("continuation") or outcome.get("problem") or ""))
-        return {"review": outcome, "live_log": str(controller.live_path)}
-    return guarded(controller, "review", _review, honor_stop=True, extra=_outcome)
+    def _outcome(_result):
+        return {**controller.newly_accepted_review(before.get("accepted")), "live_log": str(controller.live_path)}
+    # also on a stop: a round can be accepted and charged before the run stops (cap, no progress, reviewer blocker)
+    return guarded(controller, "review", _review, honor_stop=True, extra=_outcome, extra_on_stop=_outcome)
 
 
 def main(argv=None, root=HERE):
+    parser = build_parser()
+    return dispatch(parser.parse_args(argv), root)
+
+
+def build_parser():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("install", help="copy this workflow version to a pinned location with a manifest")
@@ -5799,7 +6135,9 @@ def main(argv=None, root=HERE):
     p.add_argument("--worktree", required=True)
     p.add_argument("--plan", required=True)
     p.add_argument("--mission", required=True)
-    p.add_argument("--mode", choices=["headless", "foreground"], default="headless")
+    p.add_argument("--mode", choices=["headless", "foreground"], default=None,
+                   help="foreground (default inside an interactive Claude session: that session develops) or headless "
+                        "(unattended; must be chosen explicitly). Omitted outside a Claude session: refused")
     p.add_argument("--pr", type=int)
     p.add_argument("--title")
     p.add_argument("--target")
@@ -5812,7 +6150,9 @@ def main(argv=None, root=HERE):
                             ("review", "foreground: submit a developer report and run one review round"),
                             ("finalize", "archive records, check readiness, post owner handoff"),
                             ("archive", "commit pending transcript records (transcript-only commit)"),
-                            ("cancel", "end an enrollment (owner decision); records and history are preserved")):
+                            ("cancel", "end an enrollment (owner decision); records and history are preserved"),
+                            ("watch", "read-only live view of any enrollment's agent activity (also older headless "
+                                      "jobs): role, candidate, round, elapsed time, latest action, stalls, blocker")):
         p = sub.add_parser(name, help=help_text)
         p.add_argument("--enrollment", required=True)
         if name == "review":
@@ -5845,14 +6185,40 @@ def main(argv=None, root=HERE):
                            help="owner amendment: a UTF-8 file holding the owner's exact updated instruction, which may "
                                 "change the task's scope or acceptance (not models, permissions, gates or budgets). It "
                                 "is appended verbatim and labeled to the enrollment's cumulative owner-amendments "
-                                "document (earlier amendments and the original mission are kept). Accepted only for a "
-                                "headless enrollment stopped BLOCKED or PAUSED in develop, review or finalize, or "
-                                "awaiting owner review on its open PR; otherwise refused (exit 4) with nothing changed. "
-                                "Supersedes any stopped round, ready result or handoff, requires a fresh developer "
-                                "report and continues the same enrollment. Both agents receive the amended task, and a "
+                                "document (earlier amendments and the original mission are kept). Accepted for an "
+                                "enrollment stopped BLOCKED or PAUSED in develop, review or finalize, or awaiting owner "
+                                "review on its open PR, and for a foreground enrollment ACTIVE in develop, review or "
+                                "finalize when run by its enrolled session between its own commands; otherwise refused "
+                                "(exit 4) with nothing changed. Supersedes any stopped round, ready result or handoff, "
+                                "requires a fresh developer report and continues the same enrollment. Both agents "
+                                "receive the amended task (foreground: printed in full as `effective_task`), and a "
                                 "sanitized rendering is PUBLISHED in each later review request: write PR-safe text")
-    args = parser.parse_args(argv)
+        if name == "watch":
+            p.add_argument("--once", action="store_true", help="print the current observation once and exit")
+            p.add_argument("--interval", type=float, default=2.0)
+            p.add_argument("--stall-minutes", type=float, default=10.0,
+                           help="report when no new agent event has arrived for this long")
+            p.add_argument("--log", help="also append the readable feed to this file")
+    return parser
+
+
+def dispatch(args, root=HERE):
     try:
+        if args.command == "watch":  # read-only: no lock, no state write, no network
+            log = open(args.log, "a", encoding="utf-8") if args.log else None
+            with contextlib.suppress(AttributeError, ValueError):  # readable rows include non-ASCII arrows
+                sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+            def emit(row):
+                stamped = f"[{dt.datetime.now(dt.timezone.utc).strftime('%H:%M:%SZ')}] {row}"
+                print(stamped, flush=True)
+                if log:
+                    log.write(stamped + "\n")
+                    log.flush()
+            with contextlib.suppress(KeyboardInterrupt):
+                watch_enrollment(find_enrollment(args.enrollment), emit, once=args.once, interval=args.interval,
+                                 stall_minutes=args.stall_minutes)
+            return EXIT_OK
         if args.command == "install":
             print(json.dumps({"installed": str(Path(args.dest).resolve()),
                               "fingerprint": install(Path(args.dest))}, indent=2))

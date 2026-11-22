@@ -343,25 +343,41 @@ only when the owner explicitly asks for unattended work. In foreground:
   command returns the accepted review on stdout (verdict, the reviewer's
   `decision_rationale` with its `Continuation for Claude` taken unchanged from
   the authenticated envelope, the public review reference, the reviewed
-  candidate, the structured findings and the next step). The session explains
+  candidate, the structured findings and the next step), including when the
+  command stops after the round was accepted or when an owner `resume`
+  publishes a preserved review; a command that accepted no round says so
+  instead of repeating an earlier verdict. The session explains
   the correction batch to the owner briefly and continues; ordinary rounds need
   no owner relay. Progress never mixes into that result.
 - Reviewer activity (commands, exit codes, messages; never reasoning) and gate
   output are written line by line to the enrollment's private live log while
-  they run. Receipts, logs, digests, event files and envelopes are unchanged
+  they run (each stream redacted before display; a gate passes only with
+  complete output within its deadline, and a timeout never interrupts a
+  protected runtime restoration). A read-only `watch` command gives the same
+  kind of view for any enrollment, including running headless jobs of older
+  versions, from their existing developer and reviewer event files. Receipts, logs, digests, event files and envelopes are unchanged
   and remain the evidence. Where the user interface shows tool output only on
   completion, the session follows the live log with a monitor and the owner
   can tail the same file.
-- An owner task change is applied from the session with
-  `resume --amend-mission` between its own commands. The running command's
-  locks refuse it meanwhile. Its output carries the full effective task with
-  the amendments digest, and the report binding requires CLI-recorded evidence
-  that this output reached the session. Codex receives the amendments document
+- An owner task change is applied from the enrolled session with
+  `resume --amend-mission` between its own commands; another session is
+  refused while the enrollment is ACTIVE, and the running command's locks
+  refuse it meanwhile. Its output carries the full effective task, then a
+  delivery marker naming the enrollment, revision and digest. The report
+  binding requires CLI-recorded evidence that one successful tool result in
+  the session contained both the complete text and the marker (a digest alone,
+  a failed command or a truncated display does not count), and the report must
+  cite the revision it was prepared for, so an earlier report cannot be
+  relabeled. An amendment after the last allowed round is recorded but stops
+  BLOCKED until a separate owner extension. Codex receives the amendments document
   byte-exact, and the existing freshness rules make older reports, reviews,
   ready results and handoffs ineligible.
-- Section 9's verification of the session (models, effort, permission mode)
-  replaces the headless permission profile, which is not applied to an
-  interactive session.
+- Section 9's verification of the session (model and effort on every logical
+  main-thread turn, an identifiable permission mode) replaces the headless
+  permission profile, which is not applied to an interactive session.
+- An omitted `--mode` selects foreground only inside an interactive Claude
+  session; elsewhere enrollment is refused, and unattended runs pass
+  `--mode headless` explicitly.
 
 Suggested initial limits: five completed review rounds per checkpoint, bounded
 per-process deadlines, and a separately recorded overall mission budget chosen
@@ -411,9 +427,12 @@ Owner amendments: the owner's explicit updated instruction can change the
 task's scope or acceptance within the same enrollment, branch and PR. The
 supervising Claude saves the exact text outside the developer worktree as
 pending, requests `stop`, waits for a stopped state and applies it with
-`resume --amend-mission FILE`. The controller accepts it only for a headless
-enrollment stopped (BLOCKED or PAUSED) in develop, review or finalize, or
-at a recorded owner-review handoff on its open PR, with no live agent,
+`resume --amend-mission FILE` (a foreground enrollment's own session applies
+it between its commands instead, without `stop`; see the foreground paragraph
+above). The controller accepts it for an enrollment stopped (BLOCKED or
+PAUSED) in develop, review or finalize, at a recorded owner-review handoff on
+its open PR, or, from the enrolled foreground session only, for a foreground
+enrollment ACTIVE in develop, review or finalize, with no live agent,
 unreturned launch, declared pending restoration, unfinished reviewer attempt,
 helper, runtime lock (checked again immediately before the application is
 committed), delivery still ambiguous after authenticated reconciliation
