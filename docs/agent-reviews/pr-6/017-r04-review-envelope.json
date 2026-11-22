@@ -1,0 +1,144 @@
+{
+  "B": "baba3c1c13fa0fab11ccbfa78a8723c848d7eff2",
+  "H": "0a005034524a850936a9bcc0ebf88d5dc0f4a578",
+  "M": "baba3c1c13fa0fab11ccbfa78a8723c848d7eff2",
+  "checkpoint_id": "final",
+  "checkpoint_type": "final",
+  "fatal": false,
+  "guidance_revision": 1,
+  "guidance_sha256": "8f748530915f09f2692d49f0c52fb3f57515895ac969ce38dc8ba6c18391cf84",
+  "invocation": {
+    "completed": true,
+    "duration_s": 263.8,
+    "errors": [],
+    "exit_code": 0,
+    "failed": false,
+    "observed": {
+      "approval_policy": "never",
+      "cli_version": "0.170.0",
+      "network": "restricted",
+      "observed_effort": "max",
+      "observed_model": "gpt-6.2-astra",
+      "plan_type": "pro",
+      "rollout_found": true,
+      "sandbox": "read-only",
+      "source": "Codex session rollout (CLI-recorded thread settings; not model-authored)",
+      "subagent_suspected": false,
+      "turn_efforts": [
+        "max"
+      ],
+      "turn_models": [
+        "gpt-6.2-astra"
+      ],
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 1074176,
+        "input_tokens": 1199619,
+        "output_tokens": 8890,
+        "reasoning_output_tokens": 4598,
+        "total_tokens": 1208509
+      }
+    },
+    "requested": {
+      "effort": "max",
+      "model": "gpt-6.2-astra",
+      "sandbox": "read-only"
+    },
+    "thread_id": "01a203d6-f4cb-7643-9d31-0875560351a0",
+    "timed_out": false
+  },
+  "mission": {
+    "id": "continuation-handoff-mission",
+    "sha256": "abe6330457a5202b3a47a2dcfa67064ca7294931909be5f692f6ad0b51984c50"
+  },
+  "ok": true,
+  "path": "~\\.agent-review\\state\\devproc-claude-continuation-handoff-20261122025808-720e\\rounds\\r04\\envelope-1.json",
+  "pr": 6,
+  "project_sha256": "bfa331169cea8fba3787ed5e96ca38b201fd5e1dc5c32dc93204de79f638664d",
+  "protocol": "agent-review.v1",
+  "publication": "r04-review",
+  "published": [
+    {
+      "comment_id": 7081266200,
+      "of": 1,
+      "part": 1,
+      "url": "https://github.com/howardreith/development-process/pull/6#issuecomment-7081266200"
+    }
+  ],
+  "raw_result_if_rejected": null,
+  "reasons": [],
+  "repository": "howardreith/development-process",
+  "request_id": "devproc-claude-continuation-handoff-20261122025808-720e-r04-d846da",
+  "response_sha256": "504c990e2ddd5a9fc8fc3c03b866ea2731aeac53d19f3e7550747e94d44b3df7",
+  "result": {
+    "candidate_commit": "0a005034524a850936a9bcc0ebf88d5dc0f4a578",
+    "checkpoint_id": "final",
+    "checkpoint_type": "final",
+    "decision": "ready_for_owner_review",
+    "decision_rationale": "R3-F1 is fixed. The required unit gate passed on the pushed candidate, including both failed-publication scenarios and the case where a retired receipt still has an unconfirmed POST. The final checkpoint requirements are met. One optional README clarification remains.",
+    "evidence_assessment": {
+      "executed_verification": [
+        "The CLI transcript records the guarded push of 0a005034524a850936a9bcc0ebf88d5dc0f4a578 and the pinned controller's invocation of `verify --gate unit`. The receipt binds the run to that commit, records exit 0 and an unchanged worktree, and matches the supplied log's SHA-256. The suite ran 256 tests with one live smoke test skipped.",
+        "The candidate log records both R3-F1 regression tests passing. It also records passing fixtures for continuation delivery, publication and archive, cumulative amendments, stale-result rejection, budget preservation, and handoff verification.",
+        "Before the candidate commit, the transcript records 43 focused tests passing and a separate run in which both targeted regression tests failed. The candidate-bound results come from the full gate."
+      ],
+      "inspected": [
+        "The fixed snapshot and full feature diff, enrolled mission, owner guidance revision 1, repository instructions, protocol, operator playbook, role prompts, controller implementation, and behavior tests.",
+        "The correction from 8f8f83e to 0a00503, prior findings ledger, developer report, CLI transcript, and controller-owned unit receipt and log."
+      ],
+      "limitations": [
+        "This read-only review relied on recorded execution. The behavior tests use real Git repositories, controller state, locks, and archives with simulated Claude, Codex, and GitHub boundaries.",
+        "For PR #6, archive creation, remote handoff verification, and notification in the launching conversation occur after this verdict."
+      ],
+      "required_gaps": [],
+      "source_inspection_only": [
+        "Traced the status predicate through publication retirement, sending, reconciliation, and guidance admission. Checked the playbook and protocol for the supervisor's pending-file, stop, resume, and notification duties."
+      ]
+    },
+    "findings": [
+      {
+        "acceptance_ids": [
+          "Owner execution addendum \u00a76"
+        ],
+        "actual": "The paragraph mentions unknown POST outcomes, then describes retired records categorically as settled and omitted. The failed-first-receipt fixture demonstrates the exception.",
+        "blocking_rationale": "The controller reports both cases correctly, and the existing regression fixture covers them.",
+        "blocks_readiness": false,
+        "category": "optional_polish",
+        "expected": "The playbook makes clear that a retired receipt remains listed while any part has an unconfirmed POST.",
+        "id": "R4-F1",
+        "location": {
+          "file": "agent_review/README.md",
+          "line": 354
+        },
+        "priority": "P3",
+        "requested_correction": "Qualify the final clause to say that a retired record drops from `pending_publications` once every attempted POST has a known outcome.",
+        "requested_evidence": "The two status assertions in the existing failed-first-receipt test already demonstrate the distinction.",
+        "title": "Clarify when a retired receipt still appears in status",
+        "trigger": "An operator inspects a superseded receipt with `posting_since` set on a part that lacks a `comment_id`."
+      }
+    ],
+    "prior_finding_assessments": [
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R3-F1",
+        "rationale": "After the rejected verdict POST and the rejected first handoff-receipt POST, the amendment fixtures each observe the public correction and an empty `pending_publications` list. The receipt fixture then sets `posting_since` on an unconfirmed part and observes exactly that retired receipt in the list. Both fixtures passed at the reviewed commit."
+      }
+    ],
+    "request_id": "devproc-claude-continuation-handoff-20261122025808-720e-r04-d846da",
+    "round": 4,
+    "schema_version": "agent-review.review.v1",
+    "summary": {
+      "delivered_behavior": "Fresh and resumed developer sessions receive the accepted reviewer's continuation. Owners can apply cumulative task amendments at a safe stop in the same enrollment. Both roles receive the amended task, and a fresh report and review are required even on unchanged source. Finding history and spent budgets are preserved.",
+      "pending_later_phase_work": [],
+      "remaining_owner_review": [
+        "Review the source and archive commits in the supervisor's verified handoff for [draft PR #6](https://github.com/howardreith/development-process/pull/6).",
+        "Decide whether to install the reviewed controller and which existing enrollments, if any, to activate between runs."
+      ],
+      "scope_reviewed": "The complete continuation and owner-amendment mission, with round four focused on R3-F1 and the status reported after publication retirement.",
+      "unresolved_questions": []
+    }
+  },
+  "round": 4,
+  "validated_at": "2026-11-22T15:23:32Z",
+  "workflow_fingerprint": "47c5403b45f726fc55881bc27a24030b5cf4e05c6d743bf22b7c4b6418ec2ae8"
+}

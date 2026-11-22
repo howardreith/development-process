@@ -18,7 +18,11 @@ $allowed_commands
 
 Mission (sha256 `$mission_sha256`): `$mission_path`
 
+$amendments
+
 $guidance
+
+$continuation
 
 ## Active checkpoint: `$checkpoint_id` ($checkpoint_type)
 
@@ -37,7 +41,11 @@ For every pending finding, decide on the evidence:
   failing reproduction and affected neighbors first, and cite the commits and
   evidence.
 - `rebutted`: the finding is wrong; give concrete evidence (file/line, test,
-  observation). The reviewer decides whether to accept it.
+  observation). The reviewer decides whether to accept it. Also use
+  `rebutted` for a finding that was valid under an earlier task revision
+  when a specific owner amendment withdrew its requirement: cite the
+  amendment's label and explain which requirement changed. That is not a fix
+  and not a false positive.
 - `deferred_optional`: only for genuinely optional polish, with rationale.
 - `unresolved_blocker`: you cannot resolve it; explain precisely.
 Do not silently drop a finding or mark your own rebuttal accepted.
