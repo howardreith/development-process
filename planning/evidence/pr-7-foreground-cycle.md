@@ -237,3 +237,56 @@ It then implemented the correction, committed as `1c92fed57a8d763db0e358c305ee18
 commit; mutations of the proposed/authorized distinction and the marker gate make their tests fail). No new real-model
 demonstration was run: these changes do not touch the amendment-delivery, review-return or live-output paths that the
 demonstrations in sections 2, 4 and 5 exercised.
+
+## 8. Round 6, the owner's further extension, and the round-7 batch (sanitized command evidence)
+
+Round 6 on `f0f6330` (`unit` through `verify`: 298 tests OK, 1 skipped) returned `changes_required`
+([review comment](https://github.com/howardreith/development-process/pull/7#issuecomment-7086981819)); the enrollment
+stopped at the cap (6/6). The owner authorized one further round (limit 7, no round 8) and corrected the handoff's
+characterization: R5-F1 is an admission and persisted-authorization defect, not merely wording or display. The session
+ran `resume --max-rounds 7`, mapped the resume branches and the publication-failure boundaries, wrote nine
+regressions, and ran them against a clean detached checkout of the reviewed candidate:
+
+```text
+$ git rev-parse HEAD                      # clean detached checkout, only the new test file copied in
+f0f6330b86587ae86b15dfdec0e1b9ede02e8d19
+$ sha256sum agent_review/agent_review.py
+ac7ffd4a2a9099fdb9849eb212dd6756db7d56a18767da56340cf6032de156b9
+$ python -m unittest agent_review.test_agent_review.ForegroundRoundSevenTests
+FAIL: test_a_crash_after_the_amendment_then_a_replay_failure_then_success (attempt=1)
+AssertionError: Tuples differ: ('BLOCKED', 'review-round budget for final [150 chars]N`)') != ('PAUSED', 'operational failure during resu[38 chars]age')
+FAIL: test_a_crash_after_the_amendment_then_a_replay_failure_then_success (attempt=2)
+AssertionError: Tuples differ: ('BLOCKED', 'review-round budget for final [150 chars]N`)') != ('PAUSED', 'operational failure during resu[38 chars]age')
+FAIL: test_a_failed_restored_notice_then_success_keeps_one_restoration_notice (attempt=1)
+AssertionError: Tuples differ: ('BLOCKED', 'review-round budget for final [150 chars]N`)') != ('PAUSED', 'publication of status-8-blocked[154 chars]ume')
+FAIL: test_a_failed_restored_notice_then_success_keeps_one_restoration_notice (attempt=2)
+AssertionError: Tuples differ: ('BLOCKED', 'review-round budget for final [150 chars]N`)') != ('PAUSED', 'publication of status-8-blocked[154 chars]ume')
+FAIL: test_an_exhausted_proposal_never_reopens_a_superseded_handoff
+AssertionError: UsageError not raised
+FAIL: test_an_exhausted_proposal_saves_no_due_rebinding
+AssertionError: {'sta[522 chars]d\\wf-earlier-install'}, 'settings': 'develope[1457 chars]': 0} != {'sta[522 chars]d\\wf'}, 'settings': 'developer-settings-7a3bd[1441 chars]': 0}
+FAIL: test_an_exhausted_proposal_with_resend_never_clears_an_uncertain_delivery
+AssertionError: {'sta[2334 chars]>', 'posting_since': '2026-11-22T23:07:02Z', '[251 chars]': 0} != {'sta[2334 chars]>', 'sha256': '68fcfcc0d7b4a567a426a7f10063a5c[210 chars]': 0}
+FAIL: test_an_explicit_zero_from_paused_develop_is_refused_before_anything_changes
+AssertionError: UsageError not raised
+FAIL: test_watch_reads_attempts_retained_by_resume
+AssertionError: 'latest action: Codex: REVIEWER-NOTE-events-3 (before this watch started)' not found in 'PAUSED/review | no agent running (controller or the foreground session) | candidate be6ac7aad66e (last reviewed be6ac7aad66e:
+Ran 9 tests in 35.888s
+FAILED (failures=9)
+```
+
+(The two tests not listed, `test_an_initial_publication_failure_then_success_restores_the_capped_blocker` and
+`test_a_crash_after_the_restoration_then_success`, passed there: they cover the R4-F1/R5-F2 behavior verified in round 6.)
+
+Corrected results on `5650e2f1c0c2edb2a44ad80d26d9bdae24a893ca`:
+
+```text
+$ python -m unittest agent_review.test_agent_review.ForegroundRoundSevenTests
+Ran 9 tests ... OK
+$ python -m unittest <the nine foreground, amendment and guidance classes>
+Ran 85 tests ... OK
+$ python -m unittest discover -s agent_review -p "test_*.py"
+Ran 307 tests ... OK (skipped=1)
+mutations: no admission hook -> zero test FAILS; no shared displacement marking -> crash/replay test FAILS;
+           no notice reuse -> failed-notice test FAILS; current attempts only -> retained-attempt watch test FAILS
+```
