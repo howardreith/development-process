@@ -203,6 +203,7 @@ class FakeDeveloper:
     def __init__(self, env):
         self.env, self.script, self.calls, self.sessions = env, [], [], set()
         self.foreground = {"models": [OPUS], "efforts": ["high"], "permission_modes": ["default"]}
+        self.exe = "simulated-claude"  # SIMULATED executable (resolved before any charge)
         self.shown = []  # SIMULATED tool results in the foreground session's transcript: (timestamp, text, is_error)
         self.transcript_error = None  # SIMULATED: an OSError raised when the transcript is read
 
@@ -7767,6 +7768,204 @@ class ForegroundRoundTwoTests(ForegroundFixture, Base):
         status = bare.status(remote=True)
         self.assertTrue(status["handoff_current"])
         json.dumps(status)
+
+
+class ForegroundRoundThreeTests(ForegroundFixture, Base):
+    """Round-3 corrections (PR #7): queued corrections finish at the round cap, the headless executable is resolved
+    before any charge, foreground provenance is re-checked before every reviewer attempt, instruction display and
+    watch are bound to the requested enrollment, watch attributes activity per invocation and attempt and never
+    writes into protected records, and amendment parts are sized by their serialized display."""
+
+    def handoff_at_cap(self):
+        env = Env("foreground", max_rounds=1, plan={"schema_version": "agent-review.plan.v1", "mission_id": "f",
+                                                    "title": "f", "checkpoints": [{"id": "final", "type": "final",
+                                                                                   "scope": "s", "exit_conditions": ["e"]}]})
+        self.addCleanup(env.cleanup)
+        env.commit("feature.txt", "v2\n", "feature v2")
+        env.push()
+        env.reviewer.script = [{"decision": "ready_for_owner_review"}]
+        self.assertEqual("ready_for_owner_review", self.review_cmd(env)[1]["result"])
+        self.assertEqual("AWAITING_OWNER_REVIEW", self.finalize_cmd(env)[1]["status"])
+        return env
+
+    def test_an_ordinary_resume_at_the_cap_finishes_the_queued_corrections_and_stays_blocked(self):
+        env = self.handoff_at_cap()
+        ctl = env.controller()
+
+        def crash():
+            raise SimulatedCrash()
+        ctl._continue_after_resume = crash  # SIMULATED: exit right after the amendment's state save
+        with self.assertRaises(SimulatedCrash):
+            self.resume(ctl, "owner amends at the cap", amendment=self.doc(env, "u1.md", self.A1))
+        self.assertFalse(self.headings_with(env, "Workflow — reopened"))  # nothing public yet
+        before = self.state(env)
+        for attempt in (1, 2):  # the original limit, twice: idempotent
+            with self.subTest(attempt=attempt):
+                with self.assertRaises(ar.UsageError) as refused:
+                    self.resume(env.controller(), "owner recovery after the interruption")
+                self.assertIn("queued corrections were sent", str(refused.exception))
+                self.assertEqual(1, len(self.headings_with(env, "Workflow — reopened")))
+                self.assertEqual(1, len(self.headings_with(env, "the owner-review handoff above is not current")))
+                self.assertEqual(1, len(self.headings_with(env, "Workflow — blocked")))
+                self.assertIn("handoff superseded by owner amendment 1", env.gh.body)
+                state = self.state(env)
+                self.assertEqual(("BLOCKED", before["rounds_completed"], 1, before["developer"]["invocations"]),
+                                 (state["status"], state["rounds_completed"],
+                                  state["limits"]["max_review_rounds_per_checkpoint"], state["developer"]["invocations"]))
+                self.assertTrue(any("helpers act only during development" in p
+                                    for p in env.controller().helper_authority_problems()))
+        with self.assertRaises(ar.UsageError):
+            self.review_cmd(env)  # report admission stays closed
+
+    def test_a_missing_executable_never_charges_a_headless_invocation(self):
+        env = Env("headless")
+        self.addCleanup(env.cleanup)
+
+        def missing(_self):
+            raise ar.UsageError("executable 'claude' not found on PATH (SIMULATED)")
+        type(env.developer).exe = property(missing)  # SIMULATED: the Claude executable cannot be resolved
+        self.addCleanup(lambda: delattr(type(env.developer), "exe"))
+        env.developer.__dict__.pop("exe", None)
+        for attempt in (1, 2):
+            with self.subTest(attempt=attempt):
+                if attempt == 1:
+                    code, out = self.run_command(env.controller())
+                else:
+                    code, out = self.resume(env.controller(), "retry after the executable problem")
+                self.assertEqual(ar.EXIT_BLOCKED, code, out)
+                self.assertIn("developer executable could not be resolved", out["reason"])
+                state = self.state(env)
+                self.assertEqual((0, None), (state["developer"]["invocations"], state["developer"].get("launch")))
+                self.assertEqual([], env.developer.calls)
+
+    def test_provenance_is_checked_again_before_an_automatic_reviewer_retry(self):
+        env = self.fg_env()
+        env.commit("feature.txt", "v2\n", "feature v2")
+        env.push()
+
+        def turns_ineligible():  # SIMULATED: the session records a turn at another effort while Codex runs
+            env.developer.foreground = dict(env.developer.foreground, efforts=["high", "low"])
+        env.reviewer.during_run = turns_ineligible
+        env.reviewer.script = [{"raw": "not json (SIMULATED retryable failure)"}, {"decision": "ready_for_owner_review"}]
+        code, out, _ = self.review_cmd(env)
+        self.assertEqual(ar.EXIT_BLOCKED, code, out)
+        self.assertIn("recorded provenance does not match", out["reason"])
+        self.assertEqual(1, len(env.reviewer.calls))  # the retry never started
+        state = self.state(env)
+        self.assertEqual(({}, "BLOCKED"), (state["rounds_completed"], state["status"]))
+
+    def test_instruction_display_never_reads_another_enrollments_amendment(self):
+        other = self.fg_env()
+        other.commit("feature.txt", "v2\n", "feature v2")
+        other.push()
+        secret = "Owner amendment (simulated) that belongs to the OTHER job: OTHER-JOB-7d2.\n"
+        self.assertEqual(ar.EXIT_OK, self.resume(other.controller(), "other job", amendment=self.doc(other, "o.md",
+                                                                                                    secret))[0])
+        env = self.fg_env()
+        enrollment = self.state(env)["enrollment_id"]
+        claim = ar.registry_path("owner/repo", env.branch)  # labeled: the claim now points at the other job's state
+        data = ar.read_json(claim)
+        data["dir"] = str(other.dir)
+        ar.atomic_write_json(claim, data)
+        for extra in ([], ["--part", "1"]):
+            with self.subTest(extra=extra):
+                with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(ar.EXIT_USAGE, ar.main(["status", "--enrollment", enrollment, "--instructions",
+                                                             *extra], root=env.wf))
+                self.assertNotIn("OTHER-JOB-7d2", out.getvalue() + err.getvalue())
+                self.assertNotIn("delivery_marker", out.getvalue())
+                self.assertIn("belongs to another enrollment", err.getvalue())
+
+    def test_watch_attributes_activity_to_the_current_attempt(self):
+        env = Env("headless")
+        self.addCleanup(env.cleanup)
+        state = self.state(env)  # labeled: round 2 is retrying; attempt 1 ended earlier, attempt 2 just started
+        state["rounds"] = [{"round": 2, "status": "reviewing", "H": "0" * 40,
+                            "attempts": [{"n": 1, "started": ar.now_iso(), "ended": ar.now_iso()},
+                                         {"n": 2, "started": ar.now_iso()}]}]
+        ar.atomic_write_json(env.dir / "state.json", state)
+        folder = env.dir / "rounds" / "r02"
+        folder.mkdir(parents=True)
+        (folder / "events-1.jsonl").write_text(json.dumps({"type": "item.completed", "item": {
+            "type": "agent_message", "text": "ATTEMPT-ONE final note"}}) + "\n", encoding="utf-8")
+        (folder / "events-2.jsonl").write_text(json.dumps({"type": "thread.started", "thread_id": "t"}) + "\n",
+                                               encoding="utf-8")
+        pending = env.dir / "evidence" / "gate-unit-y.pending"  # a marker whose PID now belongs to another process
+        pending.parent.mkdir(parents=True, exist_ok=True)
+        ar.write_text(pending, json.dumps({"gate": "unit", "candidate": "2" * 40, "started": ar.now_iso(),
+                                           "pid": os.getpid()}) + "\n")
+        rows = []
+        ar.watch_enrollment(env.dir, rows.append, once=True)
+        status = [r for r in rows if "| reviewer Codex, round 2 attempt 2" in r][-1]
+        self.assertIn("latest action: none observed yet in this attempt", status)
+        self.assertNotIn("ATTEMPT-ONE", status)
+        self.assertIn("helper PID", status)
+        self.assertIn("identity unconfirmed", status)
+        with open(folder / "events-2.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "item.completed", "item": {"type": "agent_message",
+                                                                    "text": "ATTEMPT-TWO first note"}}) + "\n")
+        rows = []
+        ar.watch_enrollment(env.dir, rows.append, once=True)
+        status = [r for r in rows if "| reviewer Codex, round 2 attempt 2" in r][-1]
+        self.assertIn("latest action: Codex: ATTEMPT-TWO first note", status)
+
+    def test_watch_refuses_worktree_aliases_and_ownership_records_as_its_log(self):
+        import gc
+        import warnings
+        env = self.fg_env()
+        enrollment = self.state(env)["enrollment_id"]
+        claim = ar.registry_path("owner/repo", env.branch)
+        marker = Path(git(env.work, "rev-parse", "--absolute-git-dir")) / "agent-review-enrollment.json"
+        alias = env.root / "worktree-alias.log"
+        os.link(env.work / "README.md", alias)  # an external name for a worktree file
+        protected = {p: p.read_bytes() for p in (env.work / "README.md", claim, marker, env.dir / "state.json")}
+        for target in (alias, claim, marker):
+            with self.subTest(target=target.name):
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(ar.EXIT_USAGE, ar.main(["watch", "--enrollment", enrollment, "--once", "--log",
+                                                             str(target)], root=env.wf))
+                self.assertIn("watch refused", err.getvalue())
+        self.assertEqual(protected, {p: p.read_bytes() for p in protected})
+        log = env.root / "separate.log"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(ar.EXIT_OK, ar.main(["watch", "--enrollment", enrollment, "--once", "--log",
+                                                      str(log)], root=env.wf))
+            gc.collect()
+        self.assertIn("ACTIVE/develop", log.read_text(encoding="utf-8"))
+        self.assertFalse([w for w in caught if issubclass(w.category, ResourceWarning)])  # the log handle is closed
+
+    def test_amendment_parts_are_sized_by_their_serialized_display(self):
+        env = self.fg_env()
+        enrollment = self.state(env)["enrollment_id"]
+        env.commit("feature.txt", "v2\n", "feature v2")
+        env.push()
+        # under 8,000 source characters, but escape-heavy: supplementary characters print as 12 ASCII characters
+        text = "Owner amendment (simulated, escape-heavy UTF-8): " + ("\U0001F600漢字 " * 1700) + "\n"
+        self.assertLess(len(text), 8000)
+        code, out = self.resume(env.controller(), "an escape-heavy update", amendment=self.doc(env, "utf8.md", text))
+        self.assertEqual(ar.EXIT_OK, code)
+        self.assertLess(len(json.dumps(out, indent=2)), 12000)  # the resume display itself stays bounded
+        task = out["effective_task"]["amendments"]
+        self.assertIsNone(task["text"])
+        self.assertGreater(task["parts"], 1)
+        displays = []
+        for k in range(1, task["parts"] + 1):
+            with contextlib.redirect_stdout(io.StringIO()) as part:
+                self.assertEqual(ar.EXIT_OK, ar.main(["status", "--enrollment", enrollment, "--instructions",
+                                                      "--part", str(k)], root=env.wf))
+            self.assertLess(len(part.getvalue()), 12000)  # the whole printed display, framing included
+            displays.append(part.getvalue())
+        data = (env.dir / "amendments" / f"{task['sha256']}.md").read_text(encoding="utf-8")
+        self.assertEqual(data, "".join(json.loads(p)["effective_task_part"]["text_part"] for p in displays))
+        for d in displays[:-1]:
+            env.developer.show(d)
+        with self.assertRaises(ar.UsageError):  # one part missing
+            self.review_cmd(env, cite=task["report_citation"])
+        env.developer.show(displays[-1])
+        env.reviewer.script = [{"decision": "ready_for_owner_review"}]
+        self.assertEqual("ready_for_owner_review", self.review_cmd(env, cite=task["report_citation"])[1]["result"])
 
 
 if __name__ == "__main__":

@@ -318,12 +318,16 @@ current checkpoint's round count, elapsed time, the current role's latest
 observable action (with its age) and any blocker, plus a notice when no new
 agent event has arrived for `--stall-minutes` (default 10; a running process is
 not proof of progress). Rows replayed for context when a file is first seen are
-marked `(earlier)`; a gate marker without a receipt whose helper is no longer
-running is shown as interrupted. Event content is sanitized whole before it is
+marked `(earlier)`. Activity is attributed to the current developer invocation
+or reviewer attempt only (a new attempt with no event yet shows "none observed
+yet in this attempt"). A gate marker without a receipt is shown as interrupted
+when its helper PID is gone, and as "identity unconfirmed" when that PID is
+alive (a PID can be reused). Event content is sanitized whole before it is
 shortened. The state must name the requested enrollment (otherwise nothing of
 it is shown). `--once` prints one observation; `--log FILE` also appends the
-feed to a separate file the owner can tail (a path inside the enrollment's
-records or worktree, or naming one of its files, is refused):
+feed to a separate file the owner can tail. A path inside the enrollment's
+records, its worktree or the worktree's git dir, inside the host registry and
+locks, or an existing file with other hard links, is refused:
 
 ```powershell
 python $ar watch --enrollment <id> --log C:/Dev/<id>-live.log
@@ -485,9 +489,11 @@ supervisor never claims an agent saw text that only the supervisor received.
   superseded handoff) before it returns, and prints the effective task under
   `effective_task`: the mission path and sha256, and the amendments `revision`,
   `sha256`, precedence note, `report_citation` and full `text` followed by its
-  `delivery_marker`. A document longer than 8,000 characters is instead listed
-  as numbered `parts`; `status --instructions --part K` prints part K (its text
-  slice, then a part marker), each small enough for one displayed tool result.
+  `delivery_marker`. A document whose printed (JSON-escaped) text exceeds 9,000
+  characters is instead listed as numbered `parts`, cut by printed size so that
+  non-ASCII escapes cannot enlarge a part; `status --instructions --part K`
+  prints part K (its text slice, then a part marker), each small enough for one
+  displayed tool result.
   `status --instructions` prints the effective task read-only at any time. A
   foreground report is bound to the selected amendments only when the
   session's CLI-recorded transcript shows a successful tool result, at or

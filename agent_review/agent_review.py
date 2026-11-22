@@ -328,13 +328,24 @@ def jsonl_records(data: bytes):
     return records, parsed
 
 
-DELIVERY_PART_CHARS = 8000  # one part, JSON-encoded, stays well inside a single displayed tool result
+DELIVERY_PART_JSON_CHARS = 9000  # a part's PRINTED (JSON-escaped) size: well inside a single displayed tool result
 
 
 def amendment_parts(text):
-    """The cumulative amendments text cut into delivery parts of at most DELIVERY_PART_CHARS characters (one part when
-    it fits). Deterministic, so the controller can check every part's display."""
-    return [text[i:i + DELIVERY_PART_CHARS] for i in range(0, len(text), DELIVERY_PART_CHARS)] or [""]
+    """The cumulative amendments text cut into delivery parts whose JSON-encoded form (as printed, with non-ASCII
+    characters escaped) is at most DELIVERY_PART_JSON_CHARS characters; one part when it fits. Deterministic, so the
+    controller can check every part's display."""
+    parts, current, size = [], [], 0
+    for ch in text:
+        width = len(json.dumps(ch)) - 2  # 1 for printable ASCII; 6 or 12 for escaped characters
+        if current and size + width > DELIVERY_PART_JSON_CHARS:
+            parts.append("".join(current))
+            current, size = [], 0
+        current.append(ch)
+        size += width
+    if current or not parts:
+        parts.append("".join(current))
+    return parts
 
 
 def clean_text(value, limit=240) -> str:
@@ -2968,6 +2979,8 @@ class Controller:
         envelope = None
         while len(rnd["attempts"]) < self.limits["max_review_attempts_per_round"]:
             self.check_stop_request()
+            if self.state["mode"] == "foreground":  # current provenance before EVERY fresh attempt, retries included
+                self.require_foreground_launcher()
             envelope = self.review_attempt(rnd, rnd_dir)
             if envelope["ok"]:
                 break
@@ -2997,9 +3010,9 @@ class Controller:
                                                    self.cfg["developer"])
         except (OSError, ValueError, UsageError) as exc:
             problems = [f"the session transcript could not be read ({type(exc).__name__}: {exc})"]
-        if problems:
-            raise UsageError("review refused: the foreground session's recorded provenance does not match the owner "
-                             "policy (" + "; ".join(problems) + "). No reviewer was launched")
+        if problems:  # the enrolled session itself no longer matches the policy: a persisted, visible stop
+            raise Stop("BLOCKED", "the foreground session's recorded provenance does not match the owner policy ("
+                                  + "; ".join(problems) + "); no reviewer was launched and nothing was charged")
 
     def review_attempt(self, rnd, rnd_dir):
         # before anything is recorded or launched: the round's owner guidance and amendments must be current and intact
@@ -3821,6 +3834,11 @@ class Controller:
         guidance_rec, guidance_text = self.require_guidance(self.current_binding())  # before any charge or launch
         amend_rec, amend_text = self.require_guidance(self.current_binding("amendments"), "amendments")
         continuation = self.continuation_section()  # authenticated before any charge or launch
+        try:  # the executable is resolved lazily (reads need none): resolve it here, before any charge or launch
+            _ = self.developer.exe
+        except UsageError as exc:
+            raise Stop("BLOCKED", f"the developer executable could not be resolved ({exc}); no invocation was charged "
+                                  "or launched") from exc
         fields = self.common_fields()
         fields.update({"stop_file": str(self.stop_path), "worktree": self.state["repo_root"],
                        "push_command": " ".join(push_argv(self.cfg, self.wf, self.state["enrollment_id"]))
@@ -4165,8 +4183,12 @@ class Controller:
             raise UsageError("enrollment was cancelled")
         limit = int(max_rounds or self.limits["max_review_rounds_per_checkpoint"])
         if self.state["phase"] in ("develop", "review") and self.budget_exhausted(limit):
+            # corrections already decided and queued (for example an amendment's handoff-superseded notice saved just
+            # before an interruption) are still sent, so the PR never keeps showing a superseded handoff as current
+            self.settle_publications()
             raise UsageError(f"the review-round budget for {self.checkpoint['id']} is exhausted "
-                             f"({self.state['rounds_completed'].get(self.checkpoint['id'], 0)}/{limit}); pass a larger --max-rounds")
+                             f"({self.state['rounds_completed'].get(self.checkpoint['id'], 0)}/{limit}); pass a larger "
+                             "--max-rounds (queued corrections were sent; nothing else changed)")
         self.stop_path.unlink(missing_ok=True)
         self._resume_updates(reason, max_rounds)
         return self._continue_after_resume()
@@ -5819,7 +5841,9 @@ def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes
     `stall_minutes` while the enrollment is ACTIVE (a running process is not proof of progress). The state must name
     `expected_id`; otherwise nothing of it is shown. Works for older pinned enrollments too; nothing is written."""
     folder = Path(folder)
-    offsets, actions = {}, {}  # actions: source -> (sanitized row, observed time of its file)
+    # actions: (role, invocation or round/attempt) -> (sanitized row, observed time of its file); never shared between
+    # invocations or reviewer attempts, so a new attempt never inherits an earlier attempt's action or age
+    offsets, actions = {}, {}
     seen = {"stall": None, "key": None, "beat": 0.0}
     now = now or (lambda: dt.datetime.now(dt.timezone.utc))
 
@@ -5879,17 +5903,19 @@ def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes
         launch, last = dev.get("launch") or {}, (rounds[-1] if rounds else {})
         n = dev.get("invocations") or 0
         if n:
-            follow(folder / "developer" / f"stream-{n:03d}.jsonl", render_claude_event, "developer")
+            follow(folder / "developer" / f"stream-{n:03d}.jsonl", render_claude_event, ("developer", n))
         for attempt in last.get("attempts") or []:
             follow(folder / "rounds" / f"r{int(last['round']):02d}" / f"events-{attempt.get('n')}.jsonl",
-                   render_codex_event, "reviewer")
+                   render_codex_event, ("reviewer", last.get("round"), attempt.get("n")))
         open_attempt = [a for a in last.get("attempts") or [] if not a.get("ended")]
         role, since, source = "no agent running (controller or the foreground session)", None, None
         if open_attempt:
-            role, since, source = (f"reviewer Codex, round {last.get('round')}", parse_iso(open_attempt[-1].get("started")),
-                                   "reviewer")
+            role = f"reviewer Codex, round {last.get('round')} attempt {open_attempt[-1].get('n')}"
+            since, source = parse_iso(open_attempt[-1].get("started")), ("reviewer", last.get("round"),
+                                                                         open_attempt[-1].get("n"))
         elif launch and not launch.get("returned"):
-            role, since, source = f"developer Claude, invocation {launch.get('n')}", parse_iso(launch.get("at")), "developer"
+            role, since = f"developer Claude, invocation {launch.get('n')}", parse_iso(launch.get("at"))
+            source = ("developer", launch.get("n"))
         current = actions.get(source) if source else max(actions.values(), key=lambda a: a[1], default=None)
         gate = None
         evidence = folder / "evidence"
@@ -5902,9 +5928,9 @@ def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes
             with contextlib.suppress(OSError, ValueError):
                 g = read_json(path)
                 if (g.get("gate"), g.get("candidate"), g.get("started")) not in receipts:
-                    running = pid_alive(g.get("pid"))
-                    if running or gate is None or not gate[1]:
-                        gate = (g, running)
+                    alive = pid_alive(g.get("pid"))  # a PID can be reused: liveness alone is not identity
+                    if alive or gate is None or not gate[1]:
+                        gate = (g, alive)
         head = "?"
         with contextlib.suppress(Exception):
             head = Git(state["repo_root"]).head()[:12]
@@ -5916,7 +5942,8 @@ def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes
         gate_text = ""
         if gate:
             g, running = gate
-            gate_text = (f" | gate {g.get('gate')} running on {str(g.get('candidate'))[:12]}" if running else
+            gate_text = (f" | gate {g.get('gate')} on {str(g.get('candidate'))[:12]}: no receipt yet; helper PID "
+                         f"{g.get('pid')} is alive (identity unconfirmed)" if running else
                          f" | gate {g.get('gate')} marker on {str(g.get('candidate'))[:12]} has no receipt and its "
                          "helper is not running (interrupted)")
         blocker = (f" | blocker: {clean_text(state.get('status_reason'), 300)}"
@@ -5927,16 +5954,19 @@ def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes
                 + f" | candidate {head} (last reviewed {str(last.get('H') or '-')[:12]}: {last.get('decision') or '-'})"
                 + f" | {checkpoint or 'checkpoint ?'} rounds {done}/{limit}"
                 + f" | developer invocations {dev.get('invocations')}" + gate_text
-                + f" | latest action: {current[0] if current else 'none observed'}"
-                + (f" ({ago(current[1])} ago)" if current else "") + blocker)
+                + (f" | latest action: {current[0]} ({ago(current[1])} ago)" if current else
+                   " | latest action: none observed yet" + (" in this " + ("attempt" if source[0] == "reviewer"
+                                                                         else "invocation") if source else ""))
+                + blocker)
         if once or key != seen["key"] or time.monotonic() - seen["beat"] >= 60:
             emit(line)
             seen["key"], seen["beat"] = key, time.monotonic()
-        quiet = (now() - current[1]).total_seconds() if current else None
+        quiet_since = current[1] if current else since  # a current attempt with no event yet counts from its start
+        quiet = (now() - quiet_since).total_seconds() if quiet_since else None
         if state.get("status") == "ACTIVE" and quiet is not None and quiet >= stall_minutes * 60 and \
-                seen["stall"] != (current[1] if current else None):
-            emit(f"no new agent events for {ago(current[1])}; a running process is not proof of progress")
-            seen["stall"] = current[1]
+                seen["stall"] != quiet_since:
+            emit(f"no new agent events for {ago(quiet_since)}; a running process is not proof of progress")
+            seen["stall"] = quiet_since
         if once:
             return
         if state.get("status") in ("AWAITING_OWNER_REVIEW", "BLOCKED", "PAUSED", "CANCELLED") and \
@@ -5950,13 +5980,18 @@ def watch_log_problem(log, folder, state):
     """Why an optional watch output file is not acceptable: it must not be, or resolve to, any file of the enrollment's
     private records or its worktree (the observer never writes to what it observes). None when acceptable."""
     target = Path(log).resolve()
-    protected = [Path(folder).resolve()]
+    protected = [Path(folder).resolve(), host_dir().resolve()]  # host claims, registry and locks
     with contextlib.suppress(Exception):
         protected.append(Path(state["repo_root"]).resolve())
+    with contextlib.suppress(Exception):  # the worktree's git dir holds its ownership marker and writer lock
+        protected.append(Path(Git(state["repo_root"])("rev-parse", "--absolute-git-dir")).resolve())
     for root in protected:
         if target == root or root in target.parents:
             return f"{log} is inside {root}, which watch only reads"
     if target.exists():
+        with contextlib.suppress(OSError):
+            if os.stat(target).st_nlink > 1:  # another name for the same file could be any protected record
+                return f"{log} has other hard links, so it could be one of the files watch only reads"
         for path in Path(folder).rglob("*"):
             with contextlib.suppress(OSError):
                 if path.is_file() and os.path.samefile(path, target):
@@ -6390,6 +6425,8 @@ def dispatch(args, root=HERE):
                     state = read_json(folder / "state.json")
                 except (OSError, ValueError) as exc:
                     raise UsageError(f"watch refused: the enrollment state cannot be read ({type(exc).__name__})")
+                if not isinstance(state, dict) or state.get("enrollment_id") != args.enrollment:
+                    raise UsageError("watch refused: the state found for this enrollment belongs to another one")
                 problem = watch_log_problem(args.log, folder, state)
                 if problem:
                     raise UsageError(f"watch refused: {problem}; choose a separate log file")
@@ -6403,9 +6440,13 @@ def dispatch(args, root=HERE):
                 if log:
                     log.write(stamped + "\n")
                     log.flush()
-            with contextlib.suppress(KeyboardInterrupt):
-                watch_enrollment(folder, emit, once=args.once, interval=args.interval,
-                                 stall_minutes=args.stall_minutes, expected_id=args.enrollment)
+            try:
+                with contextlib.suppress(KeyboardInterrupt):
+                    watch_enrollment(folder, emit, once=args.once, interval=args.interval,
+                                     stall_minutes=args.stall_minutes, expected_id=args.enrollment)
+            finally:
+                if log:
+                    log.close()
             return EXIT_OK
         if args.command == "install":
             print(json.dumps({"installed": str(Path(args.dest).resolve()),
@@ -6485,6 +6526,9 @@ def dispatch(args, root=HERE):
         controller = Controller(find_enrollment(args.enrollment), workflow_root=root)
         if args.command == "status":
             if getattr(args, "instructions", False):  # read-only; prints the amendments text with its digest
+                if controller.state.get("enrollment_id") != args.enrollment:
+                    raise UsageError(f"the state found for {args.enrollment} belongs to another enrollment; nothing "
+                                     "is shown")
                 try:
                     if getattr(args, "part", None) is not None:
                         print(json.dumps({"enrollment": controller.state["enrollment_id"],
