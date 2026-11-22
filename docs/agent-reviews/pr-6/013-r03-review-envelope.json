@@ -1,0 +1,162 @@
+{
+  "B": "baba3c1c13fa0fab11ccbfa78a8723c848d7eff2",
+  "H": "8f8f83ee61ee088412cb24eb2669d2dc1df6aa1d",
+  "M": "baba3c1c13fa0fab11ccbfa78a8723c848d7eff2",
+  "checkpoint_id": "final",
+  "checkpoint_type": "final",
+  "fatal": false,
+  "guidance_revision": 1,
+  "guidance_sha256": "8f748530915f09f2692d49f0c52fb3f57515895ac969ce38dc8ba6c18391cf84",
+  "invocation": {
+    "completed": true,
+    "duration_s": 602.4,
+    "errors": [],
+    "exit_code": 0,
+    "failed": false,
+    "observed": {
+      "approval_policy": "never",
+      "cli_version": "0.170.0",
+      "network": "restricted",
+      "observed_effort": "max",
+      "observed_model": "gpt-6.2-astra",
+      "plan_type": "pro",
+      "rollout_found": true,
+      "sandbox": "read-only",
+      "source": "Codex session rollout (CLI-recorded thread settings; not model-authored)",
+      "subagent_suspected": false,
+      "turn_efforts": [
+        "max"
+      ],
+      "turn_models": [
+        "gpt-6.2-astra"
+      ],
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 2862848,
+        "input_tokens": 3031644,
+        "output_tokens": 19457,
+        "reasoning_output_tokens": 13632,
+        "total_tokens": 3051101
+      }
+    },
+    "requested": {
+      "effort": "max",
+      "model": "gpt-6.2-astra",
+      "sandbox": "read-only"
+    },
+    "thread_id": "01a203bf-1795-7350-a1fe-b5056ee95bd8",
+    "timed_out": false
+  },
+  "mission": {
+    "id": "continuation-handoff-mission",
+    "sha256": "abe6330457a5202b3a47a2dcfa67064ca7294931909be5f692f6ad0b51984c50"
+  },
+  "ok": true,
+  "path": "~\\.agent-review\\state\\devproc-claude-continuation-handoff-20261122025808-720e\\rounds\\r03\\envelope-1.json",
+  "pr": 6,
+  "project_sha256": "bfa331169cea8fba3787ed5e96ca38b201fd5e1dc5c32dc93204de79f638664d",
+  "protocol": "agent-review.v1",
+  "publication": "r03-review",
+  "published": [
+    {
+      "comment_id": 7081003676,
+      "of": 1,
+      "part": 1,
+      "url": "https://github.com/howardreith/development-process/pull/6#issuecomment-7081003676"
+    }
+  ],
+  "raw_result_if_rejected": null,
+  "reasons": [],
+  "repository": "howardreith/development-process",
+  "request_id": "devproc-claude-continuation-handoff-20261122025808-720e-r03-c8e381",
+  "response_sha256": "2e97135bf4ab7c68f8d3c661f93588ff2e50d809da67790c52ceea3d4eef1226",
+  "result": {
+    "candidate_commit": "8f8f83ee61ee088412cb24eb2669d2dc1df6aa1d",
+    "checkpoint_id": "final",
+    "checkpoint_type": "final",
+    "decision": "changes_required",
+    "decision_rationale": "All four prior fixes are verified. One status defect remains. After an amendment retires a verdict or handoff receipt, the controller can keep reporting that publication as pending indefinitely.\n\nContinuation for Claude\n\nCorrect the `pending_publications` filter so it reports work awaiting delivery or reconciliation. A superseded record with a settled delivery outcome should drop out of the list. Keep the change confined to status reporting and its tests. Extend the two existing rejected-POST amendment fixtures to check the retired keys, preserve visibility of genuinely uncertain delivery, and run the required `unit` gate on the pushed correction.",
+    "evidence_assessment": {
+      "executed_verification": [
+        "The CLI transcript records the guarded push of 8f8f83ee61ee088412cb24eb2669d2dc1df6aa1d and the pinned controller starting `verify --gate unit`. The candidate-bound receipt records exit 0, an unchanged worktree and 659.4 seconds. The log matches its recorded SHA-256 and reports 256 tests run with one live smoke test skipped.",
+        "The candidate gate passed the headless fixtures for rejected verdict and receipt posts, publication of a PR-safe replacement, partial-request withdrawal through handoff, remote edit and deletion detection, and replay of an older amendment file.",
+        "The transcript also records 52 focused tests passing before the candidate commit. In a separate handoff-reopen fixture, the candidate gate log prints the retired receipt `final-status-24d0760809` under `pending_publications`."
+      ],
+      "inspected": [
+        "The pinned mission and owner guidance, repository instructions, full feature diff, correction commit, prior findings ledger, developer report, CLI transcript, gate receipt and gate log.",
+        "The controller's amendment admission, publication retirement, archive, remote readiness and status paths, their behavior tests, both developer prompts, the reviewer prompt and the operator playbook."
+      ],
+      "limitations": [
+        "The review used the supplied execution records in the read-only snapshot. The behavior fixtures use real Git repositories, controller state and archive commits with simulated model and GitHub boundaries.",
+        "The supplemental live-model gates were not run. Delivery of the eventual handoff notification in the launching conversation is a supervisor duty."
+      ],
+      "required_gaps": [
+        "R3-F1 requires accurate status output for settled verdicts and receipts retired by an amendment, with assertions in the headless fixtures."
+      ],
+      "source_inspection_only": [
+        "The headless rejected-POST fixtures establish that the verdict and receipt become `superseded`. Their continued appearance in amendment status follows directly from the filter at line 4392. Those fixtures do not assert the returned list for either key."
+      ]
+    },
+    "findings": [
+      {
+        "acceptance_ids": [
+          "B. Apply at the next safe boundary, without re-enrollment",
+          "B. Both roles receive the same effective instructions",
+          "Owner execution addendum \u00a76"
+        ],
+        "actual": "`retire_verdict` and `retire_receipts` mark the old publication `superseded`. `send` treats that state as terminal, but `status` excludes only `posted` and `withdrawn`. The retired `r01-review` or `final-status-\u2026` key therefore stays in `pending_publications` after its correction has posted.",
+        "blocking_rationale": "The supervisor can report outstanding public work, or wait for it to clear, even though the controller has settled the amendment and will never send that publication.",
+        "blocks_readiness": true,
+        "category": "defect",
+        "expected": "Once retirement and its correction are settled, status omits the retired key. Any part whose delivery is still uncertain remains visible.",
+        "id": "R3-F1",
+        "location": {
+          "file": "agent_review/agent_review.py",
+          "line": 4392
+        },
+        "priority": "P2",
+        "requested_correction": "Use the same distinction between settled publication states and unresolved POST outcomes that guidance admission already uses.",
+        "requested_evidence": "In the existing failed-verdict and failed-first-receipt amendment fixtures, inspect status after the correction posts and assert that each retired key is absent. Also confirm that a part with `posting_since` and no confirmed comment ID remains listed.",
+        "title": "Status lists retired verdicts and handoff receipts as pending",
+        "trigger": "Apply an amendment after definitive rejection of a verdict POST or the first handoff-receipt POST, then inspect the enrollment's status."
+      }
+    ],
+    "prior_finding_assessments": [
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R1-F3",
+        "rationale": "The two candidate-bound fixtures confirm the public correction names the affected round and commit. A rejected verdict leads to withdrawal of the posted request. A rejected first receipt leads to correction of the ready verdict without a reopened-handoff notice. Neither path launches another reviewer."
+      },
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R1-F5",
+        "rationale": "The refusal fixture checks unchanged state after the unsafe submission, then publishes a safe replacement in the same enrollment. It verifies the replacement text, revision 1 and cumulative document digest in the posted request."
+      },
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R2-F1",
+        "rationale": "The multipart fixture reaches a current handoff with one delivered part archived, the unsent suffix withdrawn and the request absent from pending publications. Editing or deleting the delivered part makes remote verification identify `r01-request`."
+      },
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R2-F2",
+        "rationale": "Replay detection checks the saved path and message digest across all revisions. After conflicting amendments A and B, retrying A's original file preserves the state bytes, call count and selection of B. A newly saved file containing A's words is accepted as revision 3."
+      }
+    ],
+    "request_id": "devproc-claude-continuation-handoff-20261122025808-720e-r03-c8e381",
+    "round": 3,
+    "schema_version": "agent-review.review.v1",
+    "summary": {
+      "delivered_behavior": "Authenticated reviewer continuations reach resumed and fresh developer sessions. Cumulative owner amendments reach both roles, require a fresh report and preserve the enrollment's findings and expenditure. The fixtures exercise publication, archival and remote handoff verification.",
+      "pending_later_phase_work": [],
+      "remaining_owner_review": [
+        "After a verified handoff on [draft PR #6](https://github.com/howardreith/development-process/pull/6), the owner decides whether to accept and install the reviewed controller and whether to activate it for any existing enrollment between runs."
+      ],
+      "scope_reviewed": "The complete continuation and owner-amendment mission at the final checkpoint, with the correction review focused on the four pending findings and the publication states their fixes produce.",
+      "unresolved_questions": []
+    }
+  },
+  "round": 3,
+  "validated_at": "2026-11-22T15:03:07Z",
+  "workflow_fingerprint": "47c5403b45f726fc55881bc27a24030b5cf4e05c6d743bf22b7c4b6418ec2ae8"
+}
