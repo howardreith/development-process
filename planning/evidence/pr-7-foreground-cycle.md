@@ -208,3 +208,14 @@ record was malformed; attempts are not rounds) and the controller retried automa
    transcript; the same report was admitted.
 4. Codex: "The candidate implements the original addition requirement and the subtraction requested by OWNER
    AMENDMENT 1." `ready_for_owner_review`, bound to amendment revision 1; handoff posted by `finalize`.
+
+## 6. Round 4 of this PR and the owner's decision
+
+The enrolled session submitted `8c233d0` (`unit` through `verify`: 290 tests OK, 1 skipped, 908.8 s). Codex
+verified 7 of the 8 pending fixes ([review comment](https://github.com/howardreith/development-process/pull/7#issuecomment-7085402653))
+and raised R4-F1..R4-F3; R2-F4 (watch log destinations) had then been open for three consecutive reviews, so the
+controller's no-progress rule stopped the enrollment BLOCKED at 4/5 rounds. The session reported the exact state to
+the owner in the conversation and asked for the smallest decision; the owner chose to resume and use the last round
+(no budget change). The owner `resume` restarted the no-progress count. The session removed the watch log option
+(eliminating the destination class rather than adding path rules), fixed R4-F1..R4-F3 with tests and mutation checks,
+and committed the batch as `5158b1f393ec0a1aeea00a2e63f6d15e0d6f8316` (full suite 292 tests OK, 1 skipped, before commit).
