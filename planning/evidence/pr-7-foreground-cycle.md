@@ -219,3 +219,21 @@ the owner in the conversation and asked for the smallest decision; the owner cho
 (no budget change). The owner `resume` restarted the no-progress count. The session removed the watch log option
 (eliminating the destination class rather than adding path rules), fixed R4-F1..R4-F3 with tests and mutation checks,
 and committed the batch as `5158b1f393ec0a1aeea00a2e63f6d15e0d6f8316` (full suite 292 tests OK, 1 skipped, before commit).
+
+## 7. Round 5, the owner's one-round extension, and the final correction batch
+
+Round 5 on `167b8db` (`unit` through `verify`: 292 tests OK, 1 skipped) returned `changes_required`
+([review comment](https://github.com/howardreith/development-process/pull/7#issuecomment-7085965329)); the enrollment
+stopped BLOCKED at the cap (5/5). The session reported the state; the owner then authorized exactly one further round
+(limit 6, no round 7), independently reproduced R5-F1 without any outage (an older amendment, 1/5 spent and a refused
+`resume --max-rounds 1` published "budget exhausted (1/5)" and closed admission; a refused resume at a genuine
+no-progress stop overwrote its reason), and asked for tests that fail on `167b8db` first. The earlier handoff's claim
+that both recovery findings required an outage/amendment/cap coincidence was wrong and is corrected here.
+
+The session ran the owner's `resume --max-rounds 6` (limit 5 to 6), wrote six behavior tests, and ran them against the
+`167b8db` logic with only a no-behavior watch test seam added: all six failed for the reasons in the findings (one
+fixture-timing assertion was corrected and re-run so the continuing-watch test failed at the age-of-action defect).
+It then implemented the correction, committed as `1c92fed57a8d763db0e358c305ee18e93be2d437` (all six pass; full suite 298 tests OK, 1 skipped, before
+commit; mutations of the proposed/authorized distinction and the marker gate make their tests fail). No new real-model
+demonstration was run: these changes do not touch the amendment-delivery, review-return or live-output paths that the
+demonstrations in sections 2, 4 and 5 exercised.
