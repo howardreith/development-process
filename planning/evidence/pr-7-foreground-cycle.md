@@ -182,3 +182,29 @@ sha256 (LF) `8fc3a4abbac9f7456bb30ad48b79b2ee17edcaba92bd4c37d49902eef1050dac`; 
 4. Codex reviewed against the full document: "The subtraction test checks four distinct reference rows, satisfying
    the minimum of three in OWNER AMENDMENT 1." `ready_for_owner_review`; round 1 bound to amendment revision 1;
    `finalize` posted the handoff (source `ac6fd1c`, archive `73f8a14`).
+
+## 5. Round 3 of this PR, and an escape-heavy UTF-8 amendment (R2-F5)
+
+**Round 3.** The enrolled session submitted `2cc19f7` (`unit` through `verify`: 283 tests OK, 1 skipped, 1098.7 s).
+The first reviewer attempt was rejected by the controller's existing provenance validation (Codex's own rollout
+record was malformed; attempts are not rounds) and the controller retried automatically. The accepted attempt
+([review comment](https://github.com/howardreith/development-process/pull/7#issuecomment-7084606273)) verified 9 of the
+12 pending fixes and raised R3-F1..R3-F5. The session explained the batch in the conversation and committed it as
+`b81d2feb1745666ade60d2c6c8be273cc0c3cf17` (full suite 290 tests OK, 1 skipped, before commit).
+
+**Escape-heavy amendment, in the actual interface.** Controller code exercised: `agent_review/agent_review.py` of
+`b81d2fe`, sha256 (LF) `eefca244304f7b1c73659c3045c8d4c3baa94952064d074f6d576336d042c267`; fixture enrollment
+`t-codex-feature-20261122150639-e44d`, bound to and verified against this session's real transcript; REAL Codex
+`gpt-6.2-astra`/max; GitHub simulated; developer steps by the session.
+
+1. A labeled demonstration amendment (written by the session, not an instruction from the owner): a `subtract`
+   requirement plus 240 lines of localized notes with emoji, kana/kanji and U+2212: **7,436 source characters, but
+   21,361 characters once JSON-escaped**, the form the displays print. Under the round-2 rule (8,000 source
+   characters per part) it would have been a single ~21 KB display; under the serialized rule it became **3 parts**.
+   Printed sizes: resume output 3,734 bytes; part displays 9,614 / 9,614 / 4,513 bytes.
+2. Parts 1 and 2 displayed in the conversation; `subtract` implemented (`a679e4d`, gate passed); a report citing
+   `prepared under owner amendments revision 1 sha256 d4cf8a03…` was **refused** (part 3 missing).
+3. Part 3 displayed; `status` reported `shown_in_foreground_session_at: 2026-11-22T20:07:41.489Z` from the real
+   transcript; the same report was admitted.
+4. Codex: "The candidate implements the original addition requirement and the subtraction requested by OWNER
+   AMENDMENT 1." `ready_for_owner_review`, bound to amendment revision 1; handoff posted by `finalize`.
