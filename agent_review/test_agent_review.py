@@ -6461,7 +6461,9 @@ class AmendmentBoundaryTests(OwnerFlowFixture, Base):
                                                  state["publications"]["r01-review"]["state"]))
         reviews = len(env.reviewer.calls)
         env.developer.script += [self.paused()]
-        self.assertEqual(ar.EXIT_PAUSED, self.resume(env.controller(), amendment=self.doc(env, "a1.md", self.A1))[0])
+        code, out = self.resume(env.controller(), amendment=self.doc(env, "a1.md", self.A1))
+        self.assertEqual(ar.EXIT_PAUSED, code)
+        self.assertEqual([], out["pending_publications"])  # the retired verdict is settled once its correction posts
         correction = [c["body"] for c in env.gh.comments_list if "round 1 review request is withdrawn" in c["body"]]
         self.assertEqual(1, len(correction))
         self.assertIn(f"`{ar.short(h)}` will not receive a current verdict", correction[0])
@@ -6490,7 +6492,15 @@ class AmendmentBoundaryTests(OwnerFlowFixture, Base):
         self.assertFalse(any(p.get("comment_id") for p in state["publications"][receipts[0]]["parts"]))
         reviews = len(env.reviewer.calls)
         env.developer.script += [self.paused("final")]
-        self.assertEqual(ar.EXIT_PAUSED, self.resume(env.controller(), amendment=self.doc(env, "a1.md", self.A1))[0])
+        code, out = self.resume(env.controller(), amendment=self.doc(env, "a1.md", self.A1))
+        self.assertEqual(ar.EXIT_PAUSED, code)
+        self.assertEqual([], out["pending_publications"])  # the retired receipt is settled once the correction posts
+        state = self.state(env)  # labeled: a retired record whose POST outcome is unknown stays listed
+        state["publications"][receipts[0]]["parts"][0]["posting_since"] = ar.now_iso()
+        ar.atomic_write_json(env.dir / "state.json", state)
+        self.assertEqual([receipts[0]], env.controller().status()["pending_publications"])
+        state["publications"][receipts[0]]["parts"][0].pop("posting_since")
+        ar.atomic_write_json(env.dir / "state.json", state)
         correction = [c["body"] for c in env.gh.comments_list if "round 2 ready verdict is not current" in c["body"]]
         self.assertEqual(1, len(correction))
         self.assertIn(f"decision above for `{ar.short(h)}` no longer applies", correction[0])

@@ -4388,8 +4388,12 @@ class Controller:
             "developer_session": s["developer"]["session_id"], "developer_invocations": s["developer"]["invocations"],
             "developer_running": pid_alive(s["developer"].get("active_pid")),
             "lock_holder": holder, "stop_requested": self.stop_path.exists(),
+            # the same settled/unsettled rule guidance admission uses: superseded and withdrawn records are terminal
+            # (never sent again), but any part whose POST outcome is still unknown keeps its record listed
             "pending_publications": sorted(k for k, p in s.get("publications", {}).items()
-                                           if p["state"] not in ("posted", "withdrawn")),  # withdrawn: settled
+                                           if p["state"] not in ("posted", "superseded", "withdrawn")
+                                           or any(q.get("posting_since") and not q.get("comment_id")
+                                                  for q in p.get("parts", []))),
             "archive_pending": bool(s.get("archive_pending")),
             "workflow_fingerprint_matches": fp_ok, "updated_at": s.get("updated_at"),
         }

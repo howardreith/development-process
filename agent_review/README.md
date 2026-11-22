@@ -349,7 +349,9 @@ supervisor never claims an agent saw text that only the supervisor received.
   A handoff that reached the PR is moved to `superseded_handoffs` with its
   receipt retired by a public correction, a `reopened` notice and a PR status
   update. The `STOP` file is consumed only
-  once this save succeeds.
+  once this save succeeds. `status.pending_publications` lists only records
+  still to be sent or whose POST outcome is unknown: retired (`superseded`)
+  and `withdrawn` records are settled and are not listed.
   The report binding is cleared and the phase returns to `develop` without
   launching any model. Findings, `rounds_completed`, developer invocations,
   limits, models, permissions and gates are untouched: nothing is refunded or
