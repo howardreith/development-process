@@ -220,60 +220,84 @@ python $ar resume --enrollment <id> --reason "change the repair approach" --guid
 
 - **Supported state.** An idle `BLOCKED` or `PAUSED` enrollment in the
   `develop` phase. Idle means no running developer (including an interrupted
-  launch whose session process is still alive), no reviewer attempt without an
-  end record, no push/verify helper holding the helper lock and no configured
-  runtime lock. The round budget (under any `--max-rounds` passed in the same
-  call) and the developer invocation budget must not be exhausted; guidance
-  never raises a budget. In any other status or phase (`ACTIVE`,
+  headless launch whose session process is still alive; in foreground mode,
+  the enrolled interactive session's transcript must show that its last turn
+  ended, so a turn in progress, a pending tool call or an unreadable
+  transcript refuses), no reviewer attempt without an end record, no
+  push/verify helper holding the helper lock and no configured runtime lock.
+  Neither the enrolled round budget nor the developer invocation budget may be
+  exhausted, and a `--max-rounds` in the same call cannot lift an exhausted
+  budget (extend it with an ordinary `resume --max-rounds` first; guidance
+  never accompanies a budget extension). `--resend-undelivered` cannot be
+  combined with `--guidance`. In any other status or phase (`ACTIVE`,
   `AWAITING_OWNER_REVIEW`, `review`, `finalize`, …) `--guidance` is refused
-  with exit code 4; it is never ignored. `resume` without `--guidance` behaves
-  exactly as before.
-- **Validation before any change.** The file is read, decoded as UTF-8 and
-  hashed before the writer lock is taken; a missing or non-regular file,
-  invalid UTF-8, an empty or whitespace-only document, or one over 64 KiB is
-  refused. Status, phase, idleness and budgets are checked under the writer
-  lock, after the host/worktree claims, before anything is written. A refusal
-  (exit 4) leaves `state.json`, the `STOP` file and every counter untouched
-  and launches nothing. (The command's usual identity, workflow-fingerprint
-  and mission guard still runs before capture; if it finds an impediment the
-  enrollment stops as for any `resume`, and nothing is captured.) Content is
-  never validated as natural language.
+  with exit code 4; it is never ignored. The one exception is recovery:
+  re-supplying the current revision's exact document (which adds no revision)
+  is also accepted in `review` and `finalize`. `resume` without `--guidance`
+  behaves exactly as before.
+- **Validation before any change.** The file is read (at most 64 KiB + 1
+  byte), decoded as UTF-8 and hashed before the writer lock is taken; a
+  missing or non-regular file, invalid UTF-8, an empty or whitespace-only
+  document, or one over 64 KiB is refused. Under the writer lock, after the
+  host/worktree claims, the controller checks read-only that the
+  owner-selected enrollment ID, the loaded state, its directory and both
+  ownership claims name the same enrollment (a misdirected registry entry is
+  refused), then status, phase, idleness and budgets, then the usual
+  identity, workflow-fingerprint and mission guard. Any failure is a refusal
+  (exit 4) that leaves `state.json`, the `STOP` file, every counter and the
+  PR untouched and launches nothing. Content is never validated as natural
+  language.
 - **Capture.** The exact bytes are copied to
   `<enrollment>/guidance/r<NNN>-<sha256 prefix>.md` and recorded in
   `state.json` (`guidance.revisions`: revision, sha256, size, source path,
-  reason, time) in the same transaction as the resume. Editing or deleting the
+  reason, time) in the same state save as the resume. The `STOP` file is
+  consumed only after that save: an interruption leaves either the complete
+  earlier state with its `STOP` file (an unselected snapshot file is inert),
+  or the new revision recorded with the stop request still pending, which
+  pauses at the next boundary until resumed again. Editing or deleting the
   original file afterwards changes nothing.
 - **Delivery.** Every later developer prompt (start or continuation, including
   correction re-invocations) contains the captured text, its revision and
-  sha256 and the path of the in-state copy; the first invocation after a new
-  revision is told that a fresh report is required. The reviewer gets a copy
-  as `.agent-review-inputs/owner-guidance.md` inside its snapshot, and its
-  prompt names that copy and the digest. Both prompts state that the guidance
-  supplements the repair approach under the mission and does not alter models,
-  permissions, budgets, acceptance criteria or finding status. In foreground
-  mode the controller launches no developer: `resume` prints the in-state path
-  and digest, and `status` shows them (`guidance`). The guidance text is never
-  published to GitHub; only its digest is.
+  sha256 and the path of the in-state copy; its guidance section tells the
+  first invocation after a new revision that a fresh report is required. The
+  reviewer gets a copy as `.agent-review-inputs/owner-guidance.md` inside its
+  snapshot, and its prompt names that copy and the digest. Both prompts state
+  that the guidance supplements the repair approach under the mission and does
+  not alter models, permissions, budgets, acceptance criteria or finding
+  status. In foreground mode the controller launches no developer: `resume`
+  prints the in-state path and digest, `status` shows them (`guidance`,
+  including `foreground_ack`), and `review --report` is refused until the
+  session acknowledges the revision with `--guidance-ack <revision>:<sha256>`.
+  A report identical to one submitted before that revision was captured is
+  refused as a replay. The controller publishes only the guidance binding
+  (revision and digest) and keeps the document in private state; text that
+  the agents write in their reports, dispositions and findings is published
+  as usual and may quote or paraphrase the guidance.
 - **Records.** Each round records `guidance_revision`/`guidance_sha256`; the
   reviewer's `request.json`, the validated envelope, the published request and
-  review comments and therefore the archived records name the digest that
-  applied, or `none`.
+  review comments and therefore the archived records name the revision and
+  digest that applied, or `none`.
 - **Persistence and revisions.** The current revision applies to every later
   invocation, review round, controller restart and ordinary `resume`. A later
   `--guidance` with different content adds a revision and keeps every earlier
   snapshot and digest; identical content to the current revision adds none.
-- **Freshness.** A developer report is bound to the guidance current when it
-  was accepted. After a new revision the next review needs a fresh report,
-  even on an unchanged commit. An outstanding request is not reused, and a
-  validated, ready or handed-off result bound to different guidance (or to
+  Returning to an earlier document (A, B, then A again) is a new revision.
+- **Freshness.** A developer report, round, envelope and ready result are
+  bound to a revision *and* its digest. After a new revision the next review
+  needs a fresh report, even on an unchanged commit and even when the new
+  revision restores earlier bytes. An outstanding request is not reused, and a
+  validated, ready or handed-off result bound to another revision (or to
   none) is not accepted and does not satisfy readiness. Earlier rounds keep
   their original binding.
-- **Failure modes.** Before every developer launch, review request and
-  reviewer launch the controller verifies the snapshot against its digest. A
-  missing or altered snapshot stops the enrollment `BLOCKED` with that reason,
-  before any launch or charge; an ordinary `resume` refuses to continue past
-  it (the `STOP` file and counters stay). Re-supplying the identical document
-  with `resume --guidance` restores the snapshot; different content is refused
+- **Failure modes.** Before every developer launch, before a review request is
+  recorded or published, and before every reviewer launch, the controller
+  verifies the snapshot against its digest (one bounded read; the developer's
+  text is decoded from that verified buffer). A missing or altered snapshot,
+  or a selection that names no recorded revision, stops the enrollment
+  `BLOCKED` with that reason, before any launch or charge; an ordinary
+  `resume` refuses to continue past it (the `STOP` file and counters stay).
+  Re-supplying the identical document with `resume --guidance` restores the
+  snapshot in `develop`, `review` or `finalize`; different content is refused
   until the current revision is restored, so its record is never lost.
   Enrollments that never received guidance, including state written before
   this option existed, load, run and archive unchanged.
