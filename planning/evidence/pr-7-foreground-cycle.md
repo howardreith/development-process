@@ -149,3 +149,36 @@ that became this PR's `watch` command (excerpt; note the interval with no new ag
 The same observation now comes from `python agent_review.py watch --enrollment <id> [--once] [--log FILE]` of this
 candidate, which was also run read-only against that (completed) enrollment's preserved files. Enrollments stayed on
 their pinned versions; no second writer was started.
+
+## 4. Round 2 of this PR, and the long-amendment delivery route (R2-F5)
+
+**Round 2 (installed controller, same enrollment and session).** The enrolled session submitted `f04f135`
+(`unit` through `verify`: 274 tests OK, 1 skipped, 713.5 s) with `review --report`; the read-only `watch` command of
+the candidate relayed the reviewer's messages into the conversation while it ran, for example
+`[18:04:29Z] Codex: … The amendment checks now reject a digest-only display and an unchanged old report. I found a
+recovery path that can still label an earlier round as newly accepted …` and `[18:11:16Z] Codex: I found that watch
+sanitizes an event for immediate display, then reuses the original text in its status line …`. Accepted at 18:16:39:
+`changes_required`, 10 of the 15 round-1 findings verified, 5 reopened and 7 new
+([review comment](https://github.com/howardreith/development-process/pull/7#issuecomment-7083478693)). The session
+explained the round-2 batch to the owner in the conversation and committed it as
+`97e37843a2db50d1dba252fee654ce2481b38a57` (full suite 283 tests OK, 1 skipped, before commit).
+
+**Long amendment, in the actual interface.** Controller code exercised: `agent_review/agent_review.py` of `97e3784`,
+sha256 (LF) `8fc3a4abbac9f7456bb30ad48b79b2ee17edcaba92bd4c37d49902eef1050dac`; fixture enrollment
+`t-codex-feature-20261122135146-5b60`, bound to and verified against this session's real transcript; the REAL Codex
+`gpt-6.2-astra`/max reviewer; GitHub simulated; developer steps by the session itself.
+
+1. The session applied a clearly labeled demonstration amendment of 35,494 characters (a `subtract` requirement plus
+   a 1,300-row reference table; written by the session, not an instruction from the owner) with
+   `resume --amend-mission` at ACTIVE develop: exit 0, revision 1, sha256 `28004f1d…`, captured document 36,028
+   bytes. The printed `effective_task` held no `text` but `parts: 5` and the five
+   `status --enrollment … --instructions --part K` commands (the whole output was 3,910 bytes).
+2. The session displayed parts 1–4 in the conversation (each output about 8.9 KB: the text slice, then
+   `agent-review effective task part K/5 delivered: …`), implemented `subtract` with four reference rows
+   (`ac6fd1c`, gate passed) and submitted a report citing `prepared under owner amendments revision 1 sha256
+   28004f1d…`: **refused**, "has not been verifiably displayed in this session" (part 5 missing).
+3. The session displayed part 5; `status` then reported `shown_in_foreground_session_at: 2026-11-22T18:52:57.271Z`
+   from the real transcript, and the same report was accepted.
+4. Codex reviewed against the full document: "The subtraction test checks four distinct reference rows, satisfying
+   the minimum of three in OWNER AMENDMENT 1." `ready_for_owner_review`; round 1 bound to amendment revision 1;
+   `finalize` posted the handoff (source `ac6fd1c`, archive `73f8a14`).
