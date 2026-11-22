@@ -330,9 +330,10 @@ started". Records observed afterwards, including a file created for a new
 invocation or attempt, are stamped with the time the watch observed them. Every
 complete record resets the silence clock, whether or not it is displayable;
 blank lines and a record still being written do not. With no agent running, the
-latest run is chosen by the controller's recorded launch and attempt times;
-when the records cannot order the runs, the latest action is shown as
-uncertain. `--once` prints one observation. `watch` never
+latest run is chosen by the controller's recorded launch and attempt times,
+including reviewer attempts that a `resume` retained in `earlier_attempts` (only
+current attempts can be the running reviewer); when the records cannot order
+the runs, the latest action is shown as uncertain. `--once` prints one observation. `watch` never
 opens a file for writing: to keep or tail the feed, redirect the console output
 to a file of your choosing outside the enrollment's records and worktree:
 
@@ -438,14 +439,23 @@ python $ar resume --enrollment <id> --reason "owner update of <date>" --amend-mi
 
 At the cap, the amendment's transaction also records which amendment was
 applied there (`capped_amendment`, bound to its revision, digest and
-checkpoint). If a publication outage then replaces that BLOCKED status, the
-record is marked for restoration. A later ordinary `resume` sends the queued
-corrections, then restores that blocker and queues its notice in one
-transaction, and still refuses (no rounds, no launches). A `resume
---max-rounds N` whose N does not exceed the rounds already spent, while the
-authorized budget is not yet spent, is refused with nothing changed. A refusal
-at a genuine cap leaves any other stop reason, such as a no-progress stop,
+checkpoint). Whenever a stop is about to replace exactly that BLOCKED status,
+the command path marks the record for restoration in the same save as the stop.
+That covers a publication failure during the amendment's own settlement, during
+an ordinary capped `resume`, or while the restored notice is delivered. A later
+ordinary `resume` sends the queued corrections, restores that blocker, records
+the transition and queues its notice in one transaction, then still refuses (no
+rounds, no launches). A restoration notice that was still pending when the
+blocker was displaced keeps its identity and is never repeated. A refusal at a
+genuine cap leaves any other stop reason, such as a no-progress stop,
 untouched. An extension clears the record.
+
+`resume --max-rounds N` is admitted on the freshly loaded state before any other
+guard or change. N must be a whole number above the review rounds already spent
+for the active checkpoint; 0 is an explicit value, not "omitted". A refused N
+changes nothing: no stop request is consumed, no delivery marker is cleared, no
+handoff is reopened, no limit or permission rebinding is saved, nothing is
+published and nothing is launched.
 
 **Headless procedure** (unattended runs: the supervisor stops the background
 `run`, waits, applies, and runs again; the owner only supplies the instruction):

@@ -4185,11 +4185,13 @@ class Controller:
                 self.state.update(status="AWAITING_OWNER_REVIEW", status_reason="handoff verified current on resume")
                 self.save()
                 return "AWAITING_OWNER_REVIEW (the handoff is still current)"
-            self.reopen(moved, int(max_rounds or self.limits["max_review_rounds_per_checkpoint"]), extend_to=max_rounds)
+            self.reopen(moved, int(max_rounds) if max_rounds is not None else
+                        int(self.limits["max_review_rounds_per_checkpoint"]), extend_to=max_rounds)
         if self.state["phase"] == "cancelled":
             raise UsageError("enrollment was cancelled")
         authorized = int(self.limits["max_review_rounds_per_checkpoint"])  # the persisted authorized limit
-        limit = int(max_rounds or authorized)  # the limit this resume proposes (the authorized one when none is given)
+        # the limit this resume proposes (admitted by admit_round_limit), or the authorized one when none is given
+        limit = int(max_rounds) if max_rounds is not None else authorized
         cp, spent = self.checkpoint["id"], self.state["rounds_completed"].get(self.checkpoint["id"], 0)
         if self.state["phase"] in ("develop", "review") and self.budget_exhausted(limit):
             if not self.budget_exhausted(authorized):
@@ -4279,6 +4281,34 @@ class Controller:
             self.release_guidance_admission()
         return self._continue_after_resume()
 
+    def capped_amendment_applies(self):
+        """The `capped_amendment` record when it names the selected amendment (revision and digest), the active
+        checkpoint and a still-exhausted persisted budget; else None."""
+        marker = self.state.get("capped_amendment")
+        if not isinstance(marker, dict):
+            return None
+        try:
+            rec = self.guidance_record("amendments")
+        except Stop:
+            return None
+        if not rec or (marker.get("revision"), marker.get("sha256")) != (rec["revision"], rec["sha256"]) or \
+                marker.get("checkpoint") != self.checkpoint["id"] or not self.budget_exhausted():
+            return None
+        return marker
+
+    def note_displaced_capped_blocker(self):
+        """Called by the command path just before it saves a stop that replaces the current status (for example a
+        publication failure during the amendment's settlement, an ordinary capped resume, or delivery of the restored
+        notice): when the status being replaced is exactly the applicable capped amendment's blocker, mark its recovery
+        as needed (in the same save as the stop) and remember whether that cycle's restoration notice had already
+        been delivered, so recovery neither loses nor repeats it."""
+        marker = self.capped_amendment_applies()
+        if not marker or self.state.get("status") != "BLOCKED" or self.state.get("status_reason") != marker.get("reason"):
+            return
+        notice = self.state.get("publications", {}).get(marker.get("notice_key") or "")
+        marker["restore_needed"] = True
+        marker["notice_delivered_before_displacement"] = bool(notice and notice.get("state") == "posted")
+
     def restore_capped_amendment_block(self):
         """Restore the budget blocker of the amendment that durable state records as applied at the persisted cap AND
         whose recovery was interrupted (`capped_amendment.restore_needed`, set only when an outage replaced that
@@ -4286,22 +4316,42 @@ class Controller:
         status, its transition and the queued notice are saved together; the notice is sent after the save, so an
         interruption before delivery leaves exactly one queued notice for the next settlement. Returns whether it
         restored anything; any other stop reason is left untouched."""
-        marker = self.state.get("capped_amendment")
-        if not isinstance(marker, dict) or not marker.get("restore_needed"):
-            return False
-        rec = self.guidance_record("amendments")
-        if not rec or (marker.get("revision"), marker.get("sha256")) != (rec["revision"], rec["sha256"]) or \
-                marker.get("checkpoint") != self.checkpoint["id"] or not self.budget_exhausted():
+        marker = self.capped_amendment_applies()
+        if not marker or not marker.get("restore_needed"):
             return False
         reason = marker["reason"]
+        previous = self.state.get("publications", {}).get(marker.get("notice_key") or "")
+        # the restoration notice queued before the displacement (still pending, or delivered by the settlement that
+        # preceded this call) is the same-purpose notice: it keeps its durable identity instead of being repeated
+        reuse = bool(previous) and not marker.get("notice_delivered_before_displacement")
         with self.txn():
             self.state.update(status="BLOCKED", status_reason=reason)
             self.transition(self.state["phase"], f"BLOCKED: {reason} (restored after the capped amendment's "
                                                  "interrupted recovery)", save=False)
-            self.queue_status("BLOCKED", reason)
+            if not reuse:
+                marker["notice_key"] = f"status-{len(self.state.get('transitions', []))}-blocked"
+                self.queue_status("BLOCKED", reason)
             marker["restore_needed"] = False
+            marker["notice_delivered_before_displacement"] = False
         self.settle_publications()
         return True
+
+    def admit_round_limit(self, max_rounds):
+        """Command admission for `resume --max-rounds N` (read-only, on freshly loaded state, before any guard, rebinding,
+        resend, handoff reopening, stop consumption or publication). An omitted limit (None) is always admitted; an
+        explicit one must be a whole number above the review rounds already spent for the active checkpoint, or the
+        command is refused with nothing changed."""
+        if max_rounds is None:
+            return
+        cp = self.checkpoint["id"]
+        spent = self.state["rounds_completed"].get(cp, 0)
+        authorized = int(self.limits["max_review_rounds_per_checkpoint"])
+        if isinstance(max_rounds, bool) or not isinstance(max_rounds, int) or max_rounds < 1:
+            raise RefusedUnchanged(f"--max-rounds {max_rounds} is not a positive whole number; the authorized limit "
+                                   f"stays {authorized}. Nothing was changed")
+        if max_rounds <= spent:
+            raise RefusedUnchanged(f"--max-rounds {max_rounds} does not exceed the {spent} review round(s) already "
+                                   f"spent for {cp}; the authorized limit stays {authorized}. Nothing was changed")
 
     def budget_block_reason(self):
         return (f"review-round budget for {self.checkpoint['id']} is exhausted "
@@ -4314,17 +4364,7 @@ class Controller:
             return self.run_loop()
         # foreground has no loop: queued public work (for example an amendment's handoff-superseded corrections) is
         # sent now, so the PR never keeps showing a superseded handoff as current until the session's next command
-        try:
-            self.settle_publications()
-        except Exception:
-            marker, rec = self.state.get("capped_amendment"), None
-            with contextlib.suppress(Stop):
-                rec = self.guidance_record("amendments")
-            if isinstance(marker, dict) and rec and self.state["status"] == "BLOCKED" and \
-                    (marker.get("revision"), marker.get("sha256")) == (rec["revision"], rec["sha256"]):
-                marker["restore_needed"] = True  # the outage stop will replace this blocker; recovery restores it
-                self.save()
-            raise
+        self.settle_publications()  # a failure here is recorded by the command path (note_displaced_capped_blocker)
         if self.state["status"] == "BLOCKED":  # persisted together with the change that caused it (amendment at cap)
             raise Stop("BLOCKED", self.state["status_reason"], persisted=True)
         if self.state["phase"] in ("develop", "review") and self.budget_exhausted():
@@ -4351,7 +4391,7 @@ class Controller:
             # failed attempts stay recorded; the owner's resume grants a fresh attempt budget
             active["earlier_attempts"] = active.get("earlier_attempts", []) + active["attempts"]
             active["attempts"] = []
-        if max_rounds:
+        if max_rounds is not None:
             self.state["limits"]["max_review_rounds_per_checkpoint"] = int(max_rounds)
             self.state.pop("capped_amendment", None)  # an explicit extension ends the capped state
         if (self.state.get("status_reason") or "").startswith("no progress"):
@@ -4937,7 +4977,7 @@ class Controller:
                                      f"{self.checkpoint['id']} is exhausted; resume with a larger --max-rounds") \
             if exhausted else ("ACTIVE", f"handoff superseded: {moved}")
         with self.txn():
-            if extend_to:  # the owner-authorized limit persists in the same save as the status it justifies
+            if extend_to is not None:  # the owner-authorized limit persists in the same save as the status it justifies
                 self.state["limits"]["max_review_rounds_per_checkpoint"] = int(extend_to)
             self.retire_receipts(f"Handoff superseded: {moved}")
             if self.state.get("handoff") or self.state.get("ready_review"):
@@ -5977,7 +6017,11 @@ def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes
         n = dev.get("invocations") or 0
         if n:
             follow(folder / "developer" / f"stream-{n:03d}.jsonl", render_claude_event, ("developer", n))
-        for attempt in last.get("attempts") or []:
+        # completed attempts a resume retained in `earlier_attempts` plus the current ones (attempt numbers are
+        # monotonic and each has its own event file); only current attempts can be the running reviewer
+        retained = {a.get("n"): a for a in (last.get("earlier_attempts") or []) + (last.get("attempts") or [])
+                    if isinstance(a, dict)}
+        for attempt in retained.values():
             follow(folder / "rounds" / f"r{int(last['round']):02d}" / f"events-{attempt.get('n')}.jsonl",
                    render_codex_event, ("reviewer", last.get("round"), attempt.get("n")))
         open_attempt = [a for a in last.get("attempts") or [] if not a.get("ended")]
@@ -5993,7 +6037,7 @@ def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes
         if not source:  # no agent running: the latest run by the controller's recorded execution order
             runs = ([(parse_iso(launch.get("at")), ("developer", launch.get("n")))] if launch.get("n") and n else [])
             runs += [(parse_iso(a.get("started")), ("reviewer", last.get("round"), a.get("n")))
-                     for a in last.get("attempts") or []]
+                     for a in retained.values()]
             if runs and all(t for t, _ in runs):
                 newest = max(t for t, _ in runs)
                 tied = [key for t, key in runs if t == newest]
@@ -6253,12 +6297,14 @@ COMMAND_STATUSES = {"run": {"ACTIVE"}, "review": {"ACTIVE"}, "finalize": {"ACTIV
 
 
 def guarded(controller, command, fn, mutate=True, honor_stop=False, precheck=None, extra=None, extra_on_stop=None,
-            on_locked=None):
+            on_locked=None, admit=None):
     """Run fn under the single-writer lock with reloaded state and the pre-mutation guard. Status eligibility and
     the host/worktree claims are re-checked after locking, so a stale process cannot act on old authority. A
     precheck refusal (UsageError), like those checks, leaves the state file untouched. extra(result), when given,
     adds keys to the printed result (stdout); progress never goes to stdout. on_locked() runs right after the reload,
-    before any guard that can stop the command (for example to record the accepted rounds a stop output compares)."""
+    before any guard that can stop the command (for example to record the accepted rounds a stop output compares).
+    admit() is a read-only admission on the freshly loaded state that runs before the claims, workflow and input
+    guards (which may save a due permission rebinding) and before fn: a refusal changes nothing."""
     with controller.lock(command):
         controller.reload()
         if on_locked:
@@ -6266,6 +6312,8 @@ def guarded(controller, command, fn, mutate=True, honor_stop=False, precheck=Non
         allowed = COMMAND_STATUSES.get(command)
         if allowed and controller.state["status"] not in allowed:
             raise UsageError(f"enrollment is {controller.state['status']}; {command} is not permitted now")
+        if admit:
+            admit()
         if precheck:  # a read-only admission (claims, eligibility, workflow and guard) that refuses without mutation
             precheck()
         controller.assert_claims()
@@ -6294,6 +6342,7 @@ def guarded(controller, command, fn, mutate=True, honor_stop=False, precheck=Non
             if getattr(stop, "persisted", False):  # saved, with its notice queued, by the transaction that caused it
                 controller.reload()
             else:
+                controller.note_displaced_capped_blocker()  # in the same save as the stop that displaces it
                 controller.state["status"], controller.state["status_reason"] = stop.status, stop.reason
                 controller.state.setdefault("transitions", []).append(
                     {"at": now_iso(), "from": controller.state.get("phase"), "to": controller.state.get("phase"),
@@ -6348,7 +6397,8 @@ def resume_command(controller, reason, max_rounds=None, resend_undelivered=False
         return controller.newly_accepted_review(before.get("accepted")) if foreground else {}
     try:
         return guarded(controller, "resume", _resume, precheck=precheck, extra=_extra, extra_on_stop=_extra_on_stop,
-                       on_locked=lambda: before.update(accepted=controller.accepted_rounds()))  # before any guard
+                       on_locked=lambda: before.update(accepted=controller.accepted_rounds()),  # before any guard
+                       admit=lambda: controller.admit_round_limit(max_rounds))
     finally:
         controller.release_guidance_admission()  # never left held, whatever happened before capture
 
