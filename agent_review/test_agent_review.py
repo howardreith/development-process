@@ -7781,7 +7781,7 @@ class ForegroundRoundThreeTests(ForegroundFixture, Base):
             with self.subTest(attempt=attempt):
                 with self.assertRaises(ar.UsageError) as refused:
                     self.resume(env.controller(), "owner recovery after the interruption")
-                self.assertIn("queued corrections were sent", str(refused.exception))
+                self.assertIn("budget for final is exhausted (1/1)", str(refused.exception))
                 self.assertEqual(1, len(self.headings_with(env, "Workflow — reopened")))
                 self.assertEqual(1, len(self.headings_with(env, "the owner-review handoff above is not current")))
                 self.assertEqual(1, len(self.headings_with(env, "Workflow — blocked")))
@@ -8046,6 +8046,246 @@ class ForegroundRoundFourTests(ForegroundFixture, Base):
         rows = []
         ar.watch_enrollment(env.dir, rows.append, once=True, stall_minutes=10, now=later)
         self.assertTrue(any("no new agent events for" in r for r in rows), rows)
+
+
+class ForegroundRoundSixTests(ForegroundFixture, Base):
+    """Round-6 corrections (PR #7): a proposed round limit is distinguished from the persisted authorized limit, so a
+    refused proposal changes no status, reason, admission or accounting; a capped amendment's blocker is restored only
+    when durable state marks that amendment's interrupted recovery, in one transaction with its queued notice; a single
+    continuing watch times newly observed events by observation, ignores blank and partial records, orders sources by
+    the controller's recorded execution history and treats streams created after attachment as live."""
+
+    SINGLE = {"schema_version": "agent-review.plan.v1", "mission_id": "f", "title": "f",
+              "checkpoints": [{"id": "final", "type": "final", "scope": "s", "exit_conditions": ["e"]}]}
+
+    def amend_and_show(self, env, name="u1.md"):
+        code, out = self.resume(env.controller(), "owner amends the task", amendment=self.doc(env, name, self.A1))
+        self.assertEqual(ar.EXIT_OK, code, out)
+        env.developer.show(json.dumps(out, indent=2))  # SIMULATED: the full update reached the session
+        return out["effective_task"]["amendments"]["report_citation"]
+
+    @staticmethod
+    def accounting(state):
+        return (state["status"], state.get("status_reason"), state["phase"], state["limits"],
+                {k: v.get("rounds_open") for k, v in state.get("findings", {}).items()})
+
+    def test_a_refused_proposed_limit_changes_no_authorization_status_or_admission(self):
+        env = self.fg_env()
+        env.commit("feature.txt", "v2\n", "feature v2")
+        env.push()
+        cite = self.amend_and_show(env)  # an older amendment, applied before any review
+        env.reviewer.script = [{"decision": "changes_required", "findings": [finding("R1-F1")]}]
+        self.assertEqual("changes_required", self.review_cmd(env, cite=cite)[1]["result"])  # 1 of 5 rounds spent
+        before, posted = self.state(env), len(env.gh.comments_list)
+        with self.assertRaises(ar.UsageError) as refused:
+            self.resume(env.controller(), "a proposed limit below the rounds spent", max_rounds=1)
+        after = self.state(env)
+        self.assertEqual(self.accounting(before), self.accounting(after))  # status, reason, limit, streaks
+        self.assertEqual(("ACTIVE", 5), (after["status"], after["limits"]["max_review_rounds_per_checkpoint"]))
+        self.assertEqual(posted, len(env.gh.comments_list))  # no false "budget exhausted" notice
+        self.assertEqual([], env.controller().helper_authority_problems())  # admission stays open
+        self.assertIn("authorized limit stays 5", str(refused.exception))
+
+    def test_a_refused_resume_at_a_no_progress_cap_keeps_the_reason_and_a_later_extension_resets_the_streak(self):
+        env = Env("foreground", max_rounds=2, plan=self.SINGLE)
+        self.addCleanup(env.cleanup)
+        env.commit("feature.txt", "v2\n", "feature v2")
+        env.push()
+        cite = self.amend_and_show(env)
+        env.reviewer.script = [{"decision": "changes_required", "findings": [finding("R1-F1")]},
+                               {"decision": "changes_required", "findings": [finding("R1-F1")],
+                                "assessments": [("R1-F1", "rebuttal_rejected")]}]
+        self.assertEqual("changes_required", self.review_cmd(env, cite=cite)[1]["result"])
+        code, out, _ = self.review_cmd(env, cite=cite, dispositions=[{
+            "finding_id": "R1-F1", "disposition": "rebutted", "commits": [], "evidence": "simulated rebuttal"}])
+        self.assertEqual(ar.EXIT_BLOCKED, code, out)
+        stopped = self.state(env)
+        self.assertTrue(stopped["status_reason"].startswith("no progress"), stopped["status_reason"])
+        self.assertEqual({"final": 2}, stopped["rounds_completed"])  # the genuine cap
+        with self.assertRaises(ar.UsageError):
+            self.resume(env.controller(), "resume without a new authorization")
+        self.assertEqual(self.accounting(stopped), self.accounting(self.state(env)))  # the no-progress reason survives
+        code, out = self.resume(env.controller(), "owner extends the budget", max_rounds=3)
+        self.assertEqual(ar.EXIT_OK, code, out)
+        state = self.state(env)
+        self.assertEqual(("ACTIVE", 0), (state["status"], state["findings"]["R1-F1"]["rounds_open"]))  # streak reset
+
+    def outage_at_cap(self):
+        """A handed-off final round at its cap, then an amendment whose queued PR-body edit fails once."""
+        env = Env("foreground", max_rounds=1, plan=self.SINGLE)
+        self.addCleanup(env.cleanup)
+        env.commit("feature.txt", "v2\n", "feature v2")
+        env.push()
+        env.reviewer.script = [{"decision": "ready_for_owner_review"}]
+        self.assertEqual("ready_for_owner_review", self.review_cmd(env)[1]["result"])
+        self.assertEqual("AWAITING_OWNER_REVIEW", self.finalize_cmd(env)[1]["status"])
+        original, failures = env.gh.edit_body, {"left": 1}
+
+        def edit_body(number, body_file):  # SIMULATED: the queued PR-body edit fails once
+            if failures["left"]:
+                failures["left"] -= 1
+                raise ar.CommandError(["gh", "pr", "edit"], subprocess.CompletedProcess([], 1, "", "simulated outage"))
+            return original(number, body_file)
+        env.gh.edit_body = edit_body
+        code, out = self.resume(env.controller(), "owner amends at the cap", amendment=self.doc(env, "u1.md", self.A1))
+        self.assertEqual(ar.EXIT_PAUSED, code, out)
+        return env
+
+    def test_an_interrupted_restoration_delivers_exactly_one_restored_notice(self):
+        env = self.outage_at_cap()
+        reviews, developer_calls = len(env.reviewer.calls), len(env.developer.calls)
+        ctl = env.controller()
+        original_settle, calls = ctl.settle_publications, {"n": 0}
+
+        def settle():
+            calls["n"] += 1
+            if calls["n"] == 2:  # SIMULATED exit: the restored state and its notice intent are saved, not delivered
+                raise SimulatedCrash()
+            return original_settle()
+
+        def publish_status(*_args, **_kwargs):  # an immediate (unqueued) delivery path would be interrupted too
+            raise SimulatedCrash()
+        ctl.settle_publications, ctl.publish_status = settle, publish_status
+        with self.assertRaises(SimulatedCrash):
+            self.resume(ctl, "owner recovery after the outage")
+        self.assertEqual("BLOCKED", self.state(env)["status"])  # durably restored before the interruption
+        for attempt in (1, 2):
+            with self.subTest(attempt=attempt):
+                with self.assertRaises(ar.UsageError):
+                    self.resume(env.controller(), "owner recovery, again")
+                state = self.state(env)
+                self.assertEqual(("BLOCKED", env.controller().budget_block_reason()),
+                                 (state["status"], state["status_reason"]))
+                blocked = [h for h in env.gh.headings() if "Workflow — blocked" in h]
+                self.assertEqual(2, len(blocked))  # the original block and exactly one restored notice
+                self.assertIn("handoff superseded by owner amendment 1", env.gh.body)
+                self.assertEqual(({"final": 1}, reviews, developer_calls),
+                                 (state["rounds_completed"], len(env.reviewer.calls), len(env.developer.calls)))
+
+    # ---- watch: a single continuing observer with real files and a controlled clock
+    def reviewer_attempts(self, env, attempts):
+        state = self.state(env)
+        state["rounds"] = [{"round": 1, "status": "reviewing", "H": "0" * 40, "attempts": attempts}]
+        ar.atomic_write_json(env.dir / "state.json", state)
+
+    @staticmethod
+    def record(kind, **item):
+        return json.dumps({"type": kind, "item": item}) + "\n"
+
+    def test_a_continuing_watch_times_new_events_by_observation_and_ignores_incomplete_records(self):
+        env = Env("headless")
+        self.addCleanup(env.cleanup)
+        clock = {"t": ar.dt.datetime.now(ar.dt.timezone.utc)}
+        self.reviewer_attempts(env, [{"n": 1, "started": (clock["t"] - ar.dt.timedelta(hours=1)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")}])
+        events = env.dir / "rounds" / "r01" / "events-1.jsonl"
+        events.parent.mkdir(parents=True)
+        events.write_text(self.record("item.started", type="command_execution", command="rg -n FIRST-CMD"),
+                          encoding="utf-8")
+        old = time.time() - 3600
+
+        def append(text):
+            with open(events, "a", encoding="utf-8") as f:
+                f.write(text)
+            os.utime(events, (old, old))  # the sampled modification time stays old
+        os.utime(events, (old, old))
+
+        def advance(minutes):
+            clock["t"] += ar.dt.timedelta(minutes=minutes)
+        rows, steps = [], [
+            lambda: (append(self.record("item.completed", type="agent_message", text="SECOND-NOTE")), advance(1)),
+            lambda: (advance(8), append(self.record("item.completed", type="reasoning", text="filtered"))),
+            lambda: advance(8),
+            lambda: (append("\n   \n" + '{"type": "item.completed", "item": {"type": "agent_mes'), advance(11)),
+            lambda: (append('sage", "text": "THIRD-NOTE"}}\n'), advance(1)),
+        ]
+
+        def sleep(_interval):
+            rows.append(f"== step {sum(1 for r in rows if r.startswith('== step')) + 1}")
+            steps[sum(1 for r in rows if r.startswith("== step")) - 1]()
+        ar.watch_enrollment(env.dir, rows.append, interval=0, stall_minutes=10, now=lambda: clock["t"], sleep=sleep,
+                            max_polls=6)
+        segments, current = [[]], 0
+        for row in rows:
+            if row.startswith("== step"):
+                segments.append([])
+                current += 1
+            else:
+                segments[current].append(row)
+        attach = "\n".join(segments[0])
+        self.assertIn("latest action: Codex ▸ $ rg -n FIRST-CMD (before this watch started)", attach)
+        self.assertRegex(attach, r"no new agent events for (59m5\ds|1h00m)")  # genuinely quiet at attachment
+        new = "\n".join(segments[1])
+        self.assertIn("Codex: SECOND-NOTE", new)
+        self.assertNotIn("(earlier)", new)
+        self.assertIn("latest action: Codex: SECOND-NOTE (0m00s ago)", new)  # observation time, not the old mtime
+        for k in (2, 3):  # the filtered complete event reset the silence clock
+            self.assertFalse(any("no new agent events" in r for r in segments[k]), segments[k])
+        self.assertTrue(any("no new agent events for 19m" in r for r in segments[4]), segments[4])  # blank/partial
+        self.assertFalse(any("no new agent events" in r for r in segments[5]), segments[5])  # completed record
+        self.assertIn("Codex: THIRD-NOTE", "\n".join(segments[5]))
+
+    def test_attachment_selects_the_latest_source_by_recorded_execution_order(self):
+        env = Env("headless")
+        self.addCleanup(env.cleanup)
+        base = ar.dt.datetime.now(ar.dt.timezone.utc)
+        stamp = lambda minutes: (base - ar.dt.timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa
+        state = self.state(env)  # labeled: a developer invocation, then two ended reviewer attempts
+        state["developer"].update(invocations=1, launch={"n": 1, "at": stamp(30), "returned": True})
+        state["rounds"] = [{"round": 1, "status": "accepted", "H": "0" * 40, "decision": "changes_required",
+                            "attempts": [{"n": 1, "started": stamp(20), "ended": stamp(18)},
+                                         {"n": 2, "started": stamp(15), "ended": stamp(10)}]}]
+        ar.atomic_write_json(env.dir / "state.json", state)
+        (env.dir / "developer").mkdir(parents=True, exist_ok=True)
+        (env.dir / "developer" / "stream-001.jsonl").write_text(json.dumps(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "DEV-ACTION"}]}}) + "\n",
+            encoding="utf-8")
+        folder = env.dir / "rounds" / "r01"
+        folder.mkdir(parents=True)
+        for n in (1, 2):
+            (folder / f"events-{n}.jsonl").write_text(self.record("item.completed", type="agent_message",
+                                                                  text=f"ATTEMPT-{n}-NOTE"), encoding="utf-8")
+        rows = []
+        ar.watch_enrollment(env.dir, rows.append, once=True)
+        status = [r for r in rows if "| no agent running" in r][-1]
+        self.assertIn("latest action: Codex: ATTEMPT-2-NOTE (before this watch started)", status)
+        state = self.state(env)  # labeled: an older record without the times needed to order its sources
+        state["developer"]["launch"].pop("at")
+        for attempt in state["rounds"][0]["attempts"]:
+            attempt.pop("started")
+        ar.atomic_write_json(env.dir / "state.json", state)
+        rows = []
+        ar.watch_enrollment(env.dir, rows.append, once=True)
+        status = [r for r in rows if "| no agent running" in r][-1]
+        self.assertIn("latest action: uncertain", status)  # no false "latest"
+
+    def test_a_stream_created_after_attachment_is_live_activity(self):
+        env = Env("headless")
+        self.addCleanup(env.cleanup)
+        clock = {"t": ar.dt.datetime.now(ar.dt.timezone.utc)}
+        iso = lambda t: t.strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa: E731
+        self.reviewer_attempts(env, [{"n": 1, "started": iso(clock["t"] - ar.dt.timedelta(minutes=9)),
+                                      "ended": iso(clock["t"] - ar.dt.timedelta(minutes=5))}])
+        folder = env.dir / "rounds" / "r01"
+        folder.mkdir(parents=True)
+        (folder / "events-1.jsonl").write_text(self.record("item.completed", type="agent_message", text="OLD-ATTEMPT"),
+                                               encoding="utf-8")
+        rows = []
+
+        def new_attempt(_interval):  # a retry starts after the watch attached
+            rows.append("== step 1")
+            clock["t"] += ar.dt.timedelta(minutes=1)
+            self.reviewer_attempts(env, [{"n": 1, "started": iso(clock["t"] - ar.dt.timedelta(minutes=10)),
+                                          "ended": iso(clock["t"] - ar.dt.timedelta(minutes=6))},
+                                         {"n": 2, "started": iso(clock["t"])}])
+            (folder / "events-2.jsonl").write_text(self.record("item.completed", type="agent_message",
+                                                               text="NEW-ATTEMPT-NOTE"), encoding="utf-8")
+        ar.watch_enrollment(env.dir, rows.append, interval=0, now=lambda: clock["t"], sleep=new_attempt, max_polls=2)
+        after = rows[rows.index("== step 1") + 1:]
+        self.assertIn("Codex: NEW-ATTEMPT-NOTE", after)  # emitted as live, not replayed history
+        status = [r for r in after if "| reviewer Codex, round 1 attempt 2" in r][-1]
+        self.assertIn("latest action: Codex: NEW-ATTEMPT-NOTE (0m00s ago)", status)
+        self.assertNotIn("OLD-ATTEMPT", status)
 
 
 if __name__ == "__main__":

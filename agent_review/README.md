@@ -324,9 +324,15 @@ yet in this attempt"). A gate marker without a receipt is shown as interrupted
 when its helper PID is gone, and as "identity unconfirmed" when that PID is
 alive (a PID can be reused). Event content is sanitized whole before it is
 shortened. The state must name the requested enrollment (otherwise nothing of
-it is shown). An action replayed at attachment is labeled "before this watch
-started"; silence is measured from the latest complete event record, not only
-from the latest displayable row. `--once` prints one observation. `watch` never
+it is shown). Files present when the watch attaches are history: their tail is
+replayed as `(earlier)` and their latest action is labeled "before this watch
+started". Records observed afterwards, including a file created for a new
+invocation or attempt, are stamped with the time the watch observed them. Every
+complete record resets the silence clock, whether or not it is displayable;
+blank lines and a record still being written do not. With no agent running, the
+latest run is chosen by the controller's recorded launch and attempt times;
+when the records cannot order the runs, the latest action is shown as
+uncertain. `--once` prints one observation. `watch` never
 opens a file for writing: to keep or tail the feed, redirect the console output
 to a file of your choosing outside the enrollment's records and worktree:
 
@@ -429,6 +435,17 @@ python $ar resume --enrollment <id> --reason "owner update of <date>" --amend-mi
 #    report under the amended task with `report_citation` in evidence_refs. At the round cap the command stops BLOCKED
 #    instead (applied, not delivered) until a separate owner extension.
 ```
+
+At the cap, the amendment's transaction also records which amendment was
+applied there (`capped_amendment`, bound to its revision, digest and
+checkpoint). If a publication outage then replaces that BLOCKED status, the
+record is marked for restoration. A later ordinary `resume` sends the queued
+corrections, then restores that blocker and queues its notice in one
+transaction, and still refuses (no rounds, no launches). A `resume
+--max-rounds N` whose N does not exceed the rounds already spent, while the
+authorized budget is not yet spent, is refused with nothing changed. A refusal
+at a genuine cap leaves any other stop reason, such as a no-progress stop,
+untouched. An extension clears the record.
 
 **Headless procedure** (unattended runs: the supervisor stops the background
 `run`, waits, applies, and runs again; the owner only supplies the instruction):

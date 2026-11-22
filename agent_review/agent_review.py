@@ -3016,7 +3016,7 @@ class Controller:
             self.save()
             problems = [f"the session transcript could not be read ({type(exc).__name__}"
                         + (f", errno {exc.errno}" if isinstance(exc, OSError) and exc.errno is not None else "")
-                        + "; local `status` notes name the details)"]
+                        + "; the notes in the enrollment's private state.json name the details)"]
         if problems:  # the enrolled session itself no longer matches the policy: a persisted, visible stop
             raise Stop("BLOCKED", "the foreground session's recorded provenance does not match the owner policy ("
                                   + "; ".join(problems) + "); no reviewer was launched and nothing was charged")
@@ -4188,23 +4188,25 @@ class Controller:
             self.reopen(moved, int(max_rounds or self.limits["max_review_rounds_per_checkpoint"]), extend_to=max_rounds)
         if self.state["phase"] == "cancelled":
             raise UsageError("enrollment was cancelled")
-        limit = int(max_rounds or self.limits["max_review_rounds_per_checkpoint"])
+        authorized = int(self.limits["max_review_rounds_per_checkpoint"])  # the persisted authorized limit
+        limit = int(max_rounds or authorized)  # the limit this resume proposes (the authorized one when none is given)
+        cp, spent = self.checkpoint["id"], self.state["rounds_completed"].get(self.checkpoint["id"], 0)
         if self.state["phase"] in ("develop", "review") and self.budget_exhausted(limit):
-            # corrections already decided and queued (for example an amendment's handoff-superseded notice saved just
-            # before an interruption) are still sent, so the PR never keeps showing a superseded handoff as current
+            if not self.budget_exhausted(authorized):
+                # a proposed limit at or below the rounds already spent, while the authorized budget is not spent:
+                # refused, and nothing (status, reason, admission, limits, no-progress accounting) changes
+                raise RefusedUnchanged(f"--max-rounds {limit} is not above the {spent} review round(s) already spent "
+                                       f"for {cp}; the authorized limit stays {authorized}. Nothing was changed")
+            # the authorized budget is genuinely spent. Already queued, authorized corrections (for example an
+            # amendment's handoff-superseded notice saved just before an interruption) are still sent; the only
+            # status change is the restoration of a capped amendment's blocker that durable state marks as needed
             self.settle_publications()
-            amended = self.state.get("amendments") and self.state["amendments"].get("current")
-            if amended and self.state["mode"] == "foreground" and \
-                    (self.state["status"], self.state.get("status_reason")) != ("BLOCKED", self.budget_block_reason()):
-                # a resolved outage (for example a PR-body edit that failed and was just completed) no longer
-                # describes the enrollment: the capped amendment's blocker is restored and stated publicly once
-                reason = self.budget_block_reason()
-                self.state.update(status="BLOCKED", status_reason=reason)
-                self.transition(self.state["phase"], f"BLOCKED: {reason} (restored after queued corrections were sent)")
-                self.publish_status("BLOCKED", reason)
-            raise UsageError(f"the review-round budget for {self.checkpoint['id']} is exhausted "
-                             f"({self.state['rounds_completed'].get(self.checkpoint['id'], 0)}/{limit}); pass a larger "
-                             "--max-rounds (queued corrections were sent; nothing else changed)")
+            restored = self.restore_capped_amendment_block()
+            raise UsageError(f"the review-round budget for {cp} is exhausted ({spent}/{authorized}); continuing needs "
+                             f"an owner extension (`resume --max-rounds N` with N above {spent}). "
+                             + ("Queued corrections were sent and the capped amendment's budget blocker was restored "
+                                "after its interrupted recovery." if restored else
+                                "Queued corrections, if any, were sent; the enrollment's status was not changed."))
         self.stop_path.unlink(missing_ok=True)
         self._resume_updates(reason, max_rounds)
         return self._continue_after_resume()
@@ -4265,10 +4267,41 @@ class Controller:
                     self.state.update(status="BLOCKED", status_reason=blocked)
                     self.transition(self.state["phase"], f"BLOCKED: {blocked}", save=False)
                     self.queue_status("BLOCKED", blocked)  # durable; sent with the amendment's corrections
+                    # which amendment was applied at the persisted cap, for this checkpoint (see
+                    # restore_capped_amendment_block); restore_needed is set only if an outage later replaces it
+                    self.state["capped_amendment"] = {"revision": rec["revision"], "sha256": rec["sha256"],
+                                                      "checkpoint": self.checkpoint["id"], "reason": blocked,
+                                                      "restore_needed": False}
+                else:
+                    self.state.pop("capped_amendment", None)  # a later amendment not at the cap supersedes it
             self.stop_path.unlink(missing_ok=True)  # consumed only once the application is committed
         finally:
             self.release_guidance_admission()
         return self._continue_after_resume()
+
+    def restore_capped_amendment_block(self):
+        """Restore the budget blocker of the amendment that durable state records as applied at the persisted cap AND
+        whose recovery was interrupted (`capped_amendment.restore_needed`, set only when an outage replaced that
+        blocker); the selected amendment, the checkpoint and the spent budget must still be the ones it names. The
+        status, its transition and the queued notice are saved together; the notice is sent after the save, so an
+        interruption before delivery leaves exactly one queued notice for the next settlement. Returns whether it
+        restored anything; any other stop reason is left untouched."""
+        marker = self.state.get("capped_amendment")
+        if not isinstance(marker, dict) or not marker.get("restore_needed"):
+            return False
+        rec = self.guidance_record("amendments")
+        if not rec or (marker.get("revision"), marker.get("sha256")) != (rec["revision"], rec["sha256"]) or \
+                marker.get("checkpoint") != self.checkpoint["id"] or not self.budget_exhausted():
+            return False
+        reason = marker["reason"]
+        with self.txn():
+            self.state.update(status="BLOCKED", status_reason=reason)
+            self.transition(self.state["phase"], f"BLOCKED: {reason} (restored after the capped amendment's "
+                                                 "interrupted recovery)", save=False)
+            self.queue_status("BLOCKED", reason)
+            marker["restore_needed"] = False
+        self.settle_publications()
+        return True
 
     def budget_block_reason(self):
         return (f"review-round budget for {self.checkpoint['id']} is exhausted "
@@ -4281,7 +4314,17 @@ class Controller:
             return self.run_loop()
         # foreground has no loop: queued public work (for example an amendment's handoff-superseded corrections) is
         # sent now, so the PR never keeps showing a superseded handoff as current until the session's next command
-        self.settle_publications()
+        try:
+            self.settle_publications()
+        except Exception:
+            marker, rec = self.state.get("capped_amendment"), None
+            with contextlib.suppress(Stop):
+                rec = self.guidance_record("amendments")
+            if isinstance(marker, dict) and rec and self.state["status"] == "BLOCKED" and \
+                    (marker.get("revision"), marker.get("sha256")) == (rec["revision"], rec["sha256"]):
+                marker["restore_needed"] = True  # the outage stop will replace this blocker; recovery restores it
+                self.save()
+            raise
         if self.state["status"] == "BLOCKED":  # persisted together with the change that caused it (amendment at cap)
             raise Stop("BLOCKED", self.state["status_reason"], persisted=True)
         if self.state["phase"] in ("develop", "review") and self.budget_exhausted():
@@ -4310,6 +4353,7 @@ class Controller:
             active["attempts"] = []
         if max_rounds:
             self.state["limits"]["max_review_rounds_per_checkpoint"] = int(max_rounds)
+            self.state.pop("capped_amendment", None)  # an explicit extension ends the capped state
         if (self.state.get("status_reason") or "").startswith("no progress"):
             for entry in self.state.get("findings", {}).values():
                 entry["rounds_open"] = 0  # the owner reviewed the disagreement; counting restarts from here
@@ -5850,14 +5894,16 @@ def render_claude_event(event) -> list:
     return rows
 
 
-def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes=10.0, now=None, expected_id=None):
+def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes=10.0, now=None, expected_id=None,
+                     sleep=time.sleep, max_polls=None):
     """Follow one enrollment read-only: its state.json (no lock), the latest developer stream (headless), the latest
     review round's reviewer event files and the gate markers/receipts. Emits readable rows: agent actions as they
     appear (rows replayed for context when a file is first seen are marked `(earlier)`), a status line (role,
     candidate, the current checkpoint's rounds, elapsed time, the current role's latest observable action with its
     age, blocker) when something changes and about once a minute, and a stall notice when that action is older than
     `stall_minutes` while the enrollment is ACTIVE (a running process is not proof of progress). The state must name
-    `expected_id`; otherwise nothing of it is shown. Works for older pinned enrollments too; nothing is written."""
+    `expected_id`; otherwise nothing of it is shown. Works for older pinned enrollments too; nothing is written.
+    `now`, `sleep` and `max_polls` let a caller drive a continuing watch deterministically (tests)."""
     folder = Path(folder)
     # per (role, invocation or round/attempt), never shared between invocations or reviewer attempts:
     #   actions -> (latest displayable sanitized row, when it was observed)
@@ -5873,6 +5919,11 @@ def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes
         return f"{secs // 3600}h{secs % 3600 // 60:02d}m" if secs >= 3600 else f"{secs // 60}m{secs % 60:02d}s"
 
     def follow(path, render, source, backfill=15):
+        """Read the complete new records of one event file. At attachment (the first poll) a file is history: its tail
+        is replayed as `(earlier)`, its latest action has no known time of its own and its last write stands for its
+        last event. A file first seen on a later poll (a new invocation or attempt) and every later record are live:
+        they are stamped with the time this watch observed them. Only parsed records count as events; blank lines and
+        a record still being written (no final newline) do not."""
         try:
             info = path.stat()
         except OSError:
@@ -5880,6 +5931,7 @@ def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes
         size, mtime = info.st_size, dt.datetime.fromtimestamp(info.st_mtime, dt.timezone.utc)
         start = offsets.get(path)
         first = start is None
+        historical = first and seen.get("polls", 0) == 0
         if not first and size <= start:
             return
         with open(path, "rb") as f:
@@ -5889,21 +5941,23 @@ def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes
         if not cut:
             return
         offsets[path] = (0 if first else start) + cut
-        rows = []
+        rows, records = [], 0
         for raw in data[:cut].split(b"\n")[:-1]:
             if not raw.strip():
                 continue
             try:
-                rows.extend(render(json.loads(raw.decode("utf-8", "replace"))))
+                event = json.loads(raw.decode("utf-8", "replace"))
             except ValueError:
                 continue
-        # every complete record counts as activity; on attachment the file's last write is its time
-        events[source] = mtime if first else max(mtime, events.get(source, mtime))
-        shown = rows[-backfill:] if first else rows  # attachment: the whole file is read, only its tail replayed
-        for row in shown:
-            emit(("(earlier) " if first else "") + row)  # rows are sanitized by the renderer
-        if rows:  # an action replayed at attachment has no known time of its own (the file's write may be later)
-            actions[source] = (rows[-1], None if first else mtime)
+            records += 1
+            rows.extend(render(event))
+        observed = now()
+        if records:
+            events[source] = mtime if historical else observed
+        for row in (rows[-backfill:] if historical else rows):
+            emit(("(earlier) " if historical else "") + row)  # rows are sanitized by the renderer
+        if rows:
+            actions[source] = (rows[-1], None if historical else observed)
 
     while True:
         try:
@@ -5912,7 +5966,7 @@ def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes
             emit(f"state unreadable: {type(exc).__name__}")
             if once:
                 return
-            time.sleep(interval)
+            sleep(interval)
             continue
         if expected_id is not None and (not isinstance(state, dict) or state.get("enrollment_id") != expected_id):
             emit(f"identity mismatch: the state at {folder} does not belong to enrollment {expected_id}; nothing from "
@@ -5935,8 +5989,21 @@ def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes
         elif launch and not launch.get("returned"):
             role, since = f"developer Claude, invocation {launch.get('n')}", parse_iso(launch.get("at"))
             source = ("developer", launch.get("n"))
-        oldest = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
-        current = actions.get(source) if source else max(actions.values(), key=lambda a: a[1] or oldest, default=None)
+        latest, uncertain = source, False
+        if not source:  # no agent running: the latest run by the controller's recorded execution order
+            runs = ([(parse_iso(launch.get("at")), ("developer", launch.get("n")))] if launch.get("n") and n else [])
+            runs += [(parse_iso(a.get("started")), ("reviewer", last.get("round"), a.get("n")))
+                     for a in last.get("attempts") or []]
+            if runs and all(t for t, _ in runs):
+                newest = max(t for t, _ in runs)
+                tied = [key for t, key in runs if t == newest]
+                if len({key[0] for key in tied}) == 1:
+                    latest = max(tied, key=lambda key: key[-1] or 0)
+                else:
+                    uncertain = True  # a developer run and a reviewer attempt recorded in the same second
+            elif runs:
+                uncertain = True  # an older record without the times that order its runs
+        current = actions.get(latest) if latest else None
         gate = None
         evidence = folder / "evidence"
         receipts = set()
@@ -5976,16 +6043,19 @@ def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes
                 + f" | candidate {head} (last reviewed {str(last.get('H') or '-')[:12]}: {last.get('decision') or '-'})"
                 + f" | {checkpoint or 'checkpoint ?'} rounds {done}/{limit}"
                 + f" | developer invocations {dev.get('invocations')}" + gate_text
-                + (f" | latest action: {current[0]}{action_age}" if current else
+                + (" | latest action: uncertain (the recorded history does not order the developer and reviewer "
+                   "runs)" if uncertain else
+                   f" | latest action: {current[0]}{action_age}" if current else
                    " | latest action: none observed yet" + (" in this " + ("attempt" if source[0] == "reviewer"
-                                                                         else "invocation") if source else ""))
+                                                                         else "invocation") if source else
+                                                            " in the latest recorded run" if latest else ""))
                 + blocker)
         if once or key != seen["key"] or time.monotonic() - seen["beat"] >= 60:
             emit(line)
             seen["key"], seen["beat"] = key, time.monotonic()
         # silence is measured from the latest complete event of the current role (or of the newest source when no
         # agent runs), not from the latest displayable row; a current attempt with no event yet counts from its start
-        last_event = events.get(source) if source else max(events.values(), default=None)
+        last_event = events.get(latest) if latest else None
         quiet_since = last_event or since
         quiet = (now() - quiet_since).total_seconds() if quiet_since else None
         if state.get("status") == "ACTIVE" and quiet is not None and quiet >= stall_minutes * 60 and \
@@ -5998,7 +6068,11 @@ def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes
                 not open_attempt and not (launch and not launch.get("returned")):
             emit("the enrollment is not active; watch ends")
             return
-        time.sleep(interval)
+        polls = seen.get("polls", 0) + 1
+        seen["polls"] = polls
+        if max_polls is not None and polls >= max_polls:
+            return
+        sleep(interval)
 
 
 def find_enrollment(value):
