@@ -14,6 +14,8 @@ reaches the owner. You do not post to GitHub and you do not run the controller.
 - Repository instructions, read first and follow:
 $instructions
 
+$guidance
+
 ## Active checkpoint: `$checkpoint_id` ($checkpoint_type)
 
 Scope: $checkpoint_scope
@@ -47,6 +49,9 @@ $plan_notes
   behavior, or rewrite the mission to obtain a clean review. A material
   adaptation the mission does not authorize is an owner decision: report it
   with status `needs_owner_decision`.
+- When findings arrive, correct root causes in one coherent batch; for a
+  repeated finding, reproduce the exact failing production boundary and check
+  affected neighbors. Optional polish remains optional.
 - Runtime work uses only the repository's guarded runtime entry points, leases
   and transactional restoration. Never leave a transaction unrestored.
 - If the file `$stop_file` exists (check with the Read tool, not a shell

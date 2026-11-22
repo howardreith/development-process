@@ -337,6 +337,37 @@ without continual polling or duplicate subprocess launches. A canceled or
 failed reviewer does not produce readiness. A publication failure pauses at the
 preserved result so it can be published without rerunning a successful review.
 
+An owner resume may carry bounded owner guidance (`resume --guidance`), only
+for an idle headless enrollment stopped (BLOCKED or PAUSED) in development with
+nothing outstanding. Every other state is refused without any change. The
+controller captures the document in private state by digest. Every later
+developer invocation receives it inline, and the reviewer receives a
+byte-exact copy. Each review request publishes a labeled, sanitized rendering
+of it with its revision and digest, so the owner must write PR-safe guidance.
+Guidance supplies the owner's approach within the unchanged mission. It never
+changes acceptance criteria, models, permissions or budgets, never closes a
+finding and never authorizes a scope change. Reports, rounds and ready results
+are bound to the guidance revision and digest. A new revision requires a fresh
+developer report, and a result bound to other guidance does not satisfy
+readiness. Missing, altered or invalid captured guidance stops the run before
+any launch. A no-progress stop and an exhausted budget are distinct. After a
+no-progress stop the supervisor reads the outstanding findings and, if the
+approach must change, supplies concrete guidance. A budget increase is a
+separate owner decision. Scope, acceptance, model or permission changes use
+the amendment, re-enrollment or between-run activation procedure. See
+`agent_review/README.md`.
+
+Review-loop discipline (prompt and operating policy): in round 1 the reviewer
+examines the complete supported change and its important failure paths and
+consolidates every supported material finding into one review. In a
+correction round it first resolves the prior findings, then inspects the
+changed code and its directly affected consumers. New concrete regressions
+remain reportable; unrelated unchanged systems and designs the mission
+excludes do not widen the mission. The developer corrects root causes in one
+coherent batch. For a repeated finding it explains the failing production
+path, reproduces that exact boundary and checks affected neighbors. The same
+defect keeps the same ID. Optional polish stays optional.
+
 On exhausted retries, inaccessible model/runtime, repeated disagreement, no
 progress, or the review-round cap, preserve work and return a precise BLOCKED
 or PAUSED report. Avoid automatic model downgrades and open-ended review loops.

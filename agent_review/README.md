@@ -173,7 +173,7 @@ python $ar run     --enrollment <id>      # develop → verify → review → co
 python $ar list                          # every enrollment on this machine (read-only)
 python $ar status  --enrollment <id> [--remote]
 python $ar stop    --enrollment <id> --reason "..."
-python $ar resume  --enrollment <id> --reason "what changed" [--max-rounds N]
+python $ar resume  --enrollment <id> --reason "what changed" [--max-rounds N] [--guidance <file>]
 python $ar cancel  --enrollment <id> --reason "..."
 ```
 
@@ -206,6 +206,225 @@ its fields. `pr` is a positive integer or null even if the state file holds
 something else. Cancelled
 enrollments release their claim and are not listed. Use `status --enrollment
 <id>` for the full detail of one enrollment.
+
+### Owner guidance (`resume --guidance <file>`)
+
+Guidance lets the owner change the *approach* of a stopped headless run while
+the enrolled mission, acceptance criteria, budgets, models and permissions stay
+exactly as they are. The captured instruction goes to both agents and is
+recorded on the PR:
+
+```powershell
+python $ar resume --enrollment <id> --reason "audit note: why" --guidance C:/path/guidance.md
+```
+
+**The guidance text is published.** Each later review request on the PR
+contains a clearly labeled rendering of it, after the controller's standard
+sanitization (credential patterns and the local home path are redacted; that
+is not a general sensitive-information detector). Write PR-safe text. The
+recorded sha256 identifies the private captured bytes, so the public
+rendering can differ from them. The input path and private state paths are
+never published. `--reason` stays an audit note and is not an instruction to
+either agent.
+
+#### Operator playbook
+
+| Owner situation | Correct operation |
+|---|---|
+| A transient blocker is resolved; mission and approach are unchanged | Ordinary `resume --reason ...`. The reason is an audit note, not agent instruction. |
+| The approach should change while meeting the same acceptance criteria | In the supported idle state, `resume --reason ... --guidance FILE`; then check `status` (`guidance.selected`) and, as the run continues, the `latest_developer_invocation` and `latest_review_round` bindings. |
+| Scope, acceptance, permissions, models or project policy must change | Record the explicit owner decision and use the existing safe amendment/re-enrollment or between-run `activate` procedure. Guidance does not apply these changes. |
+| An instruction arrives while an agent is working | `stop`, wait until `status` shows the run stopped (not `ACTIVE`, `developer_running` false, `lock_holder` null), then deliver it. There is no live injection into a running agent. |
+| A budget is exhausted, or the same approach has repeatedly failed | Report the concrete blocker, the actual counters, and the specific owner decision that can advance the run (below). No automatic resume or cap increase. |
+
+**No-progress stop versus exhausted budget.** These are different stops, but
+they can coincide, so always check the counters in `status`:
+`rounds_completed[<checkpoint>]` against `round_limit`, and
+`developer_invocations` against the enrollment's limit (`limits.max_developer_invocations`
+in its `state.json`; default 30). The stop reason names whichever cap was hit.
+
+- A no-progress stop (`status_reason` starts with `no progress`) means the
+  same blocking findings stayed open. The no-progress check runs before the
+  round-cap check, so this reason can also be recorded on the last permitted
+  round, with no budget left. An owner `resume` restarts the no-progress
+  counting. If the approach must change, the supervising Claude reads the
+  actual outstanding findings and supplies concrete guidance through
+  `--guidance`; another status reason is not enough.
+- An exhausted review-round budget (`review-round cap reached`, or
+  no progress on the last round) needs an explicit owner decision.
+  `resume --max-rounds N` raises only the review-round limit.
+- An exhausted developer-invocation budget
+  (`developer invocation budget exhausted`) is a separate owner decision. No
+  `resume` option raises it, and `--max-rounds` does not help. Report it and
+  use the existing re-enrollment procedure.
+- Every ordinary `resume`, including one with `--max-rounds`, continues the
+  run immediately: the developer is launched under the current guidance
+  selection. Guidance is refused while a budget is exhausted and never
+  accompanies a budget change. If both are needed, the owner extends the
+  budget first and accepts that the run continues under the current approach.
+  The supervisor then requests `stop`, waits for the stopped state and
+  resumes with `--guidance`.
+- If the owner has already authorized a specific continuation, the supervisor
+  carries it out without asking again. A genuinely new scope or budget
+  decision stays with the owner.
+
+**Status reports by the supervising Claude** are concise and cover: the
+current source commit versus the last-reviewed source commit, the actual run
+`status`/`status_reason`, the checkpoint, rounds used and remaining, the
+selected guidance with its delivery evidence (below), the next permitted
+operation, and whether an owner decision is needed. A PR body that still says
+"enrolled" does not show that a run is working; use `status`. The supervisor
+does not become a second implementation writer in an enrolled worktree.
+
+#### Rules
+
+- **Supported state (headless only).** `--guidance` is accepted only for a
+  headless enrollment that is `BLOCKED` or `PAUSED` in the `develop` phase,
+  with no active review round or reviewer attempt, a returned last developer
+  launch (or none yet), no live developer process, no push/verify helper
+  holding the helper lock, no configured runtime lock, and no pending or
+  uncertain publication, queued public operation or pending archive commit.
+  Neither the round budget nor the developer invocation budget may be
+  exhausted. `--max-rounds` (a budget change) and `--resend-undelivered`
+  cannot be combined with it. Foreground enrollments are refused (give the
+  interactive session the instruction directly). Every other state is
+  refused with exit code 4, for every document, including the current one.
+  The option is never silently ignored. `resume` without `--guidance` behaves
+  exactly as before.
+- **Validation before any change.** The file is read (at most 64 KiB + 1
+  byte), must be valid UTF-8 with non-whitespace content, and is hashed
+  before anything else. A workflow that fails to load, a malformed manifest
+  or a malformed claim file is also a refusal. Under the writer lock the
+  controller takes the helper lock and holds it until capture. It then checks,
+  read-only, that the owner-selected enrollment ID, the loaded state, its
+  directory and both ownership claims name the same enrollment. Next come
+  the state rules above and the integrity of any existing selection. A null,
+  malformed or dangling selection, or a damaged selected snapshot, is refused:
+  supplying a new document is not a repair bypass. Last come the usual
+  identity, workflow-fingerprint and mission checks. A refusal (exit 4)
+  leaves `state.json`, the `STOP` file, every counter and the PR unchanged and
+  launches nothing. Content is never validated as natural language.
+- **Capture.** The bytes are written with the controller's atomic-write
+  pattern to the content-addressed file `<enrollment>/guidance/<sha256>.md`.
+  An existing file is verified and reused, and never overwritten. Only after
+  the file exists is the revision selected in `state.json`
+  (`guidance.revisions`: revision, sha256, size, capture time, original path
+  for information, reason), in the same state save as the resume itself. The
+  `STOP` file is handled exactly as by an ordinary resume. If the save fails,
+  the unreferenced content file is harmless and nothing is selected. Editing
+  or deleting the original file afterwards changes nothing.
+- **Revisions.** Identical content keeps the current revision. Any other
+  content becomes a new revision. A → B → A creates revisions 1, 2 and 3, and
+  revision 3 reuses A's content file. Content identity and the latest owner
+  decision are different things. Earlier content files are immutable.
+- **Delivery.** Every later developer prompt (start, continuation and
+  report-correction invocations) includes the text inline under a heading
+  that names the revision and sha256. The prompt transport may adjust line
+  endings; the digest identifies the captured bytes. The reviewer gets a
+  byte-exact copy as `.agent-review-inputs/owner-guidance.md` next to the
+  mission, and its prompt names that file, the revision and the digest. Both
+  prompts say that guidance supplies the owner's approach within the
+  enrolled mission. It does not change acceptance criteria, close a finding,
+  change budgets, models or permissions, or authorize a scope change. The
+  reviewer still judges the work against the mission.
+- **Records.** Each round records `guidance_revision`/`guidance_sha256`. The
+  reviewer's `request.json`, the validated envelope, the published request
+  (with its frozen public rendering) and review comments, and therefore the
+  archived records, name the revision and digest that applied, or `none`. The
+  rendering is fixed when the request is queued. Publication retries send the
+  already-rendered body and do not re-read guidance.
+- **Freshness.** A developer report, round, envelope and ready result are
+  bound to a revision *and* its digest. Selecting a new revision clears the
+  current report and ready bindings, so the next review needs a fresh
+  developer report even on an unchanged commit. A stale review, including one
+  bound to revision 1 after A → B → A, does not satisfy readiness or finalize.
+  Historical rounds keep their original binding.
+- **Status.** `status` adds a `guidance` summary computed from existing state:
+  `selected` (revision, digest, capture time, snapshot path and `integrity`),
+  `latest_developer_invocation` and `latest_review_round`.
+  - `latest_developer_invocation`: its guidance binding,
+    `intent_recorded_at` (saved before dispatch, so intent only),
+    `process_start_recorded` and `returned`.
+  - `latest_review_round`: its binding, its status and its latest attempt
+    (`opened_at`, `process_start_recorded`, `ended_at`, `ok`).
+  - `process_start_recorded` is `true` only when the controller's
+    process-start callback (or a later return) recorded it, `false` for an
+    attempt closed as never launched, and `null` when there is no evidence
+    either way.
+  - `matches_selected` compares each binding with the selection.
+  - A null, malformed or dangling selection shows `"integrity": "problem"`
+    (with the recorded member, locally), never "none". `selected: null` means the
+  enrollment never had guidance. These are distinct observations: "captured",
+  "included in the invocation input", "launch recorded" and "returned". A
+  saved file or launch intent alone does not prove delivery to a running
+  process. An agent's acknowledgement in its own prose is not independent
+  evidence that it followed the guidance; the reviewer checks the resulting
+  work.
+- **Integrity at use.** Immediately before each developer prompt is built,
+  and before a review request is recorded or a reviewer attempt is opened,
+  the controller re-reads the selected snapshot and verifies its digest. A
+  missing or altered file, or a present but null or invalid selection, stops
+  the run `BLOCKED` before any launch or invocation charge. That stop is
+  persisted. It differs from an admission refusal, which changes nothing.
+  Only a state without any `guidance` key is an unguided (legacy) enrollment.
+  A known filesystem failure while the reviewer's inputs are being prepared
+  closes that attempt as not launched and stops `BLOCKED`, leaving no
+  unfinished attempt.
+- **Supervised recovery.** A damaged selected snapshot is never repaired
+  automatically, and `--guidance` refuses until it is fixed. Restore the
+  identical captured bytes to the path that local
+  `status.guidance.selected.snapshot` shows (the published stop reason names
+  only the revision and digest; the sha256 must match), confirm
+  `"integrity": "intact"`, then run an ordinary `resume`. The same applies to
+  an earlier revision's file: resubmitting that document never recreates it,
+  and `--guidance` refuses (exit 4, nothing changed) until the identical bytes
+  are restored. A failure to write a new capture file is also an exit-4
+  refusal with the path in the local message; nothing is selected or published. A damaged selection
+  record in `state.json` needs supervised repair of the enrollment state, or a
+  cancel and re-enrollment. Enrollments that never received guidance,
+  including state written before this option existed, load, run and archive
+  unchanged.
+- **Not provided.** Foreground guidance, live injection into a running
+  agent, guidance outside the idle `develop` state, automatic repair,
+  acknowledgement protocols and general amendment APIs.
+
+#### After the owner accepts this change: install and activate
+
+The candidate in this PR is code under test. It is not installed or
+activated as part of the PR. After owner acceptance, install exactly the
+reviewed source commit H named in the owner handoff (`<reviewed-sha>`). Use a
+fresh, clean, detached checkout of that commit, not a working copy that may
+hold local edits, and not a later merge commit whose content was not
+reviewed:
+
+```powershell
+$src = 'C:/Dev/agent-review-src-<reviewed-sha>'
+git -C C:/Dev/development-process fetch origin
+git -C C:/Dev/development-process worktree add --detach $src <reviewed-sha>
+git -C $src rev-parse HEAD                                  # must print <reviewed-sha>
+git -C $src status --porcelain                              # must print nothing
+python $src/agent_review/agent_review.py install --dest C:/Dev/agent-review
+# install prints the new package's fingerprint; record it. Existing versions stay in place for pinned enrollments
+python $ar status --enrollment <id>                         # inspect: mode headless, status, phase, counters, guidance
+python $ar stop   --enrollment <id> --reason "activate the guidance-capable controller"
+python $ar status --enrollment <id>                         # wait: not ACTIVE, developer_running false, lock_holder null
+python $ar activate --enrollment <id>                       # owner decision, between runs
+python $ar status --enrollment <id>                         # eligibility: headless, BLOCKED/PAUSED, phase develop,
+                                                            # budget left, pending_publications empty
+python $ar resume --enrollment <id> --reason "..." --guidance C:/path/guidance.md
+```
+
+If the status check fails, guided resume refuses with exit code 4 and changes
+nothing. Remove the temporary source worktree afterwards with
+`git -C C:/Dev/development-process worktree remove $src`; the installed
+version is self-contained.
+
+Activation is a per-enrollment owner decision. It can invalidate a previous
+validated or ready result, which is then reviewed again. Enrollments that are
+not activated stay on their pinned versions. An example guidance document for
+the paused Tabletop repair is prepared, but not applied, in
+`planning/TABLETOP-REPAIR-GUIDANCE-PROPOSAL.md`. Refresh that enrollment's
+status before using it.
 
 ### Prepared mission: Black Tentacles (not started)
 
@@ -291,9 +510,12 @@ which run the candidate's own code. Do not reinstall or activate the controlling
 | Wrong model/effort, usage limit | BLOCKED at once; never downgrades | Restore access, `resume` |
 | Head or merge base moved | HISTORICAL review or correction comment; new report needed | Reconcile, `resume` |
 | Material change after ready or handoff | Ready result invalidated; superseded handoffs detected and reopened | `resume` |
-| Round cap / no progress | BLOCKED with a visible status comment | Decide; `resume --reason … [--max-rounds N]` (restarts the no-progress counters) |
+| No progress (`no progress: …`) | BLOCKED with a visible status comment | Check `rounds_completed` against `round_limit` (no progress can fall on the last round). With budget left: read the outstanding findings, then either `resume --reason … --guidance <file>` to change the approach or `resume --reason …`. Either restarts the no-progress counting. With no rounds left: handle it as the round-cap row |
+| Round cap (`review-round cap reached`, or no progress on the last round) | BLOCKED with a visible status comment | Owner budget decision: `resume --reason … --max-rounds N`. This continues the run immediately; guidance cannot be added in the same command. To change the approach as well, `stop` the continued run, wait, then `resume --guidance` |
+| Developer invocation budget exhausted | BLOCKED (`developer invocation budget exhausted`) | Separate owner decision. No `resume` option raises it (`--max-rounds` does not), and guidance is refused. Use the existing re-enrollment procedure |
+| Owner guidance snapshot missing or altered, or selection invalid | BLOCKED before any launch; `--guidance` refuses | Restore the identical captured bytes to the snapshot path (`status` shows path and digest; integrity must read `intact`), then ordinary `resume`. A damaged selection record needs supervised state repair or re-enrollment |
 | Developer `blocked` / `needs_owner_decision` | Dispositions published; BLOCKED / PAUSED | Decide, `resume --reason` |
-| Operational error (git/gh/process/decoding) | Persisted PAUSED and posted when identity is established | Fix, `resume` |
+| Operational error (git/gh/process/decoding/filesystem) | Persisted PAUSED and posted when identity is established. A filesystem error is posted by type and errno only; the local `status` reason names the path | Fix, `resume` |
 | Workflow reinstalled | PAUSED until `activate`; validated or ready results from the old version are re-reviewed | Review, `activate` |
 | Mission, mission snapshot, permission file or a record changed | BLOCKED | Restore or re-enroll |
 | Abandon an enrollment | `cancel`: CANCELLED, claims released, history kept | — |

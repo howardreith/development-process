@@ -31,6 +31,7 @@ the change.
   output.
 - Prior findings ledger and the IDs you must assess: `$prior_findings_path`
   (pending: $pending_findings)
+$guidance
 
 Applicable repository instructions (read them in the snapshot):
 $instructions
@@ -60,13 +61,21 @@ $plan_notes
    runtime behavior. If required evidence is absent, raise an `evidence_gap`
    finding that names the observation needed.
 3. Report every supported actionable finding within this checkpoint's scope in
-   one coherent review. Do not expand the mission into speculative refactors or
-   a whole-project audit. Keep optional polish (`optional_polish`,
+   one coherent review. In a first review of a checkpoint (no pending prior
+   findings), examine the complete supported change and its important failure
+   paths, and consolidate every supported material finding now rather than in
+   later rounds. In a correction round, first resolve the prior findings, then
+   inspect the changed code and its directly affected consumers: new concrete
+   regressions remain reportable, but unrelated unchanged systems and designs
+   the mission excludes are not invitations to expand it. Do not expand the
+   mission into speculative refactors or a whole-project audit. Keep optional polish (`optional_polish`,
    `blocks_readiness: false`) separate from defects and required work.
    Readiness depends on correctness and required acceptance, not on priority:
    a missed required behavior blocks readiness even if you label it P2.
 4. Finding IDs must be stable. Reuse the existing ID when the same issue is
-   still present. New IDs use the form `R$round-F<n>`.
+   still present. If an old defect is fixed and a different defect is found,
+   verify the old one and report the new one under a new ID. New IDs use the
+   form `R$round-F<n>`.
 5. For each pending prior finding, give exactly one assessment:
    `fix_verified` / `fix_rejected`, `rebuttal_accepted` / `rebuttal_rejected`,
    `deferral_accepted` / `deferral_rejected`, or `still_open`, with concrete
