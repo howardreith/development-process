@@ -127,3 +127,97 @@ cannot.
 - The required validation is the project's `unit` gate, run through `verify` on the committed and
   pushed candidate.
 - Do not merge or tag. The PR stays a draft.
+
+## Owner addendum of 2026-11-22: narrow the design, keep the safety bar
+
+The first enrollment of this branch stopped after three review rounds under the no-progress rule. Its
+design had grown to about 670 controller lines: foreground support, STOP-file renaming and identity
+tracking, transcript-turn detection, and guidance rechecks inside publication retries. Most open findings
+were crash or race windows in that extra machinery.
+
+The owner chose to narrow the design and re-enroll on the same PR and branch. This addendum supersedes
+any broader reading of the requirements above. Simplify in new commits; never rewrite history. Remove
+machinery that this design does not need.
+
+1. **Headless only.** `--guidance` is refused, with a clear message and no state change, for
+   foreground enrollments. Do not detect foreground turns or inspect transcripts.
+
+2. **One supported state.** Accept guidance only when all of the following hold. Anything else is
+   refused (exit code 4, no state change, no PR post, STOP untouched, no agent launched):
+   - the enrollment is headless;
+   - status is `BLOCKED` or `PAUSED`;
+   - phase is `develop`;
+   - there is no active review round or reviewer attempt;
+   - the last developer launch has returned;
+   - there are no pending or uncertain publications.
+
+   Check these with the existing locks held, together with the existing identity, workflow, mission and
+   snapshot checks.
+
+3. **Validate before mutating.** Before anything changes:
+   - read the file;
+   - require nonempty, non-whitespace content that is valid UTF-8;
+   - compute the sha256 of the exact bytes.
+
+   Every validation failure is a usage refusal raised before any write. Guided resume otherwise behaves
+   exactly like the existing `resume`, including its existing STOP-file handling. Add no new STOP
+   semantics.
+
+4. **Content-addressed capture.**
+   - Write the bytes to `<state dir>/guidance/<sha256>.md` with the controller's existing atomic-write
+     helper. Writing is idempotent: identical content yields the same file and no new revision.
+   - Only after the file exists, record the revision in `state.json` in the same save as the resume
+     transition. Record its sha256, its revision number, when it was captured and the original path, for
+     information only.
+   - An earlier revision's file is never removed or overwritten.
+   - If the save fails, the unreferenced file is harmless.
+   - The private state directory is in the same trust domain as `state.json`. Add no special defenses
+     against links or junctions inside it beyond what the existing state writes already do.
+
+5. **Integrity at use.**
+   - Immediately before composing a developer prompt, and before a reviewer attempt record is opened,
+     re-read the selected snapshot and verify its sha256.
+   - If the file is missing or its digest is wrong, stop BLOCKED with a clear reason before any launch,
+     and leave no unfinished attempt record.
+   - If guidance revisions exist but the selection is missing or invalid (including an explicit null),
+     stop BLOCKED. Never fall back silently to unguided.
+   - State with no guidance key at all is an unguided legacy enrollment and behaves exactly as before.
+
+6. **Delivery.**
+   - The developer prompt (start and continuation) includes the guidance text inline, under a heading
+     that names the digest and revision. The digest identifies the captured bytes. Newline handling by
+     the existing prompt transport is acceptable and out of scope.
+   - The reviewer receives a byte-exact copy inside the existing reserved inputs folder, next to the
+     mission. The reviewer prompt names that file and its digest.
+   - The round's request record and its review envelope or archive record name the digest, or `none`.
+
+7. **Freshness.**
+   - Each review round records the guidance digest that applied.
+   - Capturing a new revision invalidates the current report and any ready result, using the existing
+     mechanism for a moved head (for example, `develop_context` `needs_report` and clearing
+     `last_report_for` and `ready_review`).
+   - Readiness and finalize require the ready review's digest to equal the current selection.
+   - Historical rounds keep their recorded digest.
+   - Publications carry already-rendered bodies. Add no guidance checks inside publication retries.
+
+8. **Small diff.** Aim for a change that a reviewer can verify end to end. Remove the code for
+   foreground guidance, STOP identity and renaming, transcript-turn detection, symlink and junction
+   defenses for the staging file, and publication-retry rechecks, unless one of those is strictly
+   required by points 1–7 above.
+
+9. **Tests.** Keep the required behaviors listed under "Required tests", with foreground replaced by
+   "foreground `--guidance` is refused". Remove tests for removed machinery.
+
+10. **Review scope for the reviewer.** The following are out of scope unless this change makes existing
+    behavior worse:
+    - adversarial redirection inside the private state directory;
+    - crash windows in the pre-existing STOP handling;
+    - foreground mode;
+    - newline translation in the existing prompt transport.
+
+    The safety bar for the supported path itself is unchanged:
+    - refusals change nothing;
+    - capture is durable and content-addressed;
+    - the guidance is never silently omitted;
+    - freshness is bound to the guidance digest;
+    - ordinary resume is unchanged.
