@@ -381,8 +381,10 @@ helper, runtime lock (checked again immediately before the application is
 committed), delivery still ambiguous after authenticated reconciliation
 against the PR, unpublishable text or archive in progress; anything else is
 refused with no change and the instruction stays pending. Visible parts of a
-superseded request and a published ready verdict receive public corrections;
-unsent parts are never sent. The message is appended verbatim, with a label, to
+superseded request (including one whose verdict never reached the PR) and a
+published ready verdict without a visible handoff receive public corrections;
+unsent parts are never sent, and delivered request parts stay verified on the
+PR at every readiness check. The message is appended verbatim, with a label, to
 a cumulative owner-amendments document captured by digest as a new revision;
 earlier revisions and the original mission and hash stay unchanged. In the
 same state save, the stopped round or validated result, the ready result and

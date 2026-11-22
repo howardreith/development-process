@@ -5926,8 +5926,9 @@ class OwnerAmendmentTests(OwnerFlowFixture, Base):
                                     amendment=self.doc(env, "review.md", self.A1))
             self.assertEqual(ar.EXIT_PAUSED, code)
             after = self.state(env)
-            self.assertEqual(("superseded", "superseded"), (after["rounds"][-1]["status"],
-                                                            after["publications"]["r01-request"]["state"]))
+            self.assertEqual(("superseded", "withdrawn"), (after["rounds"][-1]["status"],
+                                                           after["publications"]["r01-request"]["state"]))
+            self.assertNotIn("r01-request", out["pending_publications"])  # withdrawn, never sent: settled
             self.assertEqual([], env.reviewer.calls)
             self.assertFalse(self.headings_with(env, "review request — round 1"))  # withdrawn, never posted
             self.assertIn(self.A1, env.developer.calls[-1]["prompt"])
@@ -6236,6 +6237,22 @@ class OwnerAmendmentTests(OwnerFlowFixture, Base):
                 self.resume(env.controller(), guidance=unsafe)
             self.assertIn("could not be published", str(refusal.exception))
             self.assertEqual(before, self.state_bytes(env))
+            # the PR-safe replacement, in this same enrollment, is applied and published in the next review request
+            safe_text = "Owner amendment (simulated, PR-safe): quote no key material; describe the format instead.\n"
+            safe = self.doc(env, "safe.md", safe_text)
+            env.developer.script += [self.rereport("phase-1")]
+            env.reviewer.script += [{"decision": "blocked"}]
+            code, out = self.resume(env.controller(), "apply the PR-safe update", amendment=safe)
+            self.assertEqual(ar.EXIT_BLOCKED, code)
+            self.assertIn("reviewer blocked", out["reason"])
+            rec = self.state(env)["amendments"]["revisions"][-1]
+            self.assertEqual((1, ar.sha256_bytes(safe_text.encode())), (rec["revision"], rec["message_sha256"]))
+            request = next(c["body"] for c in env.gh.comments_list if "review request — round 1 —" in c["body"])
+            self.assertIn(f"| Owner amendments | revision 1, sha256 `{rec['sha256']}` |", request)
+            self.assertIn(f"**Owner amendments to the mission — revision 1, captured-source sha256 `{rec['sha256']}`.**",
+                          request)
+            self.assertIn(safe_text.strip(), request)
+            self.assertEqual(1, env.reviewer.calls[-1]["request"]["amendment_revision"])
         with self.subTest("a replay of the same saved submission"):
             env.developer.script += [self.paused()]
             self.assertEqual(ar.EXIT_PAUSED, self.resume(env.controller(), "apply", amendment=path)[0])
@@ -6243,7 +6260,7 @@ class OwnerAmendmentTests(OwnerFlowFixture, Base):
             before = self.state_bytes(env)
             with self.assertRaises(ar.UsageError) as refusal:
                 self.resume(env.controller(), "apply again", amendment=path)
-            self.assertIn("already the latest applied owner amendment", str(refusal.exception))
+            self.assertIn("already applied as owner amendment 2", str(refusal.exception))
             self.assertEqual(before, self.state_bytes(env))
 
 
@@ -6362,7 +6379,7 @@ class AmendmentBoundaryTests(OwnerFlowFixture, Base):
         self.assertEqual(ar.EXIT_PAUSED, code)
         state = self.state(env)
         request = state["publications"]["r01-request"]
-        self.assertEqual(("superseded", 1), (request["state"], request["visible_parts"]))
+        self.assertEqual("posted", request["state"])  # reconciled as completely delivered: settled and still verified
         self.assertTrue(request["parts"][0]["comment_id"])
         self.assertEqual(1, len(self.headings_with(env, "review request — round 1")))  # never re-posted
         self.assertEqual(1, len(self.headings_with(env, "round 1 review request is withdrawn")))
@@ -6387,16 +6404,32 @@ class AmendmentBoundaryTests(OwnerFlowFixture, Base):
         parts = self.state(env)["publications"]["r01-request"]["parts"]
         self.assertEqual((2, True, None), (len(parts), bool(parts[0]["comment_id"]), parts[1]["comment_id"]))
         env.developer.script += [self.paused()]
-        self.assertEqual(ar.EXIT_PAUSED, self.resume(env.controller(), amendment=self.doc(env, "a1.md", self.A1))[0])
+        code, out = self.resume(env.controller(), amendment=self.doc(env, "a1.md", self.A1))
+        self.assertEqual(ar.EXIT_PAUSED, code)
+        self.assertEqual("withdrawn", self.state(env)["publications"]["r01-request"]["state"])
+        self.assertNotIn("r01-request", out["pending_publications"])  # settled, not awaiting delivery
         posted = [c["body"] for c in env.gh.comments_list if "key=r01-request " in c["body"]]
         self.assertEqual(1, len(posted))  # part two was never sent after supersession
         self.assertIn("part=1/2", posted[0])
         self.assertEqual(1, len(self.headings_with(env, "round 1 review request is withdrawn")))
         self.assertEqual([], env.reviewer.calls)
-        env.controller().archive("manual")  # the delivered part is the archived record
-        record = next((env.work / "docs" / "agent-reviews" / "pr-7").glob("*-r01-request.md")).read_text(encoding="utf-8")
-        self.assertIn("Superseded record: 1 of 2 part(s) were published", record)
+        # the run continues under the amended task to a verified handoff
+        env.developer.script += [self.rereport("phase-1"), self.work("final.txt", "final")]
+        env.reviewer.script += [{"decision": "checkpoint_passed"}, {"decision": "ready_for_owner_review"}]
+        code, out = self.resume(env.controller(), "continue under the amended task")
+        self.assertEqual((ar.EXIT_OK, "AWAITING_OWNER_REVIEW"), (code, out["result"]))
+        self.assertNotIn("r01-request", out["pending_publications"])
         self.assertEqual(1, sum("key=r01-request " in c["body"] for c in env.gh.comments_list))
+        record = next((env.work / "docs" / "agent-reviews" / "pr-7").glob("*-r01-request.md")).read_text(encoding="utf-8")
+        self.assertIn("Withdrawn record: 1 of 2 part(s) were published", record)  # the delivered part is the record
+        self.assertTrue(env.controller().status(remote=True)["handoff_current"])
+        delivered = next(c for c in env.gh.comments_list if "key=r01-request part=1/2" in c["body"])
+        delivered["body"] = delivered["body"].replace("simulated long summary", "edited on GitHub (simulated)")
+        status = env.controller().status(remote=True)  # the delivered part is still verified remotely
+        self.assertFalse(status["handoff_current"])
+        self.assertIn("r01-request", status["handoff_superseded_by"])
+        env.gh.comments_list.remove(delivered)  # removed entirely: also detected
+        self.assertIn("r01-request", env.controller().status(remote=True)["handoff_superseded_by"])
 
     def test_identical_words_received_again_become_a_new_entry_while_a_replay_is_refused(self):
         env = self.env
@@ -6418,6 +6451,78 @@ class AmendmentBoundaryTests(OwnerFlowFixture, Base):
         self.assertEqual(2, data.count(self.A1.encode()))
         self.assertLess(data.index(b"BEGIN OWNER AMENDMENT 1 ("), data.index(b"BEGIN OWNER AMENDMENT 2 ("))
         self.assertEqual(2, env.developer.calls[-1]["prompt"].count(self.A1))
+
+    def test_a_failed_verdict_post_closes_the_posted_request(self):
+        env = self.env
+        self.validated_review_stop(env)  # the request is on the PR; its verdict POST was definitively rejected
+        state = self.state(env)
+        h = state["rounds"][-1]["H"]
+        self.assertEqual(("posted", "pending"), (state["publications"]["r01-request"]["state"],
+                                                 state["publications"]["r01-review"]["state"]))
+        reviews = len(env.reviewer.calls)
+        env.developer.script += [self.paused()]
+        self.assertEqual(ar.EXIT_PAUSED, self.resume(env.controller(), amendment=self.doc(env, "a1.md", self.A1))[0])
+        correction = [c["body"] for c in env.gh.comments_list if "round 1 review request is withdrawn" in c["body"]]
+        self.assertEqual(1, len(correction))
+        self.assertIn(f"`{ar.short(h)}` will not receive a current verdict", correction[0])
+        self.assertIn("owner amendment 1", correction[0])
+        state = self.state(env)
+        self.assertEqual(("invalidated", "superseded", "posted"),
+                         (state["rounds"][-1]["status"], state["publications"]["r01-review"]["state"],
+                          state["publications"]["r01-request"]["state"]))  # complete, so still verified as posted
+        self.assertFalse(self.headings_with(env, "Codex GPT-6.2 Astra — review — round 1"))
+        self.assertEqual(reviews, len(env.reviewer.calls))  # no obsolete reviewer launch
+
+    def test_a_failed_first_receipt_post_corrects_the_ready_verdict_and_claims_no_handoff(self):
+        env = self.env
+        env.developer.script += [self.work("phase1.txt", "phase-1"), self.work("final.txt", "final")]
+        env.reviewer.script += [{"decision": "checkpoint_passed"}, {"decision": "ready_for_owner_review"}]
+        # simulated outage right after the ready verdict is posted: the handoff receipt is definitively rejected
+        env.gh.on_post = lambda rec: setattr(env.gh, "fail_next", 99) \
+            if "Codex GPT-6.2 Astra — review — round 2" in rec["body"] else None
+        code, out = self.run_command(env.controller())
+        env.gh.on_post, env.gh.fail_next = None, 0
+        self.assertEqual(ar.EXIT_PAUSED, code)
+        state = self.state(env)
+        h = state["ready_review"]["H"]
+        receipts = [k for k in state["publications"] if ar.VERDICT_KEY_RE.match(k) and k.startswith("final-status-")]
+        self.assertEqual(("finalize", 1), (state["phase"], len(receipts)))
+        self.assertFalse(any(p.get("comment_id") for p in state["publications"][receipts[0]]["parts"]))
+        reviews = len(env.reviewer.calls)
+        env.developer.script += [self.paused("final")]
+        self.assertEqual(ar.EXIT_PAUSED, self.resume(env.controller(), amendment=self.doc(env, "a1.md", self.A1))[0])
+        correction = [c["body"] for c in env.gh.comments_list if "round 2 ready verdict is not current" in c["body"]]
+        self.assertEqual(1, len(correction))
+        self.assertIn(f"decision above for `{ar.short(h)}` no longer applies", correction[0])
+        self.assertFalse(self.headings_with(env, "Workflow — reopened"))  # no handoff ever reached the PR
+        self.assertFalse(self.headings_with(env, "handoff above is not current"))
+        self.assertFalse(self.headings_with(env, "awaiting owner review"))
+        self.assertEqual("superseded", self.state(env)["publications"][receipts[0]]["state"])  # never sent later
+        self.assertEqual(reviews, len(env.reviewer.calls))
+
+    def test_retrying_an_older_saved_file_never_reinstates_it_over_a_later_amendment(self):
+        env = self.env
+        env.developer.script += [self.paused()]
+        self.pause_in_develop_quick(env)
+        a = self.doc(env, "20261122T100000Z.md", "Owner amendment (simulated): require feature X.\n")
+        b = self.doc(env, "20261122T110000Z.md", "Owner amendment (simulated): feature X is withdrawn.\n")
+        for path in (a, b):
+            env.developer.script += [self.paused()]
+            self.assertEqual(ar.EXIT_PAUSED, self.resume(env.controller(), "owner update", amendment=path)[0])
+        ar.write_text(env.dir / "STOP", "owner stop (simulated)\n")
+        before, calls = self.state_bytes(env), len(env.developer.calls)
+        with self.assertRaises(ar.UsageError) as refusal:  # a retry of A's original saved file
+            self.resume(env.controller(), "retry", amendment=a)
+        self.assertIn("already applied as owner amendment 1", str(refusal.exception))
+        self.assertEqual((before, calls), (self.state_bytes(env), len(env.developer.calls)))
+        self.assertEqual(2, self.state(env)["amendments"]["current"])  # B stays selected
+        again = self.doc(env, "20261122T120000Z.md", a.read_bytes())  # a newly received decision with A's words
+        env.developer.script += [self.paused()]
+        self.assertEqual(ar.EXIT_PAUSED, self.resume(env.controller(), "new decision", amendment=again)[0])
+        state = self.state(env)
+        self.assertEqual(3, state["amendments"]["current"])
+        self.assertEqual(state["amendments"]["revisions"][0]["message_sha256"],
+                         state["amendments"]["revisions"][2]["message_sha256"])
 
     def pause_in_develop_quick(self, env):
         code, out = self.run_command(env.controller())

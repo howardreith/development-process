@@ -1698,7 +1698,7 @@ class Controller:
             raise UsageError(f"--guidance refused: review round {active['round']} is still active ({active['status']}); "
                              "guidance is accepted only between rounds. Nothing was captured or changed")
         unsettled = sorted(k for k, p in s.get("publications", {}).items()
-                           if p.get("state") not in ("posted", "superseded")
+                           if p.get("state") not in ("posted", "superseded", "withdrawn")
                            or any(q.get("posting_since") and not q.get("comment_id") for q in p.get("parts", [])))
         if unsettled or s.get("public_ops") or s.get("archive_pending"):
             raise UsageError("--guidance refused: publication or public work is pending or of uncertain delivery ("
@@ -1822,13 +1822,18 @@ class Controller:
         if folder.exists() and not folder.is_dir():
             raise UsageError(f"{option} refused: {folder} exists but is not a folder, so nothing can be captured there; "
                              "move it aside under supervision. Nothing was captured or changed")
-        if current and current.get("message_sha256") == message["sha256"] and current.get("source") == message["source"]:
-            # a replay of the same saved submission (same pending file, same bytes); a separately saved message with
+        applied = [r for r in (self.state.get("amendments") or {}).get("revisions") or []
+                   if isinstance(r, dict) and r.get("message_sha256") == message["sha256"]
+                   and r.get("source") == message["source"]]
+        if applied:
+            # a replay of a saved submission already applied at any earlier revision (same pending file, same bytes):
+            # retrying it must never reinstate an older instruction over a later one. A separately saved message with
             # the same words is a new owner decision and becomes its own labeled entry
-            raise UsageError(f"{option} refused: this saved submission ({message['source']}) is already the latest "
-                             f"applied owner amendment (revision {current['revision']}); nothing was captured or "
-                             "changed. Use an ordinary `resume` to continue, or save a newly received owner message in "
-                             "a new file")
+            raise UsageError(f"{option} refused: this saved submission ({message['source']}) was already applied as "
+                             f"owner amendment {applied[-1].get('revision')}"
+                             + (f"; revision {current['revision']} is selected" if current else "")
+                             + ". Nothing was captured or changed. Use an ordinary `resume` to continue, or save a "
+                             "newly received owner message in a new file")
         document = self.amendment_document(message, current)
         try:  # the publication policy that will render it in every later review request, checked while still pending
             sanitize("\n".join(self.amendments_public_section(
@@ -1936,20 +1941,28 @@ class Controller:
         why = f"the owner amended the task (owner amendment {n}, sha256 {short(rec['sha256'])})"
         invalidated = []
         active = self.active()
+        pubs = s.get("publications", {})
+
+        def delivered(pub):  # confirmed publication state only (uncertain parts were reconciled or refused)
+            return bool(pub) and any(q.get("comment_id") for q in pub["parts"])
         if active:
             if active["status"] == "validated":
+                verdict_public = delivered(pubs.get(f"r{active['round']:02d}-review"))
                 self.retire_verdict(active, why + " before this review was accepted")
                 active["status"] = "invalidated"  # never accepted, never charged
                 invalidated.append(f"round {active['round']} result")
+                if not verdict_public:  # the posted request would otherwise wait forever for a verdict
+                    self.retire_request(active, why)
             else:  # requested or reviewing with every attempt ended (admission checked)
                 active["status"] = "superseded"
                 invalidated.append(f"round {active['round']} request")
                 self.retire_request(active, why)
             s["active_round"] = None
-        receipts = [k for k, p in s.get("publications", {}).items()
+        receipts = [k for k, p in pubs.items()
                     if k.startswith("final-status-") and VERDICT_KEY_RE.match(k) and p["state"] != "superseded"]
         handoff = s.get("handoff")
-        if receipts or handoff:
+        public_handoff = bool(handoff) or any(delivered(pubs[k]) for k in receipts)  # a receipt that reached the PR
+        if receipts or handoff:  # every unsuperseded receipt is retired; only visible ones get a correction
             self.retire_receipts(f"Handoff superseded: {why}. The work returns to development under the amended task.")
         if handoff:
             s.setdefault("superseded_handoffs", []).append({**handoff, "why": why, "at": now_iso()})
@@ -1958,15 +1971,14 @@ class Controller:
             ready = s["ready_review"]
             s.setdefault("superseded_ready", []).append({**ready, "why": why, "at": now_iso()})
             invalidated.append("ready result")
-            verdict = s.get("publications", {}).get(f"r{ready['round']:02d}-review")
-            if not (receipts or handoff) and verdict and any(q.get("comment_id") for q in verdict["parts"]):
-                # the accepted ready verdict is public but no handoff receipt exists yet: say it is no longer current
+            if not public_handoff and delivered(pubs.get(f"r{ready['round']:02d}-review")):
+                # the accepted ready verdict is public but no handoff reached the PR: say it is no longer current
                 self.queue(f"r{ready['round']:02d}-ready-superseded",
                            f"### Workflow — correction — round {ready['round']} ready verdict is not current\n\nThe "
                            f"`ready_for_owner_review` decision above for `{short(ready['H'])}` no longer applies: {why}. "
                            "The review is preserved for the record; the work returns to development under the amended "
                            "task.\n\n_Automated workflow status; not a human review._\n")
-        if receipts or handoff:
+        if public_handoff:
             self.queue_status("REOPENED", f"The owner amended the task (owner amendment {n}). The earlier owner-review "
                                           "handoff is preserved above and is no longer current; the work returns to "
                                           "development under the amended task.")
@@ -1977,21 +1989,23 @@ class Controller:
         return invalidated
 
     def retire_request(self, rnd, why):
-        """A superseded round's review request (inside the caller's transaction): parts not yet sent are never sent,
-        and any part already on the PR gets a queued public correction; the delivered parts stay the archived
-        record (the existing superseded-publication archive rule)."""
+        """A superseded round's review request (inside the caller's transaction). Any part already on the PR gets a
+        queued public correction. A completely delivered request stays `posted` (settled; its comments keep being
+        verified). Otherwise it becomes `withdrawn`: settled, its unsent parts are never sent, and its delivered parts
+        are still verified on the PR (missing_publications) and archived as the record."""
         request = self.state.get("publications", {}).get(f"r{rnd['round']:02d}-request")
-        if not request or request["state"] == "superseded":
+        if not request or request["state"] in ("superseded", "withdrawn"):
             return
         delivered = [q for q in request["parts"] if q.get("comment_id")]
         if delivered:
             self.queue(f"r{rnd['round']:02d}-request-withdrawn",
                        f"### Workflow — correction — round {rnd['round']} review request is withdrawn\n\nThe review "
                        f"request posted (in whole or in part: {len(delivered)} of {len(request['parts'])} part(s)) for "
-                       f"`{short(rnd['H'])}` will not be reviewed: {why}. It is preserved for the record; any part not "
-                       "yet posted will not be sent.\n\n_Automated workflow status; not a human review._\n")
-        request["state"] = "superseded"
-        request["visible_parts"] = len(delivered)
+                       f"`{short(rnd['H'])}` will not receive a current verdict: {why}. It is preserved for the record; "
+                       "any part not yet posted will not be sent.\n\n_Automated workflow status; not a human review._\n")
+        if len(delivered) < len(request["parts"]):
+            request["state"] = "withdrawn"
+            request["visible_parts"] = len(delivered)
 
     def pr_view(self):
         number = self.state["pr"]["number"]
@@ -2116,7 +2130,7 @@ class Controller:
         return record
 
     def send(self, key, record):
-        if record["state"] in ("posted", "superseded"):
+        if record["state"] in ("posted", "superseded", "withdrawn"):
             return record
         if getattr(self, "_txn_depth", 0):
             raise RuntimeError("publication attempted inside a state transaction")
@@ -3729,12 +3743,15 @@ class Controller:
             carried = [p for p in pub["parts"] if p.get("comment_id")]  # parts that actually reached GitHub
             if pub["state"] == "posted":
                 carried = pub["parts"]
-            elif not (pub["state"] == "superseded" and carried):
+            elif not (pub["state"] in ("superseded", "withdrawn") and carried):
                 continue  # never sent: nothing public to archive
             body = "\n\n---\n\n".join(self.outbox_body(pub["key"], p) for p in carried)
             if pub["state"] == "superseded":
                 body = (f"_Superseded record: {len(carried)} of {len(pub['parts'])} part(s) were published; it is not "
                         "a current verdict._\n\n" + body)
+            elif pub["state"] == "withdrawn":
+                body = (f"_Withdrawn record: {len(carried)} of {len(pub['parts'])} part(s) were published; the rest "
+                        "were withdrawn and never sent._\n\n" + body)
             files.append((f"{rel_dir}/{seq:03d}-{pub['key']}.md", body, pub["key"]))
             seq += 1
             review_key = re.fullmatch(r"r(\d+)-review(-historical)?", pub["key"])
@@ -4200,7 +4217,7 @@ class Controller:
                 continue  # other receipts (current or retired); their corrections below are checked
             if pub["state"] == "superseded" and key != include_receipt:
                 continue
-            if pub["state"] != "posted":
+            if pub["state"] not in ("posted", "withdrawn"):
                 missing.append(key + " (not sent)")
                 continue
             total = len(pub["parts"])
@@ -4210,9 +4227,14 @@ class Controller:
                 missing.append(key + " (incomplete part inventory)")
                 continue
             for part in pub["parts"]:
-                remote = comments.get(part["comment_id"])
                 copies = [c for c in listing if c.get("user") == self.cfg["expected_actor"]
                           and (c.get("body") or "").startswith(part["marker"])]
+                if pub["state"] == "withdrawn" and not part.get("comment_id"):
+                    if copies:  # a withdrawn, never-sent part must not appear
+                        missing.append(key)
+                        break
+                    continue  # the delivered parts of a withdrawn request are verified exactly like a posted one
+                remote = comments.get(part["comment_id"])
                 if not remote or remote.get("user") != self.cfg["expected_actor"] or len(copies) != 1 or \
                         normalize_body(remote.get("body")) != normalize_body(self.outbox_body(key, part)):
                     missing.append(key)  # gone, altered, by another author, or duplicated
@@ -4366,7 +4388,8 @@ class Controller:
             "developer_session": s["developer"]["session_id"], "developer_invocations": s["developer"]["invocations"],
             "developer_running": pid_alive(s["developer"].get("active_pid")),
             "lock_holder": holder, "stop_requested": self.stop_path.exists(),
-            "pending_publications": sorted(k for k, p in s.get("publications", {}).items() if p["state"] != "posted"),
+            "pending_publications": sorted(k for k, p in s.get("publications", {}).items()
+                                           if p["state"] not in ("posted", "withdrawn")),  # withdrawn: settled
             "archive_pending": bool(s.get("archive_pending")),
             "workflow_fingerprint_matches": fp_ok, "updated_at": s.get("updated_at"),
         }

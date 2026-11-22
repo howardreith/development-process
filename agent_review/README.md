@@ -317,8 +317,9 @@ supervisor never claims an agent saw text that only the supervisor received.
   unknown and whose exact marked body is not found on the PR from the expected
   account (one that is found is recorded as delivered), an archive commit in
   progress, a closed or non-draft PR, a damaged guidance or amendments
-  selection, text the publication sanitizer would refuse, a replay of the
-  saved file that is already the latest amendment, or a combination with
+  selection, text the publication sanitizer would refuse, a replay of a saved
+  file that was already applied at any earlier revision (it never reinstates
+  an older instruction over a later one), or a combination with
   `--max-rounds`, `--resend-undelivered` or `--guidance`. Foreground
   enrollments are refused.
 - **Capture.** The file is validated like a guidance document (at most 64 KiB,
@@ -333,15 +334,21 @@ supervisor never claims an agent saw text that only the supervisor received.
   sizes, capture time, source path for information, reason, supersedes).
   Earlier snapshots stay unchanged; editing or deleting the input file later
   changes nothing.
-- **Application (one state save).** The stopped round is superseded and its
-  request retired: parts not yet sent are never sent, and parts already on the
-  PR get a public "review request is withdrawn" correction and stay archived
-  as the record. A validated result is invalidated and its verdict retired. A
-  ready result is moved to `superseded_ready`; if its ready verdict is already
-  on the PR without a handoff receipt, a public "ready verdict is not
-  current" correction is queued. An owner-review handoff is moved to
-  `superseded_handoffs` with its receipt retired by a public correction, a
-  `reopened` notice and a PR status update. The `STOP` file is consumed only
+- **Application (one state save).** Corrections are chosen from confirmed
+  publication state. The stopped round is superseded and its request retired:
+  parts already on the PR get a public "review request is withdrawn"
+  correction; a completely posted request stays `posted`, and a partly posted
+  one becomes `withdrawn` (settled: its unsent parts are never sent, its
+  delivered parts stay archived and are still verified on the PR by every
+  readiness check, and it is not listed as pending). A validated result is
+  invalidated and its verdict retired; if no part of that verdict reached the
+  PR, the posted request gets the withdrawal correction instead. A ready
+  result is moved to `superseded_ready`; if its ready verdict is on the PR but
+  no handoff receipt reached it, a public "ready verdict is not current"
+  correction is queued and every unsent receipt is retired without a notice.
+  A handoff that reached the PR is moved to `superseded_handoffs` with its
+  receipt retired by a public correction, a `reopened` notice and a PR status
+  update. The `STOP` file is consumed only
   once this save succeeds.
   The report binding is cleared and the phase returns to `develop` without
   launching any model. Findings, `rounds_completed`, developer invocations,
