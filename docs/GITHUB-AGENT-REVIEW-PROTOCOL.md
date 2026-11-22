@@ -337,6 +337,14 @@ without continual polling or duplicate subprocess launches. A canceled or
 failed reviewer does not produce readiness. A publication failure pauses at the
 preserved result so it can be published without rerunning a successful review.
 
+An owner resume may carry bounded owner guidance (`resume --guidance`) for an
+idle stopped enrollment in development. The controller captures it in private
+state by digest, gives it to both roles as a supplement to the repair approach
+under the unchanged mission (never altering models, permissions, budgets,
+acceptance criteria or finding status), binds reports and reviews to it, and
+does not accept a result bound to other guidance. See
+`agent_review/README.md`.
+
 On exhausted retries, inaccessible model/runtime, repeated disagreement, no
 progress, or the review-round cap, preserve work and return a precise BLOCKED
 or PAUSED report. Avoid automatic model downgrades and open-ended review loops.

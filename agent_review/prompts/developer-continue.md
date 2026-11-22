@@ -18,6 +18,8 @@ $allowed_commands
 
 Mission (sha256 `$mission_sha256`): `$mission_path`
 
+$guidance
+
 ## Active checkpoint: `$checkpoint_id` ($checkpoint_type)
 
 Scope: $checkpoint_scope

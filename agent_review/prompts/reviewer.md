@@ -31,6 +31,7 @@ the change.
   output.
 - Prior findings ledger and the IDs you must assess: `$prior_findings_path`
   (pending: $pending_findings)
+$guidance
 
 Applicable repository instructions (read them in the snapshot):
 $instructions

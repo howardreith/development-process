@@ -1077,6 +1077,38 @@ def writer_lock(repository, branch, worktree, command):
                       Lock(git_dir / "agent-review.lock", command)])
 
 
+# --------------------------------------------------------------------------- owner guidance
+
+GUIDANCE_MAX_BYTES = 64 * 1024
+GUIDANCE_STATUSES = ("BLOCKED", "PAUSED")
+GUIDANCE_FILE_RE = re.compile(r"^r\d{3,}-[0-9a-f]{16}\.md$")
+GUIDANCE_SCOPE = ("It supplements the repair approach under the mission. It does not alter the mission, models, "
+                  "permissions, budgets, acceptance criteria or finding status.")
+
+
+def read_guidance(path):
+    """Read and hash an owner guidance document (`resume --guidance`) before anything changes. Refuses a missing
+    or non-regular file, an oversized, non-UTF-8, empty or whitespace-only document. The exact bytes are kept."""
+    if path is None or not str(path).strip():
+        raise UsageError("--guidance needs a file path")
+    source = Path(expand(str(path)))
+    if not source.is_file():
+        raise UsageError(f"guidance file {path} does not exist or is not a regular file; nothing was captured")
+    try:
+        data = source.read_bytes()
+    except OSError as exc:
+        raise UsageError(f"guidance file {path} could not be read ({exc}); nothing was captured")
+    if len(data) > GUIDANCE_MAX_BYTES:
+        raise UsageError(f"guidance file {path} is {len(data)} bytes; the limit is {GUIDANCE_MAX_BYTES} bytes")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise UsageError(f"guidance file {path} is not valid UTF-8 ({exc}); nothing was captured")
+    if not text.lstrip("﻿").strip():
+        raise UsageError(f"guidance file {path} is empty or whitespace only; nothing was captured")
+    return {"source": str(source.resolve()), "data": data, "text": text, "sha256": sha256_bytes(data)}
+
+
 # --------------------------------------------------------------------------- controller
 
 class Controller:
@@ -1233,6 +1265,129 @@ class Controller:
         if Path(mission["path"]).exists() and sha256_file(mission["path"]) != mission["sha256"]:
             return "the enrolled mission file changed; mission changes need an owner decision"
         return None
+
+    # -- owner guidance (resume --guidance) ----------------------------------
+    def guidance_record(self):
+        """The current owner guidance revision, or None (never captured; also every pre-guidance state file)."""
+        g = self.state.get("guidance") or {}
+        return next((r for r in g.get("revisions", []) if r["revision"] == g.get("current")), None)
+
+    def guidance_sha(self):
+        rec = self.guidance_record()
+        return rec["sha256"] if rec else None
+
+    def guidance_path(self, rec):
+        if not GUIDANCE_FILE_RE.match(rec.get("file") or ""):
+            raise Stop("BLOCKED", f"owner guidance revision {rec.get('revision')} names an invalid snapshot file")
+        return self.dir / "guidance" / rec["file"]
+
+    def guidance_problem(self, rec=None):
+        """Why the captured snapshot of the current (or given) guidance revision cannot be used, or None."""
+        rec = rec or self.guidance_record()
+        if not rec:
+            return None
+        path = self.guidance_path(rec)
+        if not path.is_file() or sha256_file(path) != rec["sha256"]:
+            return (f"the captured owner guidance (revision {rec['revision']}, sha256 {short(rec['sha256'])}) at {path} "
+                    "is missing or altered; it is never silently omitted. Re-supply the identical document with "
+                    "`resume --guidance` to restore it")
+        return None
+
+    def require_guidance(self, expected_sha=None):
+        """Verify the current guidance snapshot before a launch: (record, text), or (None, None) without guidance.
+        expected_sha binds a review round to the guidance it was requested under."""
+        rec = self.guidance_record()
+        if (rec["sha256"] if rec else None) != expected_sha:
+            raise Stop("BLOCKED", f"owner guidance changed from {short(expected_sha) or 'none'} to "
+                                  f"{short(rec['sha256']) if rec else 'none'} after this work was bound to it")
+        if not rec:
+            return None, None
+        problem = self.guidance_problem(rec)
+        if problem:
+            raise Stop("BLOCKED", problem)
+        return rec, self.guidance_path(rec).read_bytes().decode("utf-8")
+
+    def guidance_binding(self):
+        rec = self.guidance_record()
+        return {"guidance_revision": rec["revision"] if rec else None, "guidance_sha256": rec["sha256"] if rec else None}
+
+    def guidance_label(self, sha=None, revision=None):
+        return f"revision {revision}, sha256 `{sha}`" if sha else "none"
+
+    def developer_guidance_section(self, rec, text):
+        if not rec:
+            return ""
+        return (f"## Owner guidance — revision {rec['revision']} (sha256 `{rec['sha256']}`)\n\n"
+                f"The owner supplied this guidance with `resume --guidance`. The controller captured its exact bytes in "
+                f"the enrollment's private state: `{self.guidance_path(rec)}` (read that copy if the text below is "
+                f"unclear; its sha256 is `{rec['sha256']}`). {GUIDANCE_SCOPE} Every pending finding still needs a "
+                "disposition, and the reviewer still judges the candidate against the mission.\n\n"
+                f"----- BEGIN OWNER GUIDANCE (sha256 {rec['sha256']}) -----\n{text.rstrip()}\n"
+                "----- END OWNER GUIDANCE -----\n")
+
+    def guidance_refusal(self, guidance, max_rounds=None):
+        """Every check for `resume --guidance`, read-only: raises UsageError (nothing changes) unless the enrollment is
+        an idle BLOCKED or PAUSED enrollment in the develop phase with budget left."""
+        s = self.state
+        if s["status"] not in GUIDANCE_STATUSES or s["phase"] != "develop":
+            raise UsageError(f"--guidance is accepted only for an idle BLOCKED or PAUSED enrollment in the develop phase; "
+                             f"this enrollment is {s['status']} in phase {s['phase']}. Nothing was captured or changed")
+        try:
+            self.assert_no_active_developer()
+        except Stop as stop:
+            raise UsageError(f"--guidance refused: {stop.reason}")
+        active = self.active()
+        if active and any("ended" not in a for a in active.get("attempts", [])):
+            raise UsageError(f"--guidance refused: reviewer attempt for round {active['round']} is running or not yet "
+                             "reconciled; run an ordinary `resume` once it has ended")
+        if self.helper_lock("resume-guidance").held_elsewhere():
+            raise UsageError("--guidance refused: a developer helper (push/verify) holds this enrollment's helper lock")
+        if self.runtime_active():
+            raise UsageError("--guidance refused: a runtime transaction lock exists ("
+                             + ", ".join(self.cfg.get("runtime_lock_paths", [])) + "); let it restore first")
+        limit = int(max_rounds or self.limits["max_review_rounds_per_checkpoint"])
+        if self.budget_exhausted(limit):
+            raise UsageError(f"--guidance refused: the review-round budget for {self.checkpoint['id']} is exhausted "
+                             f"({s['rounds_completed'].get(self.checkpoint['id'], 0)}/{limit}); guidance never raises a "
+                             "budget (pass a larger --max-rounds as a separate owner decision)")
+        if s["developer"]["invocations"] >= self.limits["max_developer_invocations"]:
+            raise UsageError(f"--guidance refused: the developer invocation budget is exhausted "
+                             f"({s['developer']['invocations']}/{self.limits['max_developer_invocations']})")
+        current = self.guidance_record()
+        if current and current["sha256"] != guidance["sha256"] and self.guidance_problem(current):
+            raise UsageError(f"--guidance refused: {self.guidance_problem(current)} before replacing it")
+
+    def write_guidance_snapshot(self, path, data):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+        with open(tmp, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        if sha256_file(path) != sha256_bytes(data):
+            raise Stop("BLOCKED", f"could not capture the owner guidance snapshot at {path}")
+
+    def capture_guidance(self, guidance, reason):
+        """Copy the document into private state and select it (inside the caller's transaction). Identical content
+        to the current revision adds no revision (and restores a damaged snapshot from the same bytes); different
+        content adds a revision and keeps every earlier snapshot and digest. Returns (record, new)."""
+        g = self.state.setdefault("guidance", {"current": None, "revisions": []})
+        current = self.guidance_record()
+        if current and current["sha256"] == guidance["sha256"]:
+            if self.guidance_problem(current):
+                self.write_guidance_snapshot(self.guidance_path(current), guidance["data"])
+                current.setdefault("restored_at", []).append(now_iso())
+            return current, False
+        n = len(g["revisions"]) + 1
+        rec = {"revision": n, "sha256": guidance["sha256"], "bytes": len(guidance["data"]),
+               "file": f"r{n:03d}-{guidance['sha256'][:16]}.md", "source": guidance["source"], "captured_at": now_iso(),
+               "reason": reason, "supersedes": current["revision"] if current else None,
+               "first_delivered_invocation": None}
+        self.write_guidance_snapshot(self.dir / "guidance" / rec["file"], guidance["data"])
+        g["revisions"].append(rec)
+        g["current"] = n
+        return rec, True
 
     def pr_view(self):
         number = self.state["pr"]["number"]
@@ -1554,7 +1709,9 @@ class Controller:
                         return f"{item['finding_id']} cites {commit}, which is not in the candidate history"
         for item in report["dispositions"]:
             ledger[item["finding_id"]].setdefault("dispositions", []).append({"round": self.last_round_no(), **item})
-        self.state.update(last_report=report, last_report_for=head, last_report_provenance=provenance)
+        # the report answers the owner guidance current when it was accepted; a later revision needs a fresh report
+        self.state.update(last_report=report, last_report_for=head, last_report_provenance=provenance,
+                          last_report_guidance=self.guidance_sha())
         self.save()
         self.publish_dispositions(report)
         if any(d["disposition"] == "unresolved_blocker" for d in report["dispositions"]):
@@ -1609,9 +1766,11 @@ class Controller:
         self.verify_transcripts(candidate["H"])
         self.verify_transcript_delta(candidate["M"], candidate["H"])
         contract = {"workflow": self.state["workflow"]["fingerprint"], "project": project_digest(self.cfg)}
+        guidance = self.guidance_sha()
         reuse = (rnd and rnd["status"] in ("requested", "reviewing") and rnd["H"] == candidate["H"]
                  and rnd["M"] == candidate["M"] and rnd["checkpoint_id"] == cp["id"]
-                 and rnd.get("contract", contract) == contract)  # never reused under another review contract
+                 and rnd.get("contract", contract) == contract  # never reused under another review contract
+                 and rnd.get("guidance_sha256") == guidance)  # nor under other owner guidance
         if not reuse:
             if rnd:
                 rnd["status"] = "superseded"
@@ -1620,6 +1779,11 @@ class Controller:
                 self.state["develop_context"] = "needs_report"
                 self.transition("develop", f"no accepted developer report for candidate {short(candidate['H'])}")
                 return "needs_report"
+            if self.state.get("last_report_guidance") != guidance:  # changed guidance: a fresh report, same commit
+                self.state["develop_context"] = "needs_report"
+                self.transition("develop", f"no accepted developer report under the current owner guidance "
+                                           f"({short(guidance) or 'none'}) for candidate {short(candidate['H'])}")
+                return "needs_report"
             number = len(self.state["rounds"]) + 1
             rnd = {"round": number, "request_id": f"{self.state['enrollment_id']}-r{number:02d}-{uuid.uuid4().hex[:6]}",
                    "checkpoint_id": cp["id"], "checkpoint_type": cp["type"], **candidate,
@@ -1627,12 +1791,13 @@ class Controller:
                    "report": self.state["last_report"], "developer_provenance": self.state.get("last_report_provenance"),
                    "evidence_since": self.state["rounds"][-1]["created_at"] if self.state["rounds"] else self.state["created_at"],
                    "created_at": now_iso(), "status": "requested", "attempts": [], "attempt_seq": 0,
-                   "contract": contract}
+                   "contract": contract, **self.guidance_binding()}
             self.state["rounds"].append(rnd)
             self.state["active_round"] = number
             self.save()
         elif rnd["B"] != candidate["B"]:
             rnd.setdefault("B_observed", []).append({"B": candidate["B"], "at": now_iso()})  # request tuple stays fixed
+        self.require_guidance(rnd.get("guidance_sha256"))  # the bound guidance is intact before it is requested
         self.publish(f"r{rnd['round']:02d}-request", self.request_body(rnd))
         rnd_dir = self.dir / "rounds" / f"r{rnd['round']:02d}"
         rnd_dir.mkdir(parents=True, exist_ok=True)
@@ -1660,6 +1825,8 @@ class Controller:
         return self.finish_round(rnd)  # review_attempt already promoted the round to validated atomically
 
     def review_attempt(self, rnd, rnd_dir):
+        # before anything is recorded or launched: the round's owner guidance must be current and intact
+        guidance_rec, _ = self.require_guidance(rnd.get("guidance_sha256"))
         rnd["attempt_seq"] = n = rnd.get("attempt_seq", 0) + 1  # monotonic across owner-granted budgets
         attempt = {"n": n, "started": now_iso()}
         attempt_started_epoch = time.time()
@@ -1670,7 +1837,7 @@ class Controller:
             self.remove_snapshot(snapshot)
         self.git("-c", "core.longpaths=true", "worktree", "add", "--detach", str(snapshot), rnd["H"])
         try:
-            inputs = self.write_review_inputs(rnd, rnd_dir, snapshot)
+            inputs = self.write_review_inputs(rnd, rnd_dir, snapshot, guidance_rec)
             schema = rnd_dir / "review-schema.json"
             atomic_write_json(schema, strict_schema_copy(json.loads(self.files[REVIEW_SCHEMA_FILE])))
             result_path = rnd_dir / f"result-{n}.json"
@@ -1744,7 +1911,7 @@ class Controller:
                     entry.update(finding=f, finding_round=rnd["round"])
         return ledger
 
-    def write_review_inputs(self, rnd, rnd_dir, snapshot):
+    def write_review_inputs(self, rnd, rnd_dir, snapshot, guidance_rec=None):
         exclude = f":(exclude){self.cfg['transcript_dir'].strip('/')}"
         diff = self.git("diff", "--no-ext-diff", rnd["M"], rnd["H"], "--", ".", exclude)
         names = self.git("diff", "--name-status", "--no-renames", rnd["M"], rnd["H"], "--", ".", exclude)
@@ -1759,8 +1926,17 @@ class Controller:
                                                             "ledger": full})
         atomic_write_json(rnd_dir / "developer-report.json", {"report": rnd["report"],
                                                               "developer_provenance": rnd.get("developer_provenance")})
-        atomic_write_json(rnd_dir / "request.json", {k: rnd[k] for k in (
-            "round", "request_id", "checkpoint_id", "checkpoint_type", "H", "B", "M")})
+        atomic_write_json(rnd_dir / "request.json", {
+            **{k: rnd[k] for k in ("round", "request_id", "checkpoint_id", "checkpoint_type", "H", "B", "M")},
+            "guidance_revision": rnd.get("guidance_revision"), "guidance_sha256": rnd.get("guidance_sha256") or "none"})
+        names = ["feature.diff", "changed-files.txt", "prior-findings.json", "developer-report.json", "request.json",
+                 "developer-tool-transcript.md"]
+        if guidance_rec:  # the round's guidance, copied from the verified snapshot and re-verified at each step
+            data = self.guidance_path(guidance_rec).read_bytes()
+            if sha256_bytes(data) != rnd["guidance_sha256"]:
+                raise Stop("BLOCKED", self.guidance_problem(guidance_rec) or "owner guidance changed while copying it")
+            (rnd_dir / "owner-guidance.md").write_bytes(data)
+            names.append("owner-guidance.md")
         receipts = []
         for gate, (_, paths) in self.gate_status(rnd["H"]).items():  # latest receipts under the shared rule
             for path in paths:
@@ -1786,9 +1962,10 @@ class Controller:
         inbox.mkdir()
         if inbox.resolve().parent != snapshot.resolve():
             raise Stop("BLOCKED", "reviewer inbox resolved outside the snapshot")
-        for name in ("feature.diff", "changed-files.txt", "prior-findings.json", "developer-report.json", "request.json",
-                     "developer-tool-transcript.md"):
+        for name in names:
             shutil.copy2(rnd_dir / name, inbox / name)
+        if guidance_rec and sha256_file(inbox / "owner-guidance.md") != rnd["guidance_sha256"]:
+            raise Stop("BLOCKED", "the reviewer's copy of the owner guidance does not match its digest")
         if receipts:
             (inbox / "evidence").mkdir()
             for path in receipts:
@@ -1797,6 +1974,7 @@ class Controller:
         return {"diff": inbox / "feature.diff", "names": inbox / "changed-files.txt",
                 "prior": inbox / "prior-findings.json", "report": inbox / "developer-report.json",
                 "mission": inbox / ("mission" + Path(self.state["mission"]["snapshot"]).suffix),
+                "guidance": inbox / "owner-guidance.md" if guidance_rec else None,
                 "diff_lines": diff.count("\n") + 1}
 
     def validate_review(self, rnd, result_path, info, prov, stderr_path):
@@ -1835,6 +2013,7 @@ class Controller:
                 "mission": {"id": self.state["plan"]["mission_id"], "sha256": self.state["mission"]["sha256"]},
                 "workflow_fingerprint": self.state["workflow"]["fingerprint"],
                 "project_sha256": project_digest(self.cfg),
+                "guidance_revision": rnd.get("guidance_revision"), "guidance_sha256": rnd.get("guidance_sha256") or "none",
                 "validated_at": now_iso(), "invocation": {"requested": requested, "observed": prov, **info},
                 "response_sha256": sha256_bytes(raw) if raw else None, "result": result if not reasons else None,
                 "raw_result_if_rejected": raw.decode("utf-8", "replace")[:4000] if reasons else None}
@@ -1940,11 +2119,16 @@ class Controller:
                 self.state["active_round"] = None
             self.settle_publications()
             return self.review_round()
+        current_guidance = self.guidance_sha() or "none"
         if envelope is None or envelope.get("workflow_fingerprint") != self.state["workflow"]["fingerprint"] or \
-                envelope.get("project_sha256") not in (None, project_digest(self.cfg)):
-            # bytes authenticated before parsing; unreadable, altered or other-version results take one transition
+                envelope.get("project_sha256") not in (None, project_digest(self.cfg)) or \
+                envelope.get("guidance_sha256", "none") != current_guidance or \
+                (rnd.get("guidance_sha256") or "none") != current_guidance:
+            # bytes authenticated before parsing; unreadable, altered, other-version or other-guidance results take
+            # one transition (a result bound to different owner guidance, or to none, is never accepted)
             with self.txn():
-                self.retire_verdict(rnd, "its preserved result is missing, altered or from another workflow version")
+                self.retire_verdict(rnd, "its preserved result is missing, altered, from another workflow version or "
+                                         "bound to different owner guidance")
                 rnd["status"] = "invalidated"
                 self.state["active_round"] = None
             self.settle_publications()
@@ -2044,7 +2228,8 @@ class Controller:
         elif decision == "ready_for_owner_review":
             self.state["ready_review"] = {"round": rnd["round"], "H": rnd["H"], "B": rnd["B"],
                                           "B_at_acceptance": rnd.get("B_at_acceptance"),
-                                          "M": rnd["M"], "summary": result["summary"]}
+                                          "M": rnd["M"], "summary": result["summary"],
+                                          "guidance_sha256": rnd.get("guidance_sha256")}
             self.transition("finalize", f"round {rnd['round']} ready for owner review", save=False)
         else:
             stop = Stop("BLOCKED", f"reviewer blocked: {result['decision_rationale']}")
@@ -2091,6 +2276,7 @@ class Controller:
                  f"| Merge base M | `{rnd['M']}` |",
                  f"| Mission | `{self.state['plan']['mission_id']}` sha256 `{short(self.state['mission']['sha256'])}` |",
                  f"| Workflow | `{short(self.state['workflow']['fingerprint'])}` |",
+                 f"| Owner guidance | {self.guidance_label(rnd.get('guidance_sha256'), rnd.get('guidance_revision'))} |",
                  f"| Developer observed | {self.provenance_line(rnd.get('developer_provenance'))} |",
                  f"| Reviewer requested | Codex `{rev['model']}`, effort `{rev['effort']}`, read-only sandbox |",
                  f"| Round budget | {self.state['rounds_completed'].get(rnd['checkpoint_id'], 0) + 1} of "
@@ -2153,6 +2339,9 @@ class Controller:
                   f"| Model | `{envelope['invocation']['requested']['model']}` | `{prov['observed_model']}` (turns {prov['turn_models']}) |",
                   f"| Reasoning effort | `{envelope['invocation']['requested']['effort']}` | `{prov['observed_effort']}` (turns {prov['turn_efforts']}) |",
                   f"| Sandbox / approvals | read-only / never | `{prov['sandbox']}` / `{prov['approval_policy']}` |",
+                  "", "Owner guidance bound to this review: " + self.guidance_label(
+                      None if envelope.get("guidance_sha256", "none") == "none" else envelope["guidance_sha256"],
+                      envelope.get("guidance_revision")) + ".",
                   "", f"Codex CLI `{prov['cli_version']}`, thread `{envelope['invocation'].get('thread_id')}`, "
                       f"duration {envelope['invocation'].get('duration_s')}s, response sha256 "
                       f"`{envelope['response_sha256']}`, request `{rnd['request_id']}`. Observed values come from the "
@@ -2194,6 +2383,15 @@ class Controller:
                        "mission_path": str(inputs["mission"]),
                        "transcript_dir": self.cfg["transcript_dir"],
                        "pending_findings": ", ".join(rnd["pending_findings"]) or "none"})
+        if inputs.get("guidance"):
+            fields["guidance"] = (
+                f"- Owner guidance revision {rnd['guidance_revision']} (sha256 `{rnd['guidance_sha256']}`): "
+                f"`{inputs['guidance']}` (`.agent-review-inputs/owner-guidance.md`). The owner supplied it with "
+                f"`resume --guidance` to steer the developer's repair approach. {GUIDANCE_SCOPE} Judge the candidate "
+                "against the mission and this checkpoint contract; the guidance never excuses missing required "
+                "behavior and does not change how prior findings are assessed.")
+        else:
+            fields["guidance"] = "- Owner guidance: none for this round."
         return fields
 
     # -- headless developer loop ---------------------------------------------------------
@@ -2361,6 +2559,7 @@ class Controller:
                                   "is dispatched without an owner-authorized extension")
         if dev["invocations"] >= self.limits["max_developer_invocations"]:
             raise Stop("BLOCKED", f"developer invocation budget exhausted ({dev['invocations']})")
+        guidance_rec, guidance_text = self.require_guidance(self.guidance_sha())  # intact, before any charge or launch
         fields = self.common_fields()
         fields.update({"stop_file": str(self.stop_path), "worktree": self.state["repo_root"],
                        "push_command": " ".join(push_argv(self.cfg, self.wf, self.state["enrollment_id"]))
@@ -2393,14 +2592,20 @@ class Controller:
             situation = ""
         if self.state.get("pending_findings") and context != "findings":
             situation += " Pending findings still need dispositions: " + ", ".join(self.state["pending_findings"])
-        fields["situation"] = situation
-        prompt = self.render("developer-continue.md" if resume else "developer-start.md", fields)
         n = dev["invocations"] + 1
+        if guidance_rec and not guidance_rec.get("first_delivered_invocation"):
+            situation = (f"The owner supplied new guidance (revision {guidance_rec['revision']}) with `resume --guidance`; "
+                         "apply it to your repair approach (see \"Owner guidance\" below). A fresh report is required "
+                         "before the next review, even if the candidate commit does not change. " + situation).strip()
+        fields["situation"] = situation
+        fields["guidance"] = self.developer_guidance_section(guidance_rec, guidance_text)
+        prompt = self.render("developer-continue.md" if resume else "developer-start.md", fields)
         log_dir = self.dir / "developer"
         log_dir.mkdir(parents=True, exist_ok=True)
         write_text(log_dir / f"prompt-{n:03d}.md", prompt)
         # Charge the budget and record launch intent before dispatch.
-        dev.update(invocations=n, launch={"n": n, "at": now_iso(), "resume": resume, "returned": False})
+        dev.update(invocations=n, launch={"n": n, "at": now_iso(), "resume": resume, "returned": False,
+                                          **(self.guidance_binding() if guidance_rec else {})})
         self.save()
 
         def on_start(pid):
@@ -2418,6 +2623,8 @@ class Controller:
                                  protected=self.runtime_active)
         dev.update(active_pid=None, started=True)
         dev["launch"]["returned"] = True
+        if guidance_rec and not guidance_rec.get("first_delivered_invocation"):
+            guidance_rec["first_delivered_invocation"] = n  # an invocation that returned has seen this revision
         dev.setdefault("log", []).append({k: out.get(k) for k in (
             "init_model", "main_models", "observed_effort", "api_key_source", "cost_usd", "model_usage",
             "permission_denials", "exit_code", "duration_s", "deadline_exceeded", "terminated", "subtype",
@@ -2654,8 +2861,12 @@ class Controller:
             known.update(self.state["archived"])
             atomic_write_json(ledger, known)
 
-    def resume(self, reason, max_rounds=None, resend_undelivered=False):
-        """Owner-initiated continuation after a stop; counters and session persist."""
+    def resume(self, reason, max_rounds=None, resend_undelivered=False, guidance=None):
+        """Owner-initiated continuation after a stop; counters and session persist. With guidance (a document read by
+        read_guidance), every eligibility check runs before anything changes, and the captured snapshot and its
+        selection persist in the same transaction as the resume itself."""
+        if guidance is not None:
+            self.guidance_refusal(guidance, max_rounds)
         if resend_undelivered:  # the owner checked the PR: parts still absent may be sent again
             for key, pub in self.state.get("publications", {}).items():
                 for part in pub["parts"]:
@@ -2679,20 +2890,33 @@ class Controller:
         if self.state["phase"] in ("develop", "review") and self.budget_exhausted(limit):
             raise UsageError(f"the review-round budget for {self.checkpoint['id']} is exhausted "
                              f"({self.state['rounds_completed'].get(self.checkpoint['id'], 0)}/{limit}); pass a larger --max-rounds")
-        self.stop_path.unlink(missing_ok=True)
-        active = self.active()
-        if active and active["status"] in ("requested", "reviewing"):
-            self.reconcile_reviewer_attempt(active, self.dir / "rounds" / f"r{active['round']:02d}")
-            # failed attempts stay recorded; the owner's resume grants a fresh attempt budget
-            active["earlier_attempts"] = active.get("earlier_attempts", []) + active["attempts"]
-            active["attempts"] = []
-        if max_rounds:
-            self.state["limits"]["max_review_rounds_per_checkpoint"] = int(max_rounds)
-        if (self.state.get("status_reason") or "").startswith("no progress"):
-            for entry in self.state.get("findings", {}).values():
-                entry["rounds_open"] = 0  # the owner reviewed the disagreement; counting restarts from here
-        self.state.update(status="ACTIVE", status_reason=f"resumed: {reason}")
-        self.transition(self.state["phase"], f"owner resume: {reason}")
+        if guidance is None and self.guidance_problem():  # never resume past a damaged snapshot into a launch
+            raise Stop("BLOCKED", self.guidance_problem())
+        captured = None
+        with contextlib.ExitStack() as held:  # without guidance: exactly the earlier sequence of saves
+            if guidance is not None:
+                held.enter_context(self.helper_lock("resume-guidance"))  # no push/verify helper starts meanwhile
+                held.enter_context(self.txn())  # the snapshot's selection and the resume persist in one save
+                captured = self.capture_guidance(guidance, reason)
+            self.stop_path.unlink(missing_ok=True)
+            active = self.active()
+            if active and active["status"] in ("requested", "reviewing"):
+                self.reconcile_reviewer_attempt(active, self.dir / "rounds" / f"r{active['round']:02d}")
+                # failed attempts stay recorded; the owner's resume grants a fresh attempt budget
+                active["earlier_attempts"] = active.get("earlier_attempts", []) + active["attempts"]
+                active["attempts"] = []
+            if max_rounds:
+                self.state["limits"]["max_review_rounds_per_checkpoint"] = int(max_rounds)
+            if (self.state.get("status_reason") or "").startswith("no progress"):
+                for entry in self.state.get("findings", {}).values():
+                    entry["rounds_open"] = 0  # the owner reviewed the disagreement; counting restarts from here
+            note = ""
+            if captured:
+                rec, new = captured
+                note = (f"; owner guidance revision {rec['revision']} sha256 {short(rec['sha256'])} "
+                        + ("captured" if new else "unchanged (identical content)"))
+            self.state.update(status="ACTIVE", status_reason=f"resumed: {reason}")
+            self.transition(self.state["phase"], f"owner resume: {reason}{note}")
         if self.state["mode"] == "headless":
             return self.run_loop()
         if self.state["phase"] == "review":
@@ -2702,6 +2926,10 @@ class Controller:
             return result
         if self.state["phase"] == "finalize":
             return self.finalize()
+        if captured:  # the foreground session is not launched by the controller: name the captured copy
+            rec = captured[0]
+            return (f"ACTIVE (foreground: owner guidance revision {rec['revision']} sha256 {rec['sha256']} is at "
+                    f"{self.guidance_path(rec)}; apply it and continue with `review --report`)")
         return "ACTIVE (foreground: continue with `review --report`)"
 
     # -- archive and readiness ---------------------------------------------------------
@@ -2960,6 +3188,18 @@ class Controller:
         if accepted.get("envelope_path") and read_json(accepted["envelope_path"]).get("workflow_fingerprint") != \
                 self.state["workflow"]["fingerprint"]:
             reasons.append("the ready review was produced under a different workflow version")
+        guidance = self.guidance_sha()
+        bound = {ready.get("guidance_sha256"), accepted.get("guidance_sha256"), self.state.get("last_report_guidance")}
+        if accepted.get("envelope_path"):
+            recorded = read_json(accepted["envelope_path"]).get("guidance_sha256", "none")
+            bound.add(None if recorded == "none" else recorded)
+        if bound != {guidance}:  # a result bound to other guidance, or to none, is not ready for the current one
+            reasons.append(f"owner guidance changed: the ready review and report are bound to "
+                           f"{', '.join(sorted(short(b) or 'none' for b in bound))}, not the current "
+                           f"{short(guidance) or 'none'}")
+        problem = self.guidance_problem()
+        if problem:
+            reasons.append(problem)
         if missing:
             reasons.append("published records are missing or altered on the PR: " + ", ".join(missing[:5]))
         if self.state.get("last_report_for") != ready["H"]:
@@ -3103,7 +3343,7 @@ class Controller:
             self.retire_receipts(f"Handoff not current: {stop.reason}")
             raise
         reasons, notes = self.readiness(archive_head)
-        if any(r.startswith(("material change", "merge base moved")) for r in reasons):
+        if any(r.startswith(("material change", "merge base moved", "owner guidance changed")) for r in reasons):
             self.invalidate_ready("; ".join(reasons))
         if reasons:
             self.retire_receipts("Not ready for owner review: " + "; ".join(reasons))
@@ -3312,6 +3552,12 @@ class Controller:
             "archive_pending": bool(s.get("archive_pending")),
             "workflow_fingerprint_matches": fp_ok, "updated_at": s.get("updated_at"),
         }
+        rec = self.guidance_record()
+        if rec:  # pre-guidance enrollments report exactly the fields they always did
+            out["guidance"] = {"revision": rec["revision"], "sha256": rec["sha256"],
+                               "snapshot": str(self.dir / "guidance" / rec["file"]),
+                               "revisions": len(s["guidance"]["revisions"]),
+                               "intact": not self.guidance_problem(rec)}
         if remote and s["status"] == "AWAITING_OWNER_REVIEW":
             try:
                 moved = self.handoff_superseded()
@@ -4235,15 +4481,18 @@ COMMAND_STATUSES = {"run": {"ACTIVE"}, "review": {"ACTIVE"}, "finalize": {"ACTIV
                     "activate": {"ACTIVE", "PAUSED", "BLOCKED", "AWAITING_OWNER_REVIEW"}}
 
 
-def guarded(controller, command, fn, mutate=True, honor_stop=False):
+def guarded(controller, command, fn, mutate=True, honor_stop=False, precheck=None):
     """Run fn under the single-writer lock with reloaded state and the pre-mutation guard. Status eligibility and
-    the host/worktree claims are re-checked after locking, so a stale process cannot act on old authority."""
+    the host/worktree claims are re-checked after locking, so a stale process cannot act on old authority. A
+    precheck refusal (UsageError), like those checks, leaves the state file untouched."""
     with controller.lock(command):
         controller.reload()
         allowed = COMMAND_STATUSES.get(command)
         if allowed and controller.state["status"] not in allowed:
             raise UsageError(f"enrollment is {controller.state['status']}; {command} is not permitted now")
         controller.assert_claims()
+        if precheck:
+            precheck()
         try:
             controller.snapshot_fp, _, controller.files = load_workflow(controller.wf)  # read under the interlock
             if mutate:
@@ -4267,6 +4516,16 @@ def guarded(controller, command, fn, mutate=True, honor_stop=False):
             controller.publish_status(stop.status, stop.reason)
             print(json.dumps({"stopped": stop.status, "reason": stop.reason, **controller.status()}, indent=2))
             return EXIT_BLOCKED if stop.status == "BLOCKED" else EXIT_PAUSED
+
+
+def resume_command(controller, reason, max_rounds=None, resend_undelivered=False, guidance_file=None):
+    """The owner's `resume`. With --guidance, the document is read, decoded and hashed before the lock is taken, and
+    its eligibility is checked under the lock before the pre-mutation guard: a refusal changes nothing."""
+    guidance = read_guidance(guidance_file) if guidance_file is not None else None
+    precheck = (lambda: controller.guidance_refusal(guidance, max_rounds)) if guidance is not None else None
+    return guarded(controller, "resume",
+                   lambda: controller.resume(reason, max_rounds, resend_undelivered, guidance=guidance),
+                   precheck=precheck)
 
 
 def main(argv=None):
@@ -4334,6 +4593,9 @@ def main(argv=None):
             p.add_argument("--reason", required=True, help="what the owner changed or decided")
             p.add_argument("--resend-undelivered", action="store_true",
                            help="after checking the PR: re-send parts whose earlier delivery was ambiguous and absent")
+            p.add_argument("--guidance", metavar="FILE",
+                           help="owner guidance (UTF-8 document) captured for both the developer and the reviewer; "
+                                "only for an idle BLOCKED or PAUSED enrollment in the develop phase")
     args = parser.parse_args(argv)
     try:
         if args.command == "install":
@@ -4417,7 +4679,7 @@ def main(argv=None):
             print(json.dumps(result, indent=2))
             return EXIT_OK
         if args.command == "resume":
-            return guarded(controller, "resume", lambda: controller.resume(args.reason, args.max_rounds, args.resend_undelivered))
+            return resume_command(controller, args.reason, args.max_rounds, args.resend_undelivered, args.guidance)
         if controller.state["status"] in ("BLOCKED", "PAUSED", "AWAITING_OWNER_REVIEW") and \
                 args.command not in ("archive", "cancel"):
             raise UsageError(f"enrollment is {controller.state['status']}: {controller.state.get('status_reason')}; "
