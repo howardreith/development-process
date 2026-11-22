@@ -365,11 +365,19 @@ only when the owner explicitly asks for unattended work. In foreground:
   refuse it meanwhile. Its output carries the full effective task, then a
   delivery marker naming the enrollment, revision and digest. The report
   binding requires CLI-recorded evidence that one successful tool result in
-  the session contained both the complete text and the marker (a digest alone,
-  a failed command or a truncated display does not count), and the report must
+  the session contained both the complete text and the marker, or, for a
+  document too long for one display, that every numbered part was displayed
+  with its part marker (a digest alone, a failed command, a truncated display
+  or a missing part does not count), and the report must
   cite the revision it was prepared for, so an earlier report cannot be
-  relabeled. An amendment after the last allowed round is recorded but stops
-  BLOCKED until a separate owner extension. Codex receives the amendments document
+  relabeled. An amendment after the last allowed round is recorded, with the
+  BLOCKED decision saved in the same transaction, until a separate owner
+  extension. In foreground every review request or reviewer attempt, including
+  the replacement for a preserved result that fails authentication, is started
+  only by the enrolled session with a matching recorded provenance; an intact
+  preserved result is published by any owner `resume`. A command reports a
+  review as its own only if that round was accepted after the command took the
+  writer lock. Codex receives the amendments document
   byte-exact, and the existing freshness rules make older reports, reviews,
   ready results and handoffs ineligible.
 - Section 9's verification of the session (model and effort on every logical

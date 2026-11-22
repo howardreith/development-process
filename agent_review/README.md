@@ -72,14 +72,16 @@ project. Plans: `single` (any mission), `black-tentacles`, `agent-review-setup`.
   schema and semantic validation of reviews, host-wide and worktree locks,
   idempotent publication, retries, round budgets, gate receipts, archive
   commits and readiness. It is the only component that writes to GitHub.
-- **Developer**: Claude Code. *Headless mode* (normal missions): the
-  controller launches `claude -p --model opus --effort high --session-id <uuid>`
-  and later `--resume <uuid>` (never `--continue`), with
-  `--permission-mode dontAsk`, the enrollment's hash-pinned permission file,
-  no MCP servers and a required structured report. *Foreground mode*: an
-  interactive Claude session is the developer and submits reports with
-  `review --report`; each report is bound to that session's CLI-recorded
-  model and effort.
+- **Developer**: Claude Code. *Foreground mode* (the default for interactive
+  work): the owner's interactive Claude session is the developer, submits
+  reports with `review --report` and receives each accepted review in that
+  command's output; reports are bound to the session's CLI-recorded models,
+  effort and permission mode. *Headless mode* (unattended missions, only on the
+  owner's explicit request): the controller launches
+  `claude -p --model opus --effort high --session-id <uuid>` and later
+  `--resume <uuid>` (never `--continue`), with `--permission-mode dontAsk`, the
+  enrollment's hash-pinned permission file, no MCP servers and a required
+  structured report.
 - **Reviewer**: `codex -a never exec --ignore-user-config -m gpt-6.2-astra
   -c model_reasoning_effort="max" -c windows.sandbox="elevated" --sandbox
   read-only --disable <connectors/agents/browser/...> -C <snapshot>
@@ -312,10 +314,16 @@ it follows the latest headless developer stream (`developer/stream-NNN.jsonl`:
 tool calls, result excerpts, Claude's messages, never thinking), the current
 review round's reviewer events (`rounds/rNN/events-K.jsonl`) and gate
 markers/receipts, and prints a status line with the role, candidate commit,
-round count, elapsed time, latest observable action and any blocker, plus a
-notice when no new agent event has arrived for `--stall-minutes` (default 10;
-a running process is not proof of progress). `--once` prints one observation;
-`--log FILE` also appends the feed to a file the owner can tail:
+current checkpoint's round count, elapsed time, the current role's latest
+observable action (with its age) and any blocker, plus a notice when no new
+agent event has arrived for `--stall-minutes` (default 10; a running process is
+not proof of progress). Rows replayed for context when a file is first seen are
+marked `(earlier)`; a gate marker without a receipt whose helper is no longer
+running is shown as interrupted. Event content is sanitized whole before it is
+shortened. The state must name the requested enrollment (otherwise nothing of
+it is shown). `--once` prints one observation; `--log FILE` also appends the
+feed to a separate file the owner can tail (a path inside the enrollment's
+records or worktree, or naming one of its files, is refused):
 
 ```powershell
 python $ar watch --enrollment <id> --log C:/Dev/<id>-live.log
@@ -380,9 +388,11 @@ separate:
    continuation is included while that round's findings are pending;
    after an owner amendment it is still shown, marked as written under earlier
    owner instructions. Normal correction rounds need no relay or approval.
-6. **Owner notification (supervisor).** The supervisor runs `run` as a
-   background task and observes its terminal result. At
-   `AWAITING_OWNER_REVIEW` it verifies the handoff with
+6. **Owner notification (supervisor).** Headless: the supervisor runs `run`
+   as a background task and observes its terminal result. Foreground: the
+   developing session itself runs `review` and `finalize` and observes their
+   results; there is no background `run`. In both modes, at
+   `AWAITING_OWNER_REVIEW` the session verifies the handoff with
    `status --enrollment <id> --remote` (`handoff_current: true`) and then tells
    the owner, in the conversation that launched the task: the PR link, the
    reviewed source commit and archive commit, the outcome, review and
@@ -401,8 +411,22 @@ scope or acceptance while keeping the same enrollment, branch, PR, finding
 history and spent counters. The original mission file and its hash stay the
 immutable baseline; amendments are recorded separately and cumulatively.
 
-**Supervisor procedure when the owner sends an updated instruction** (the
-owner only supplies the instruction; the supervisor runs every command):
+**Foreground procedure** (the default for interactive work; the enrolled session
+is the developer and runs every command; there is no background `run` to stop):
+
+```powershell
+# 1. Save the owner's exact text durably, outside the worktree, in a NEW file, and report it to the owner as PENDING.
+# 2. Let any running review/finalize/verify/push command of the session return (their locks refuse the amendment).
+# 3. Apply it from the enrolled session, between its own commands (no `stop`):
+python $ar resume --enrollment <id> --reason "owner update of <date>" --amend-mission <saved-file>
+# 4. Read the printed effective_task: the full text and its delivery marker; for a long document, `parts` lists the
+#    `status --enrollment <id> --instructions --part K` commands, and every part must be displayed. Then write the next
+#    report under the amended task with `report_citation` in evidence_refs. At the round cap the command stops BLOCKED
+#    instead (applied, not delivered) until a separate owner extension.
+```
+
+**Headless procedure** (unattended runs: the supervisor stops the background
+`run`, waits, applies, and runs again; the owner only supplies the instruction):
 
 ```powershell
 # 1. Save the owner's exact text durably, outside the enrolled worktree, in a NEW file for every message received
@@ -460,12 +484,20 @@ supervisor never claims an agent saw text that only the supervisor received.
   refused. The command publishes the queued corrections (for example a
   superseded handoff) before it returns, and prints the effective task under
   `effective_task`: the mission path and sha256, and the amendments `revision`,
-  `sha256`, precedence note and full `text`. `status --instructions` prints the
-  same, read-only, at any time. A foreground report is bound to the selected
-  amendments only when the session's CLI-recorded transcript shows a tool
-  result containing that revision's sha256 at or after its capture; otherwise
-  `review --report` is refused with the command to display it. `status`
-  reports that observation as `amendments.selected.shown_in_foreground_session_at`.
+  `sha256`, precedence note, `report_citation` and full `text` followed by its
+  `delivery_marker`. A document longer than 8,000 characters is instead listed
+  as numbered `parts`; `status --instructions --part K` prints part K (its text
+  slice, then a part marker), each small enough for one displayed tool result.
+  `status --instructions` prints the effective task read-only at any time. A
+  foreground report is bound to the selected amendments only when the
+  session's CLI-recorded transcript shows a successful tool result, at or
+  after the capture, holding the complete text and its marker (or, for a long
+  document, one for every part and its part marker), and the report cites the
+  revision; otherwise `review --report` is refused with the command to display
+  it. A digest alone, a failed command, a truncated display or a missing part
+  never counts. `status` reports the observation as
+  `amendments.selected.shown_in_foreground_session_at` (and
+  `foreground_delivery_problem` when the transcript cannot be read).
   Approach-only `--guidance` stays headless-only: in foreground the owner
   gives approach guidance to the session directly.
 - **Capture.** The file is validated like a guidance document (at most 64 KiB,

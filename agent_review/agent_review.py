@@ -78,10 +78,12 @@ PEM_BEGIN_RE = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
 class Stop(Exception):
     """A visible workflow stop: BLOCKED (impediment) or PAUSED (resumable)."""
 
-    def __init__(self, status: str, reason: str):
+    def __init__(self, status: str, reason: str, persisted: bool = False):
         assert status in ("BLOCKED", "PAUSED")
         super().__init__(f"{status}: {reason}")
-        self.status, self.reason = status, reason
+        # persisted: the stop and its public notice were already saved in the same transaction as the change that
+        # caused it; the command path only reports it (no second transition or notice)
+        self.status, self.reason, self.persisted = status, reason, persisted
 
 
 class UsageError(Exception):
@@ -310,6 +312,40 @@ class LiveLog:
                     pass
 
 
+def jsonl_records(data: bytes):
+    """(completed records, parsed objects) of a JSON-lines byte stream split on its physical record delimiter (LF)
+    only: a JSON string may legitimately contain U+2028/U+2029, which str.splitlines() would wrongly split. A final
+    record without its LF is still being written and is not counted; a completed record that does not parse is in
+    `records` but not in the parsed list."""
+    parts = data.split(b"\n")
+    records = [p for p in parts[:-1] if p.strip()]  # parts[-1] is "" or an in-progress record
+    parsed = []
+    for raw in records:
+        try:
+            parsed.append(json.loads(raw.decode("utf-8")))
+        except (ValueError, UnicodeDecodeError):
+            continue
+    return records, parsed
+
+
+DELIVERY_PART_CHARS = 8000  # one part, JSON-encoded, stays well inside a single displayed tool result
+
+
+def amendment_parts(text):
+    """The cumulative amendments text cut into delivery parts of at most DELIVERY_PART_CHARS characters (one part when
+    it fits). Deterministic, so the controller can check every part's display."""
+    return [text[i:i + DELIVERY_PART_CHARS] for i in range(0, len(text), DELIVERY_PART_CHARS)] or [""]
+
+
+def clean_text(value, limit=240) -> str:
+    """Display text from an event field: the COMPLETE value is sanitized (credentials, key blocks, home paths) before
+    it is flattened and shortened, so a cut can never leave the tail of a redacted block visible."""
+    if value is None:
+        return ""
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    return one_line(sanitize(text, strict=False)[0], limit)
+
+
 def one_line(text, limit=240) -> str:
     text = re.sub(r"\s+", " ", str(text or "")).strip()
     return text if len(text) <= limit else text[:limit - 1] + "…"
@@ -322,16 +358,16 @@ def render_codex_event(event) -> list:
         return []
     kind, item = event.get("type"), event.get("item") if isinstance(event.get("item"), dict) else {}
     if kind == "item.started" and item.get("type") == "command_execution":
-        return ["Codex ▸ $ " + one_line(item.get("command"), 300)]
+        return ["Codex ▸ $ " + clean_text(item.get("command"), 300)]
     if kind == "item.completed" and item.get("type") == "command_execution":
-        return [f"   ↳ exit {item.get('exit_code')}: " + one_line(item.get("aggregated_output"), 200)]
+        return [f"   ↳ exit {item.get('exit_code')}: " + clean_text(item.get("aggregated_output"), 200)]
     if kind == "item.completed" and item.get("type") == "agent_message":
-        return ["Codex: " + one_line(item.get("text"), 600)]
+        return ["Codex: " + clean_text(item.get("text"), 600)]
     if kind == "turn.completed":
         usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
         return [f"Codex turn completed (input {usage.get('input_tokens')}, output {usage.get('output_tokens')} tokens)"]
     if kind in ("turn.failed", "error"):
-        return ["Codex error: " + one_line(event.get("message") or event.get("error"), 300)]
+        return ["Codex error: " + clean_text(event.get("message") or event.get("error"), 300)]
     return []
 
 
@@ -398,25 +434,36 @@ class StreamRedactor:
 
 def stream_process(argv, cwd, timeout_s, on_line, may_terminate=lambda: True):
     """Run argv with stdout and stderr read concurrently; on_line(text) receives each line as it arrives, redacted per
-    stream (StreamRedactor). Returns (exit code, stdout text, stderr text): the same separate, unredacted streams `run`
-    captures, so a receipt built from them is unchanged. Output counts as complete only when the process has exited
-    AND both streams reached end of file (descendants can keep a pipe open) within the deadline; otherwise the result
-    is a timeout (exit code None). On a timeout the process tree is terminated only once may_terminate() allows it
-    (a configured runtime restoration is never interrupted); a descendant that already left the gate's process tree
-    cannot always be reached and is no longer waited for."""
+    stream (StreamRedactor). Returns (exit code, stdout text, stderr text, problem): the same separate, unredacted
+    streams `run` captures, so a receipt built from them is unchanged, and problem None, "timeout" or "capture failed:
+    ...". Output counts as complete only when the process exited AND each reader recorded its stream's end of file
+    within the deadline (descendants can keep a pipe open); a reader that stopped without reaching end of file is a
+    capture failure, never a complete capture. A failing progress display never stops the evidence from draining. On a
+    timeout the process tree is terminated only once may_terminate() allows it (a configured runtime restoration is
+    never interrupted); a descendant that already left the gate's process tree cannot always be reached and is no
+    longer waited for."""
     deadline = time.monotonic() + timeout_s
     proc = subprocess.Popen([str(a) for a in argv], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace")
-    chunks = {"out": [], "err": []}
+    chunks, eof, failures = {"out": [], "err": []}, {"out": False, "err": False}, []
 
     def pump(stream, key):
         redact = StreamRedactor()
-        for row in iter(stream.readline, ""):
-            chunks[key].append(row)
-            shown = redact(row.rstrip("\r\n"))
-            if shown is not None:
-                on_line(shown)
-        stream.close()
+        try:
+            for row in iter(stream.readline, ""):
+                chunks[key].append(row)  # evidence first
+                try:
+                    shown = redact(row.rstrip("\r\n"))
+                    if shown is not None:
+                        on_line(shown)
+                except Exception:  # noqa: BLE001 - progress only: the line is simply not shown
+                    pass
+            eof[key] = True  # positive evidence that this stream was read to its end
+        except Exception as exc:  # noqa: BLE001 - recorded: the capture is incomplete
+            failures.append(f"{key}: {type(exc).__name__}: {exc}")
+        finally:
+            with contextlib.suppress(Exception):
+                stream.close()
     readers = [threading.Thread(target=pump, args=(proc.stdout, "out"), daemon=True),
                threading.Thread(target=pump, args=(proc.stderr, "err"), daemon=True)]
     for reader in readers:
@@ -426,11 +473,14 @@ def stream_process(argv, cwd, timeout_s, on_line, may_terminate=lambda: True):
         proc.wait(timeout=remaining())
         for reader in readers:  # descendants may still hold a pipe: wait for both ends of file, within the deadline
             reader.join(timeout=remaining())
-        complete = not any(reader.is_alive() for reader in readers)
+        finished = not any(reader.is_alive() for reader in readers)
     except subprocess.TimeoutExpired:
-        complete = False
-    if complete:
-        return proc.returncode, "".join(chunks["out"]), "".join(chunks["err"])
+        finished = False
+    out, err = "".join(chunks["out"]), "".join(chunks["err"])
+    if finished:
+        if all(eof.values()):
+            return proc.returncode, out, err, None
+        return proc.returncode, out, err, "capture failed: " + ("; ".join(failures) or "a stream ended without EOF")
     while not may_terminate():  # a protected runtime restoration reaches its safe boundary first
         time.sleep(2)
     if proc.poll() is None:
@@ -439,7 +489,7 @@ def stream_process(argv, cwd, timeout_s, on_line, may_terminate=lambda: True):
             proc.wait(timeout=30)
     for reader in readers:
         reader.join(timeout=5)
-    return None, "".join(chunks["out"]), "".join(chunks["err"])
+    return None, "".join(chunks["out"]), "".join(chunks["err"]), "timeout"
 
 
 # A foreground session runs under the owner's own Claude Code settings and interactive approvals: the enrollment's
@@ -463,6 +513,9 @@ def foreground_session_problems(prov, dev_cfg):
         problems.append(f"foreground session models {models} are not all {dev_cfg['model']}")
     if prov.get("efforts") != [dev_cfg["effort"]]:
         problems.append(f"foreground session effort {prov.get('efforts')} != {dev_cfg['effort']}")
+    if prov.get("unreadable_records"):  # a completed record that cannot be read could hide a turn
+        problems.append(f"{prov['unreadable_records']} completed record(s) of the foreground session's transcript "
+                        "could not be read")
     if prov.get("turns_missing_metadata"):  # every logical main-thread turn must carry both observations
         problems.append(f"{prov['turns_missing_metadata']} main-thread turn(s) of the foreground session lack a "
                         f"recorded model or effort (for example {prov.get('incomplete_turns')})")
@@ -1040,8 +1093,14 @@ class ClaudeDeveloper:
 
     def __init__(self, cfg: dict, settings_path: Path, schema_path: Path, schema_text: str = None):
         self.cfg, self.settings_path, self.schema_path, self.schema_text = cfg, settings_path, schema_path, schema_text
-        self.exe = resolve_exe(cfg.get("executable", "claude"))
+        self._exe = None  # resolved when something is launched: reading a transcript needs no executable
         self.config_dir = Path(expand(cfg["config_dir"])) if cfg.get("config_dir") else None
+
+    @property
+    def exe(self):
+        if self._exe is None:
+            self._exe = resolve_exe(self.cfg.get("executable", "claude"))
+        return self._exe
 
     @property
     def requested(self):
@@ -1070,17 +1129,15 @@ class ClaudeDeveloper:
         """CLI-recorded models (main thread) and effort settings for a session transcript; with since (an ISO
         prefix), only records of the current invocation count. Also the permission modes the CLI recorded for the
         session (`permission-mode` records and each user turn's `permissionMode`)."""
-        models, efforts, modes, paths = set(), set(), set(), self._transcripts(session_id)
+        modes, paths, unreadable = set(), self._transcripts(session_id), 0
         turns = {}  # one logical main-thread turn can span several CLI records (same message id)
         for path in paths:
             data = path.read_bytes()
             if after is not None:
                 data = data[after.get(str(path), 0):]  # bytes appended after the recorded position
-            for line in data.decode("utf-8", errors="replace").splitlines():
-                try:
-                    obj = json.loads(line)
-                except ValueError:
-                    continue
+            records, ok = jsonl_records(data)
+            unreadable += len(records) - len(ok)
+            for obj in ok:
                 if not isinstance(obj, dict):
                     continue
                 if since and str(obj.get("timestamp") or "") < since:
@@ -1091,13 +1148,11 @@ class ClaudeDeveloper:
                                             {"models": set(), "efforts": set(), "synthetic": False})
                     for key in ("effort", "perTurnEffort"):
                         if isinstance(obj.get(key), str) and obj[key]:
-                            efforts.add(obj[key])
                             turn["efforts"].add(obj[key])
                     model = message.get("model")
                     if model == "<synthetic>":
                         turn["synthetic"] = True  # a CLI-generated message, not a model turn
                     elif isinstance(model, str) and model:
-                        models.add(model)
                         turn["models"].add(model)
                 if obj.get("type") in ("permission-mode", "user") and not obj.get("isSidechain") and \
                         "permissionMode" in obj:
@@ -1105,22 +1160,24 @@ class ClaudeDeveloper:
                     modes.add(mode if isinstance(mode, str) else repr(mode))  # empty/odd values stay visible
         real = {k: t for k, t in turns.items() if t["models"] or not t["synthetic"]}
         incomplete = [str(k) for k, t in real.items() if not t["models"] or not t["efforts"]]
+        # the session's models and efforts come from its real (model) turns only
+        models = set().union(*(t["models"] for t in real.values())) if real else set()
+        efforts = set().union(*(t["efforts"] for t in real.values())) if real else set()
         return {"found": bool(paths), "session_id": session_id, "models": sorted(models), "efforts": sorted(efforts),
+                "unreadable_records": unreadable,
                 "permission_modes": sorted(modes), "turns": len(real), "turns_missing_metadata": len(incomplete),
                 "incomplete_turns": incomplete[:5],
                 "source": "Claude Code session transcript (CLI-recorded; not model-authored)"}
 
-    def session_delivered(self, session_id, needles, since_iso):
-        """When (transcript timestamp) one successful (not `is_error`) tool result in the session's main thread first
-        contained every string in `needles`, at or after `since_iso`; None if never. CLI-recorded evidence that one
-        complete command output reached the session. Raises OSError if a transcript cannot be read."""
+    def session_delivered_parts(self, session_id, needle_sets, since_iso):
+        """For each set of strings in `needle_sets`: when (transcript timestamp) one successful (not `is_error`) tool
+        result in the session's main thread first contained every string of that set, at or after `since_iso`, else
+        None. CLI-recorded evidence that each complete command output reached the session; one scan of the transcript.
+        Raises OSError if a transcript cannot be read."""
+        found = [None] * len(needle_sets)
         since = parse_iso(since_iso)
         for path in self._transcripts(session_id):
-            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-                try:
-                    obj = json.loads(line)
-                except ValueError:
-                    continue
+            for obj in jsonl_records(path.read_bytes())[1]:
                 if not isinstance(obj, dict) or obj.get("type") != "user" or obj.get("isSidechain"):
                     continue
                 stamp = parse_iso(obj.get("timestamp"))
@@ -1133,9 +1190,12 @@ class ClaudeDeveloper:
                     body = item.get("content")
                     if isinstance(body, list):
                         body = "\n".join(str(b.get("text", "")) for b in body if isinstance(b, dict))
-                    if isinstance(body, str) and all(n in body for n in needles):
-                        return obj.get("timestamp")
-        return None
+                    if not isinstance(body, str):
+                        continue
+                    for i, needles in enumerate(needle_sets):
+                        if found[i] is None and all(n in body for n in needles):
+                            found[i] = obj.get("timestamp")
+        return found
 
     def tool_transcript(self, session_id, since_iso, limit_chars=150000):
         """CLI-recorded shell commands and their outputs from the developer session since ``since_iso``.
@@ -1834,41 +1894,76 @@ class Controller:
         The digest identifies the captured bytes; output transport may adjust line endings."""
         rec, text = self.require_guidance(self.current_binding("amendments"), "amendments")
         mission = self.state["mission"]
-        return {"mission": mission.get("path"), "mission_sha256": mission.get("sha256"),
-                "mission_snapshot": mission.get("snapshot"),
-                "amendments": None if not rec else {
-                    "revision": rec["revision"], "sha256": rec["sha256"], "captured_at": rec.get("captured_at"),
-                    "precedence": "The original mission plus these owner amendments in order. Later amendments "
-                                  "supersede conflicting earlier requirements; requirements they do not change still "
-                                  "apply. Amendments never change models, permissions, required gates or budgets.",
-                    "report_citation": self.amendment_citation(rec),
-                    "text": text,
-                    # last, after the full text: an output cut short never carries it (see foreground_delivery)
-                    "delivery_marker": self.delivery_marker(rec)}}
+        out = {"mission": mission.get("path"), "mission_sha256": mission.get("sha256"),
+               "mission_snapshot": mission.get("snapshot"), "amendments": None}
+        if not rec:
+            return out
+        parts = amendment_parts(text)
+        out["amendments"] = {
+            "revision": rec["revision"], "sha256": rec["sha256"], "captured_at": rec.get("captured_at"),
+            "precedence": "The original mission plus these owner amendments in order. Later amendments supersede "
+                          "conflicting earlier requirements; requirements they do not change still apply. Amendments "
+                          "never change models, permissions, required gates or budgets.",
+            "report_citation": self.amendment_citation(rec)}
+        if len(parts) == 1:
+            out["amendments"].update({
+                "text": text,
+                # last, after the full text: an output cut short never carries it (see foreground_delivery)
+                "delivery_marker": self.delivery_marker(rec)})
+        else:  # too long for one tool result: delivered as numbered parts, each with its own marker
+            out["amendments"].update({
+                "text": None, "parts": len(parts),
+                "read_parts": [f"status --enrollment {self.state['enrollment_id']} --instructions --part {k}"
+                               for k in range(1, len(parts) + 1)]})
+        return out
+
+    def effective_task_part(self, k):
+        """Part k (1-based) of the selected amendments' text, for bounded display: the slice, then a marker naming the
+        enrollment, revision, digest and part number. Every part's display together proves delivery."""
+        rec, text = self.require_guidance(self.current_binding("amendments"), "amendments")
+        if not rec:
+            raise UsageError("no owner amendments are selected")
+        parts = amendment_parts(text)
+        if not 1 <= k <= len(parts):
+            raise UsageError(f"--part must be between 1 and {len(parts)}")
+        return {"revision": rec["revision"], "sha256": rec["sha256"], "part": k, "parts": len(parts),
+                "report_citation": self.amendment_citation(rec), "text_part": parts[k - 1],
+                "part_marker": self.delivery_marker(rec, k, len(parts))}
 
     def amendment_citation(self, rec):
         """The exact `evidence_refs` entry a foreground report prepared under these amendments must carry."""
         return f"prepared under owner amendments revision {rec['revision']} sha256 {rec['sha256']}"
 
-    def delivery_marker(self, rec):
-        return (f"agent-review effective task delivered: enrollment {self.state['enrollment_id']}, owner amendments "
-                f"revision {rec['revision']}, sha256 {rec['sha256']}")
+    def delivery_marker(self, rec, part=None, parts=None):
+        what = f"part {part}/{parts} " if part else ""
+        return (f"agent-review effective task {what}delivered: enrollment {self.state['enrollment_id']}, owner "
+                f"amendments revision {rec['revision']}, sha256 {rec['sha256']}")
 
     def foreground_delivery(self, rec):
         """(timestamp or None, problem or None): whether the selected amendments reached the enrolled foreground session
-        as content. Evidence is one successful tool result in its CLI-recorded transcript, at or after the capture,
-        containing both the complete captured text (JSON-encoded exactly as `effective_task` output prints it) and the
-        delivery marker naming this enrollment, revision and digest, which is printed after the text. A digest alone
-        (for example in `status` or a refusal), a failed command or a truncated display does not qualify."""
+        as content. Evidence is CLI-recorded in its transcript, at or after the capture: one successful tool result
+        holding the complete captured text (JSON-encoded exactly as `effective_task` prints it) followed by the delivery
+        marker naming this enrollment, revision and digest; or, for a document too long for one tool result, a
+        successful tool result for EVERY numbered part holding that part's text and its part marker (the latest of
+        those times is returned). A digest alone (for example in `status` or a refusal), a failed command, a truncated
+        display or a missing part does not qualify."""
         data = self.read_guidance_snapshot(rec["sha256"], "amendments")
         if data is None:
             return None, self.guidance_problem(rec, "amendments")
-        needles = (json.dumps(data.decode("utf-8")), json.dumps(self.delivery_marker(rec)))
+        parts = amendment_parts(data.decode("utf-8"))
+        if len(parts) == 1:
+            needle_sets = [(json.dumps(parts[0]), json.dumps(self.delivery_marker(rec)))]
+        else:
+            needle_sets = [(json.dumps(p), json.dumps(self.delivery_marker(rec, k, len(parts))))
+                           for k, p in enumerate(parts, 1)]
         try:
-            return self.developer.session_delivered(self.state["foreground_session"], needles,
-                                                    rec.get("captured_at")), None
-        except (OSError, ValueError) as exc:
+            found = self.developer.session_delivered_parts(self.state["foreground_session"], needle_sets,
+                                                           rec.get("captured_at"))
+        except (OSError, ValueError, UsageError) as exc:
             return None, f"the foreground session transcript could not be read ({type(exc).__name__}: {exc})"
+        if any(stamp is None for stamp in found):
+            return None, None
+        return max(found, key=lambda stamp: parse_iso(stamp) or dt.datetime.min.replace(tzinfo=dt.timezone.utc)), None
 
     def foreground_amendments_binding(self, report):
         """((revision, sha256), None) for a foreground report under the selected amendments, or ((None, None), error).
@@ -1901,7 +1996,10 @@ class Controller:
         round this command accepted (the latest of those not in `before`, the set taken under the lock when the command
         began), or None with a note when it accepted none, so an earlier verdict is never presented as current. The
         accepted verdict and continuation also go to the live log."""
-        new = sorted(self.accepted_rounds() - set(before or ()))
+        if before is None:  # no baseline was recorded under the lock: never evidence of a new acceptance
+            return {"review": None, "review_note": "no review round was accepted by this command (it stopped before "
+                                                   "its baseline was recorded)"}
+        new = sorted(self.accepted_rounds() - set(before))
         if not new:
             return {"review": None, "review_note": "no review round was accepted by this command"}
         outcome = self.review_outcome(new[-1])
@@ -2801,6 +2899,8 @@ class Controller:
         rnd = self.active()
         if rnd and rnd["status"] == "validated":
             return self.finish_round(rnd)  # publish a preserved result without rerunning a successful review
+        if self.state["mode"] == "foreground":  # anything past here can record a request or launch a reviewer
+            self.require_foreground_launcher()
         completed = self.state["rounds_completed"].get(cp["id"], 0)
         if completed >= self.limits["max_review_rounds_per_checkpoint"]:
             raise Stop("BLOCKED", f"review-round cap reached for {cp['id']} "
@@ -2880,6 +2980,26 @@ class Controller:
             raise Stop("BLOCKED", f"no valid review after {len(rnd['attempts'])} attempts: " +
                        "; ".join(envelope["reasons"] if envelope else []))
         return self.finish_round(rnd)  # review_attempt already promoted the round to validated atomically
+
+    def require_foreground_launcher(self):
+        """Foreground: a review request or reviewer attempt (a new round, a retry, or the replacement for a preserved
+        result that failed authentication, reached through finish_round) is started only by the enrolled session whose
+        recorded provenance matches the owner policy. Publishing an intact preserved result (the owner's recovery
+        route) returns before this check. Refused with nothing launched."""
+        caller = os.environ.get("CLAUDE_CODE_SESSION_ID")
+        if caller != self.state.get("foreground_session"):
+            raise UsageError(f"review refused: only the enrolled foreground session ({self.state.get('foreground_session')}) "
+                             f"may start a review request or reviewer attempt; this process reports session {caller}. "
+                             "No reviewer was launched. (An intact preserved result is published by any owner "
+                             "`resume`.)")
+        try:
+            problems = foreground_session_problems(self.developer.session_provenance(self.state["foreground_session"]),
+                                                   self.cfg["developer"])
+        except (OSError, ValueError, UsageError) as exc:
+            problems = [f"the session transcript could not be read ({type(exc).__name__}: {exc})"]
+        if problems:
+            raise UsageError("review refused: the foreground session's recorded provenance does not match the owner "
+                             "policy (" + "; ".join(problems) + "). No reviewer was launched")
 
     def review_attempt(self, rnd, rnd_dir):
         # before anything is recorded or launched: the round's owner guidance and amendments must be current and intact
@@ -3664,10 +3784,13 @@ class Controller:
         live.line(f"gate {gate_id} started on {short(head)} (live output follows; the receipt is the record): "
                   + " ".join(argv))
         # each output line is shown as it arrives; the receipt is built exactly as before from stdout then stderr
-        code, out, err = stream_process(argv, self.state["repo_root"], timeout_s,
-                                        lambda row: live.line(f"gate {gate_id} | {row}"),
-                                        may_terminate=lambda: not self.runtime_active())
-        output = out + err if code is not None else f"timed out after {timeout_s}s"
+        code, out, err, problem = stream_process(argv, self.state["repo_root"], timeout_s,
+                                                 lambda row: live.line(f"gate {gate_id} | {row}"),
+                                                 may_terminate=lambda: not self.runtime_active())
+        if problem == "timeout":
+            output = f"timed out after {timeout_s}s"
+        else:
+            output = out + err + (f"\n[agent-review: output {problem}; this receipt cannot pass]\n" if problem else "")
         clean_after = self.git.head() == head and self.git.clean()
         live.line(f"gate {gate_id} finished on {short(head)}: exit {code}, worktree unchanged {clean_after}, "
                   f"{round(time.monotonic() - t0, 1)} s")
@@ -3677,7 +3800,7 @@ class Controller:
         write_text(base.with_suffix(".log"), text)
         receipt = {"schema": "agent-review.gate-receipt.v1", "gate": gate_id, "argv": argv, "candidate": head,
                    "started": started, "recorded_at": stamp, "duration_s": round(time.monotonic() - t0, 1), "exit_code": code,
-                   "worktree_unchanged": clean_after, "passed": code == 0 and clean_after,
+                   "worktree_unchanged": clean_after, "passed": code == 0 and clean_after and not problem,
                    "log": base.with_suffix(".log").name, "log_sha256": sha256_file(base.with_suffix(".log")),
                    "output_tail": text[-3000:], "recorded_by": "agent-review controller (not model-authored)"}
         atomic_write_json(base.with_suffix(".json"), receipt)  # the run marker stays: this newer receipt answers it
@@ -4097,6 +4220,17 @@ class Controller:
                 self._resume_updates(reason, None, f"; owner amendment {rec['revision']} applied (amendments sha256 "
                                      f"{short(rec['sha256'])}" + (f"; invalidated {', '.join(invalidated)}"
                                                                     if invalidated else "") + ")")
+                if self.state["mode"] == "foreground" and self.budget_exhausted():
+                    # decided in the same save that reopens development: no window in which the enrollment is
+                    # ACTIVE in develop with its round budget spent (helpers and report admission stay closed)
+                    blocked = (f"review-round budget for {self.checkpoint['id']} is exhausted "
+                               f"({self.state['rounds_completed'].get(self.checkpoint['id'], 0)}/"
+                               f"{self.limits['max_review_rounds_per_checkpoint']}); the owner amendment is applied but "
+                               "no further development is authorized without an explicit owner extension "
+                               "(`resume --max-rounds N`)")
+                    self.state.update(status="BLOCKED", status_reason=blocked)
+                    self.transition(self.state["phase"], f"BLOCKED: {blocked}", save=False)
+                    self.queue_status("BLOCKED", blocked)  # durable; sent with the amendment's corrections
             self.stop_path.unlink(missing_ok=True)  # consumed only once the application is committed
         finally:
             self.release_guidance_admission()
@@ -4108,6 +4242,8 @@ class Controller:
         # foreground has no loop: queued public work (for example an amendment's handoff-superseded corrections) is
         # sent now, so the PR never keeps showing a superseded handoff as current until the session's next command
         self.settle_publications()
+        if self.state["status"] == "BLOCKED":  # persisted together with the change that caused it (amendment at cap)
+            raise Stop("BLOCKED", self.state["status_reason"], persisted=True)
         if self.state["phase"] in ("develop", "review") and self.budget_exhausted():
             # the same rule headless applies before dispatching development: an amendment applied after the last
             # allowed round stays recorded (and its corrections published) but authorizes no further work
@@ -4809,8 +4945,9 @@ class Controller:
         """The enrolled interactive session's CLI-recorded provenance against the owner policy (read-only)."""
         try:
             prov = self.developer.session_provenance(self.state["foreground_session"])
-        except (OSError, ValueError) as exc:
-            return {"session_id": self.state["foreground_session"], "problems": [f"transcript unreadable: {exc}"]}
+        except (OSError, ValueError, UsageError) as exc:  # status always returns; admission stays closed elsewhere
+            return {"session_id": self.state["foreground_session"],
+                    "problems": [f"transcript unreadable: {type(exc).__name__}: {exc}"]}
         return {"session_id": self.state["foreground_session"], "models": prov.get("models"),
                 "efforts": prov.get("efforts"), "permission_modes": prov.get("permission_modes"),
                 "problems": foreground_session_problems(prov, self.cfg["developer"]),
@@ -5643,7 +5780,8 @@ def init_project(args, root=HERE, github_factory=GitHub):
 
 def render_claude_event(event) -> list:
     """Observable developer activity from one headless `claude -p --output-format stream-json` event: tool calls,
-    the first part of their results, Claude's visible messages and the invocation's return. Thinking is not shown."""
+    the first part of their results, Claude's visible messages and the invocation's return. Thinking is not shown.
+    Each field is sanitized whole before it is flattened or shortened."""
     if not isinstance(event, dict):
         return []
     kind, rows = event.get("type"), []
@@ -5654,130 +5792,151 @@ def render_claude_event(event) -> list:
             if not isinstance(item, dict):
                 continue
             if item.get("type") == "text" and str(item.get("text", "")).strip():
-                rows.append("Claude: " + one_line(item["text"], 600))
+                rows.append("Claude: " + clean_text(item["text"], 600))
             elif item.get("type") == "tool_use":
                 args = item.get("input") if isinstance(item.get("input"), dict) else {}
                 what = args.get("command") or args.get("file_path") or args.get("pattern") or args.get("description")
-                rows.append(f"Claude ▸ {item.get('name')}: " + one_line(what if what is not None else args, 300))
+                rows.append(f"Claude ▸ {clean_text(item.get('name'), 40)}: " + clean_text(what if what is not None
+                                                                                        else args, 300))
     elif kind == "user":
         for item in content:
             if isinstance(item, dict) and item.get("type") == "tool_result":
                 body = item.get("content")
                 if isinstance(body, list):
-                    body = " ".join(str(b.get("text", "")) for b in body if isinstance(b, dict))
-                rows.append(f"   ↳ {'ERROR ' if item.get('is_error') else ''}" + one_line(body, 200))
+                    body = "\n".join(str(b.get("text", "")) for b in body if isinstance(b, dict))
+                rows.append(f"   ↳ {'ERROR ' if item.get('is_error') else ''}" + clean_text(body, 200))
     elif kind == "result":
-        rows.append(f"developer invocation returned: {event.get('subtype')}")
+        rows.append(f"developer invocation returned: {clean_text(event.get('subtype'), 40)}")
     return rows
 
 
-def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes=10.0, now=None):
+def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes=10.0, now=None, expected_id=None):
     """Follow one enrollment read-only: its state.json (no lock), the latest developer stream (headless), the latest
     review round's reviewer event files and the gate markers/receipts. Emits readable rows: agent actions as they
-    appear, a status line (role, candidate, round, elapsed time, latest observable action, blocker) when something
-    changes and about once a minute, and a stall notice when no new agent event arrived for `stall_minutes` (a running
-    process is not proof of progress). Works for enrollments of older pinned versions too; nothing is written."""
-    folder, offsets, seen = Path(folder), {}, {"event": None, "action": None, "stall": False, "line": None, "beat": 0.0}
+    appear (rows replayed for context when a file is first seen are marked `(earlier)`), a status line (role,
+    candidate, the current checkpoint's rounds, elapsed time, the current role's latest observable action with its
+    age, blocker) when something changes and about once a minute, and a stall notice when that action is older than
+    `stall_minutes` while the enrollment is ACTIVE (a running process is not proof of progress). The state must name
+    `expected_id`; otherwise nothing of it is shown. Works for older pinned enrollments too; nothing is written."""
+    folder = Path(folder)
+    offsets, actions = {}, {}  # actions: source -> (sanitized row, observed time of its file)
+    seen = {"stall": None, "key": None, "beat": 0.0}
     now = now or (lambda: dt.datetime.now(dt.timezone.utc))
 
     def ago(stamp):
         if not stamp:
             return "?"
-        secs = int((now() - stamp).total_seconds())
+        secs = max(0, int((now() - stamp).total_seconds()))
         return f"{secs // 3600}h{secs % 3600 // 60:02d}m" if secs >= 3600 else f"{secs // 60}m{secs % 60:02d}s"
 
-    def follow(path, render, backfill):
+    def follow(path, render, source, backfill=15):
         try:
-            size, mtime = path.stat().st_size, dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc)
+            info = path.stat()
         except OSError:
             return
+        size, mtime = info.st_size, dt.datetime.fromtimestamp(info.st_mtime, dt.timezone.utc)
         start = offsets.get(path)
         with open(path, "rb") as f:
-            if start is None:  # first sight: show only the last few events for context
+            if start is None:  # first sight: replay only the last few events, marked as earlier activity
                 data = f.read()
-                rows = data.split(b"\n")
-                offsets[path] = size - len(rows[-1])
-                lines = rows[:-1][-backfill:] if backfill else []
+                cut = data.rfind(b"\n") + 1
+                offsets[path] = cut
+                lines, prefix = data[:cut].split(b"\n")[:-1][-backfill:], "(earlier) "
             elif size > start:
                 f.seek(start)
                 data = f.read()
-                cut = data.rfind(b"\n")
-                if cut < 0:
-                    return
-                offsets[path] = start + cut + 1
-                lines = data[:cut].split(b"\n")
+                cut = data.rfind(b"\n") + 1
+                offsets[path] = start + cut
+                lines, prefix = data[:cut].split(b"\n")[:-1], ""
             else:
-                lines = []
+                lines, prefix = [], ""
+        last = None
         for raw in lines:
             try:
                 rendered = render(json.loads(raw.decode("utf-8", "replace")))
             except ValueError:
                 continue
             for row in rendered:
-                emit(sanitize(row, strict=False)[0])
-                seen["action"] = one_line(row, 160)
-        if seen["event"] is None or mtime > seen["event"]:
-            seen["event"] = mtime  # the file's last write: the latest observable agent event
-            seen["stall"] = False
+                emit(prefix + row)  # rows are sanitized by the renderer before anything is shortened or cached
+                last = row
+        if last is not None and (source not in actions or mtime >= actions[source][1]):
+            actions[source] = (last, mtime)
 
     while True:
         try:
             state = read_json(folder / "state.json")
         except (OSError, ValueError) as exc:
-            emit(f"state unreadable: {type(exc).__name__}: {exc}")
+            emit(f"state unreadable: {type(exc).__name__}")
             if once:
                 return
             time.sleep(interval)
             continue
+        if expected_id is not None and (not isinstance(state, dict) or state.get("enrollment_id") != expected_id):
+            emit(f"identity mismatch: the state at {folder} does not belong to enrollment {expected_id}; nothing from "
+                 "it is shown")
+            return
         dev, rounds = state.get("developer") or {}, state.get("rounds") or []
         launch, last = dev.get("launch") or {}, (rounds[-1] if rounds else {})
         n = dev.get("invocations") or 0
         if n:
-            follow(folder / "developer" / f"stream-{n:03d}.jsonl", render_claude_event, 15)
+            follow(folder / "developer" / f"stream-{n:03d}.jsonl", render_claude_event, "developer")
         for attempt in last.get("attempts") or []:
             follow(folder / "rounds" / f"r{int(last['round']):02d}" / f"events-{attempt.get('n')}.jsonl",
-                   render_codex_event, 15)
+                   render_codex_event, "reviewer")
         open_attempt = [a for a in last.get("attempts") or [] if not a.get("ended")]
-        role, since = "no agent running (controller or the foreground session)", None
+        role, since, source = "no agent running (controller or the foreground session)", None, None
         if open_attempt:
-            role, since = f"reviewer Codex, round {last.get('round')}", parse_iso(open_attempt[-1].get("started"))
+            role, since, source = (f"reviewer Codex, round {last.get('round')}", parse_iso(open_attempt[-1].get("started")),
+                                   "reviewer")
         elif launch and not launch.get("returned"):
-            role, since = f"developer Claude, invocation {launch.get('n')}", parse_iso(launch.get("at"))
+            role, since, source = f"developer Claude, invocation {launch.get('n')}", parse_iso(launch.get("at")), "developer"
+        current = actions.get(source) if source else max(actions.values(), key=lambda a: a[1], default=None)
         gate = None
+        evidence = folder / "evidence"
         receipts = set()
-        for path in sorted((folder / "evidence").glob("gate-*.json")) if (folder / "evidence").exists() else []:
+        for path in sorted(evidence.glob("gate-*.json")) if evidence.exists() else []:
             with contextlib.suppress(OSError, ValueError):
                 r = read_json(path)
                 receipts.add((r.get("gate"), r.get("candidate"), r.get("started")))
-        for path in sorted((folder / "evidence").glob("gate-*.pending")) if (folder / "evidence").exists() else []:
+        for path in sorted(evidence.glob("gate-*.pending")) if evidence.exists() else []:
             with contextlib.suppress(OSError, ValueError):
                 g = read_json(path)
-                started = parse_iso(g.get("started"))
-                if (g.get("gate"), g.get("candidate"), g.get("started")) not in receipts and started and \
-                        (now() - started).total_seconds() < 3 * 3600:
-                    gate = g
+                if (g.get("gate"), g.get("candidate"), g.get("started")) not in receipts:
+                    running = pid_alive(g.get("pid"))
+                    if running or gate is None or not gate[1]:
+                        gate = (g, running)
         head = "?"
         with contextlib.suppress(Exception):
             head = Git(state["repo_root"]).head()[:12]
+        checkpoint = None
+        with contextlib.suppress(Exception):
+            checkpoint = state["plan"]["checkpoints"][int(state.get("checkpoint_index") or 0)]["id"]
         limit = (state.get("limits") or {}).get("max_review_rounds_per_checkpoint", "?")
-        done = sum((state.get("rounds_completed") or {}).values()) if isinstance(state.get("rounds_completed"), dict) \
-            else "?"
+        done = (state.get("rounds_completed") or {}).get(checkpoint, 0) if checkpoint else "?"
+        gate_text = ""
+        if gate:
+            g, running = gate
+            gate_text = (f" | gate {g.get('gate')} running on {str(g.get('candidate'))[:12]}" if running else
+                         f" | gate {g.get('gate')} marker on {str(g.get('candidate'))[:12]} has no receipt and its "
+                         "helper is not running (interrupted)")
+        blocker = (f" | blocker: {clean_text(state.get('status_reason'), 300)}"
+                   if state.get("status") in ("BLOCKED", "PAUSED") else "")
+        key = (state.get("status"), state.get("phase"), role, head, last.get("H"), last.get("decision"), done,
+               gate_text, blocker, current[0] if current else None)
         line = (f"{state.get('status')}/{state.get('phase')} | {role}" + (f" for {ago(since)}" if since else "")
                 + f" | candidate {head} (last reviewed {str(last.get('H') or '-')[:12]}: {last.get('decision') or '-'})"
-                + f" | rounds {done}/{limit} | developer invocations {dev.get('invocations')}"
-                + (f" | gate {gate.get('gate')} running on {str(gate.get('candidate'))[:12]} for "
-                   f"{ago(parse_iso(gate.get('started')))}" if gate else "")
-                + f" | latest action: {seen['action'] or 'none observed'} ({ago(seen['event'])} ago)"
-                + (f" | blocker: {one_line(state.get('status_reason'), 300)}"
-                   if state.get("status") in ("BLOCKED", "PAUSED") else ""))
-        key = line.split(" | latest action")[0]
-        if once or key != seen["line"] or time.monotonic() - seen["beat"] >= 60:
+                + f" | {checkpoint or 'checkpoint ?'} rounds {done}/{limit}"
+                + f" | developer invocations {dev.get('invocations')}" + gate_text
+                + f" | latest action: {current[0] if current else 'none observed'}"
+                + (f" ({ago(current[1])} ago)" if current else "") + blocker)
+        if once or key != seen["key"] or time.monotonic() - seen["beat"] >= 60:
             emit(line)
-            seen["line"], seen["beat"] = key, time.monotonic()
-        quiet = (now() - seen["event"]).total_seconds() if seen["event"] else None
-        if state.get("status") == "ACTIVE" and quiet is not None and quiet >= stall_minutes * 60 and not seen["stall"]:
-            emit(f"no new agent events for {ago(seen['event'])}; a running process is not proof of progress")
-            seen["stall"] = True
+            seen["key"], seen["beat"] = key, time.monotonic()
+        quiet = (now() - current[1]).total_seconds() if current else None
+        if state.get("status") == "ACTIVE" and quiet is not None and quiet >= stall_minutes * 60 and \
+                seen["stall"] != (current[1] if current else None):
+            emit(f"no new agent events for {ago(current[1])}; a running process is not proof of progress")
+            seen["stall"] = current[1]
         if once:
             return
         if state.get("status") in ("AWAITING_OWNER_REVIEW", "BLOCKED", "PAUSED", "CANCELLED") and \
@@ -5785,6 +5944,24 @@ def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes
             emit("the enrollment is not active; watch ends")
             return
         time.sleep(interval)
+
+
+def watch_log_problem(log, folder, state):
+    """Why an optional watch output file is not acceptable: it must not be, or resolve to, any file of the enrollment's
+    private records or its worktree (the observer never writes to what it observes). None when acceptable."""
+    target = Path(log).resolve()
+    protected = [Path(folder).resolve()]
+    with contextlib.suppress(Exception):
+        protected.append(Path(state["repo_root"]).resolve())
+    for root in protected:
+        if target == root or root in target.parents:
+            return f"{log} is inside {root}, which watch only reads"
+    if target.exists():
+        for path in Path(folder).rglob("*"):
+            with contextlib.suppress(OSError):
+                if path.is_file() and os.path.samefile(path, target):
+                    return f"{log} is the same file as the enrollment record {path}"
+    return None
 
 
 def find_enrollment(value):
@@ -5964,13 +6141,17 @@ COMMAND_STATUSES = {"run": {"ACTIVE"}, "review": {"ACTIVE"}, "finalize": {"ACTIV
                     "activate": {"ACTIVE", "PAUSED", "BLOCKED", "AWAITING_OWNER_REVIEW"}}
 
 
-def guarded(controller, command, fn, mutate=True, honor_stop=False, precheck=None, extra=None, extra_on_stop=None):
+def guarded(controller, command, fn, mutate=True, honor_stop=False, precheck=None, extra=None, extra_on_stop=None,
+            on_locked=None):
     """Run fn under the single-writer lock with reloaded state and the pre-mutation guard. Status eligibility and
     the host/worktree claims are re-checked after locking, so a stale process cannot act on old authority. A
     precheck refusal (UsageError), like those checks, leaves the state file untouched. extra(result), when given,
-    adds keys to the printed result (stdout); progress never goes to stdout."""
+    adds keys to the printed result (stdout); progress never goes to stdout. on_locked() runs right after the reload,
+    before any guard that can stop the command (for example to record the accepted rounds a stop output compares)."""
     with controller.lock(command):
         controller.reload()
+        if on_locked:
+            on_locked()
         allowed = COMMAND_STATUSES.get(command)
         if allowed and controller.state["status"] not in allowed:
             raise UsageError(f"enrollment is {controller.state['status']}; {command} is not permitted now")
@@ -5999,12 +6180,15 @@ def guarded(controller, command, fn, mutate=True, honor_stop=False, precheck=Non
                 public = (f"operational failure during {command}: {type(exc).__name__}"
                           + (f" (errno {exc.errno})" if exc.errno is not None else "")
                           + "; the local `status` reason names the affected path")
-            controller.state["status"], controller.state["status_reason"] = stop.status, stop.reason
-            controller.state.setdefault("transitions", []).append(
-                {"at": now_iso(), "from": controller.state.get("phase"), "to": controller.state.get("phase"),
-                 "why": f"{stop.status}: {stop.reason}"})
-            controller.save()
-            controller.publish_status(stop.status, public)
+            if getattr(stop, "persisted", False):  # saved, with its notice queued, by the transaction that caused it
+                controller.reload()
+            else:
+                controller.state["status"], controller.state["status_reason"] = stop.status, stop.reason
+                controller.state.setdefault("transitions", []).append(
+                    {"at": now_iso(), "from": controller.state.get("phase"), "to": controller.state.get("phase"),
+                     "why": f"{stop.status}: {stop.reason}"})
+                controller.save()
+                controller.publish_status(stop.status, public)
             more = {}
             if extra_on_stop:  # for example a review accepted (and charged) before the stop
                 try:
@@ -6039,7 +6223,6 @@ def resume_command(controller, reason, max_rounds=None, resend_undelivered=False
     before = {}
 
     def _resume():
-        before["accepted"] = controller.accepted_rounds()  # under the lock: a preserved review may be published now
         return controller.resume(reason, max_rounds, resend_undelivered, guidance=guidance, amendment=amendment)
 
     def _extra(_result):
@@ -6053,7 +6236,8 @@ def resume_command(controller, reason, max_rounds=None, resend_undelivered=False
     def _extra_on_stop(_result):  # a recovered review can be accepted before a stop; an amendment is not delivered
         return controller.newly_accepted_review(before.get("accepted")) if foreground else {}
     try:
-        return guarded(controller, "resume", _resume, precheck=precheck, extra=_extra, extra_on_stop=_extra_on_stop)
+        return guarded(controller, "resume", _resume, precheck=precheck, extra=_extra, extra_on_stop=_extra_on_stop,
+                       on_locked=lambda: before.update(accepted=controller.accepted_rounds()))  # before any guard
     finally:
         controller.release_guidance_admission()  # never left held, whatever happened before capture
 
@@ -6068,16 +6252,7 @@ def review_command(controller, report_path):
     before = {}
 
     def _review():
-        before["accepted"] = controller.accepted_rounds()  # under the lock, before anything can be accepted
-        if controller.state["phase"] == "review":
-            active = controller.active()
-            if not (active and active["status"] == "validated"):  # a new reviewer attempt: the enrolled session only
-                caller = os.environ.get("CLAUDE_CODE_SESSION_ID")
-                if caller != controller.state.get("foreground_session"):
-                    raise UsageError(f"review refused: only the enrolled foreground session "
-                                     f"({controller.state.get('foreground_session')}) may start a review attempt; this "
-                                     f"process reports session {caller}. (An already validated result is published by "
-                                     "any owner `resume`.)")
+        if controller.state["phase"] == "review":  # review_round enforces the foreground launcher before any launch
             result = controller.review_round()
         elif controller.state["phase"] == "develop":
             error = controller.admit_report(read_json(report_path), "developer submitted a checkpoint report")
@@ -6093,7 +6268,8 @@ def review_command(controller, report_path):
     def _outcome(_result):
         return {**controller.newly_accepted_review(before.get("accepted")), "live_log": str(controller.live_path)}
     # also on a stop: a round can be accepted and charged before the run stops (cap, no progress, reviewer blocker)
-    return guarded(controller, "review", _review, honor_stop=True, extra=_outcome, extra_on_stop=_outcome)
+    return guarded(controller, "review", _review, honor_stop=True, extra=_outcome, extra_on_stop=_outcome,
+                   on_locked=lambda: before.update(accepted=controller.accepted_rounds()))  # before any guard
 
 
 def main(argv=None, root=HERE):
@@ -6167,6 +6343,8 @@ def build_parser():
             p.add_argument("--remote", action="store_true", help="also check whether a handoff is still current")
             p.add_argument("--instructions", action="store_true",
                            help="print the effective task (mission and selected owner amendments in full)")
+            p.add_argument("--part", type=int, help="with --instructions: print numbered part K of an amendments "
+                                                    "document too long for one display")
         if name == "resume":
             p.add_argument("--max-rounds", type=int)
             p.add_argument("--reason", required=True,
@@ -6205,7 +6383,17 @@ def build_parser():
 def dispatch(args, root=HERE):
     try:
         if args.command == "watch":  # read-only: no lock, no state write, no network
-            log = open(args.log, "a", encoding="utf-8") if args.log else None
+            folder = find_enrollment(args.enrollment)  # resolved before any output file is opened
+            log = None
+            if args.log:
+                try:
+                    state = read_json(folder / "state.json")
+                except (OSError, ValueError) as exc:
+                    raise UsageError(f"watch refused: the enrollment state cannot be read ({type(exc).__name__})")
+                problem = watch_log_problem(args.log, folder, state)
+                if problem:
+                    raise UsageError(f"watch refused: {problem}; choose a separate log file")
+                log = open(args.log, "a", encoding="utf-8")
             with contextlib.suppress(AttributeError, ValueError):  # readable rows include non-ASCII arrows
                 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -6216,8 +6404,8 @@ def dispatch(args, root=HERE):
                     log.write(stamped + "\n")
                     log.flush()
             with contextlib.suppress(KeyboardInterrupt):
-                watch_enrollment(find_enrollment(args.enrollment), emit, once=args.once, interval=args.interval,
-                                 stall_minutes=args.stall_minutes)
+                watch_enrollment(folder, emit, once=args.once, interval=args.interval,
+                                 stall_minutes=args.stall_minutes, expected_id=args.enrollment)
             return EXIT_OK
         if args.command == "install":
             print(json.dumps({"installed": str(Path(args.dest).resolve()),
@@ -6298,6 +6486,10 @@ def dispatch(args, root=HERE):
         if args.command == "status":
             if getattr(args, "instructions", False):  # read-only; prints the amendments text with its digest
                 try:
+                    if getattr(args, "part", None) is not None:
+                        print(json.dumps({"enrollment": controller.state["enrollment_id"],
+                                          "effective_task_part": controller.effective_task_part(args.part)}, indent=2))
+                        return EXIT_OK
                     print(json.dumps({"enrollment": controller.state["enrollment_id"],
                                       "effective_task": controller.effective_task()}, indent=2))
                 except Stop as stop:
