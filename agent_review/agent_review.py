@@ -370,7 +370,7 @@ def load_workflow(root: Path):
     manifest = root / "MANIFEST.json"
     if manifest.exists():
         recorded = read_json(manifest)
-        if recorded.get("files") != hashes or recorded.get("fingerprint") != digest:
+        if not isinstance(recorded, dict) or recorded.get("files") != hashes or recorded.get("fingerprint") != digest:
             raise Stop("PAUSED", f"installed workflow at {root} differs from its MANIFEST; reinstall or review the change")
     return digest, hashes, {rel: b.decode("utf-8") for rel, b in data.items()}
 
@@ -1298,19 +1298,26 @@ class Controller:
         g = self.state["guidance"]
         current = g.get("current") if isinstance(g, dict) else None
         rec = self.guidance_revision_record(current)
-        if rec is None:
-            raise Stop("BLOCKED", f"the owner guidance selection is invalid (state member `guidance` is "
-                                  f"{json.dumps(g)[:160]}); guidance is never silently omitted, so nothing is launched "
-                                  "until the enrollment state is repaired under supervision")
+        if rec is None:  # public-safe reason (it may be published): no state content or private path
+            raise Stop("BLOCKED", "the owner guidance selection in the enrollment state is invalid (null, malformed, or "
+                                  "naming no well-formed recorded revision); guidance is never silently omitted, so "
+                                  "nothing is launched until the state is repaired under supervision (see local "
+                                  "`status`)")
         return rec
 
+    @staticmethod
+    def _revision_number(value):
+        """A positive JSON integer (never a boolean or a float), else None."""
+        return value if type(value) is int and value > 0 else None
+
     def guidance_revision_record(self, revision):
-        """A recorded revision with the expected shape, or None (absent, malformed or ambiguous)."""
+        """A recorded revision with the expected shape, or None (absent, malformed or ambiguous). Both the selection
+        and the recorded revision must be positive JSON integers: Python equality (True == 1 == 1.0) is not enough."""
         g = self.state.get("guidance")
         revisions = g.get("revisions") if isinstance(g, dict) else None
-        if not isinstance(revisions, list) or isinstance(revision, bool) or not isinstance(revision, int):
+        if not isinstance(revisions, list) or self._revision_number(revision) is None:
             return None
-        matches = [r for r in revisions if isinstance(r, dict) and r.get("revision") == revision]
+        matches = [r for r in revisions if isinstance(r, dict) and self._revision_number(r.get("revision")) == revision]
         if len(matches) != 1:
             return None
         rec = matches[0]
@@ -1357,11 +1364,11 @@ class Controller:
         rec = rec or self.guidance_record()
         if not rec:
             return None
-        if self.read_guidance_snapshot(rec["sha256"]) is None:
-            return (f"the captured owner guidance (revision {rec['revision']}, sha256 {rec['sha256']}) at "
-                    f"{self.guidance_path(rec['sha256'])} is missing or altered; it is never silently omitted or "
-                    "repaired automatically. Supervised recovery: restore the identical captured bytes to that path "
-                    "(their sha256 must match) and run an ordinary `resume`")
+        if self.read_guidance_snapshot(rec["sha256"]) is None:  # public-safe: the private path is in local status
+            return (f"the captured owner guidance (revision {rec['revision']}, sha256 {rec['sha256']}) is missing or "
+                    "altered; it is never silently omitted or repaired automatically. Supervised recovery: restore the "
+                    "identical captured bytes to the snapshot path shown by local `status` (guidance.selected.snapshot; "
+                    "their sha256 must match) and run an ordinary `resume`")
         return None
 
     def require_guidance(self, expected=(None, None)):
@@ -1407,6 +1414,9 @@ class Controller:
         sanitized and split like every publication). Frozen when the request is queued; never re-read on retries."""
         if not text:
             return []
+        # line endings normalized like every published body (the outbox digest is computed over LF text); the captured
+        # bytes, their digest and the reviewer's byte-exact copy are unaffected
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
         fence = "`" * max(3, max((len(m) for m in re.findall(r"`+", text)), default=0) + 1)
         return ["", f"**Owner guidance — revision {rnd['guidance_revision']}, captured-source sha256 "
                     f"`{rnd['guidance_sha256']}`.** Supplied by the owner with `resume --guidance`. The reported work "
@@ -1454,6 +1464,12 @@ class Controller:
                 self.verify_inputs(rebind=False)
             except (Stop, UsageError, CommandError, subprocess.TimeoutExpired, OSError, ValueError) as exc:
                 raise UsageError(f"--guidance refused before any change: {getattr(exc, 'reason', exc)}")
+            # last, after the remote identity checks and immediately before capture: runtime lock files can be shared
+            # with other projects' enrollments, which the writer and helper locks do not exclude
+            if self.runtime_active():
+                raise UsageError("--guidance refused: a runtime transaction lock exists ("
+                                 + ", ".join(self.cfg.get("runtime_lock_paths", [])) + "); let it restore first. "
+                                 "Nothing was captured or changed")
         except BaseException:
             lock.__exit__()
             raise
@@ -1505,9 +1521,6 @@ class Controller:
                              + ", ".join(unsettled + [o.get("op", "?") for o in s.get("public_ops") or []]
                                          + (["archive commit"] if s.get("archive_pending") else []))
                              + "). Nothing was captured or changed")
-        if self.runtime_active():
-            raise UsageError("--guidance refused: a runtime transaction lock exists ("
-                             + ", ".join(self.cfg.get("runtime_lock_paths", [])) + "); let it restore first")
         limit = int(self.limits["max_review_rounds_per_checkpoint"])
         if self.budget_exhausted(limit):
             raise UsageError(f"--guidance refused: the review-round budget for {self.checkpoint['id']} is exhausted "
@@ -1520,8 +1533,20 @@ class Controller:
         problem = self.guidance_problem(current) if current else None
         if problem:  # never replaced or repaired by a new document; recovery is supervised
             raise UsageError(f"--guidance refused: {problem}. Nothing was captured or changed")
+        folder = self.dir / "guidance"
+        if folder.exists() and not folder.is_dir():
+            raise UsageError(f"--guidance refused: {folder} exists but is not a folder, so nothing can be captured "
+                             "there; move it aside under supervision. Nothing was captured or changed")
         path = self.guidance_path(guidance["sha256"])
-        if path.exists() and self.read_guidance_snapshot(guidance["sha256"]) is None:
+        recorded = [r["revision"] for r in s["guidance"]["revisions"]
+                    if isinstance(r, dict) and r.get("sha256") == guidance["sha256"]] if current else []
+        intact = self.read_guidance_snapshot(guidance["sha256"]) is not None
+        if recorded and not intact:  # a previously selected snapshot is never recreated from a new submission
+            raise UsageError(f"--guidance refused: this document's content was captured before (revision(s) "
+                             f"{recorded}), but its content file {path} is missing or altered; it is never recreated or "
+                             "repaired automatically. Restore the identical captured bytes under supervision, then "
+                             "retry. Nothing was captured or changed")
+        if path.exists() and not intact:
             raise UsageError(f"--guidance refused: the existing content file {path} for this document's digest does not "
                              "match it and is never overwritten; restore its captured bytes or remove it if no revision "
                              "references it. Nothing was captured or changed")
@@ -1532,8 +1557,9 @@ class Controller:
         path = self.guidance_path(guidance["sha256"])
         if not path.exists():
             atomic_write_bytes(path, guidance["data"])
-        if self.read_guidance_snapshot(guidance["sha256"]) is None:
-            raise Stop("BLOCKED", f"could not capture the owner guidance at {path}: the file does not match its digest")
+        if self.read_guidance_snapshot(guidance["sha256"]) is None:  # public-safe reason; the path is in local status
+            raise Stop("BLOCKED", f"could not capture the owner guidance (sha256 {guidance['sha256']}): its content file "
+                                  "does not match its digest")
 
     def select_guidance(self, guidance, reason):
         """Select a staged document (state only, inside the caller's transaction). Content identical to the current
@@ -1544,7 +1570,7 @@ class Controller:
             return current, False
         g = self.state.setdefault("guidance", {"current": None, "revisions": []})
         n = max([r["revision"] for r in g["revisions"]
-                 if isinstance(r, dict) and isinstance(r.get("revision"), int)] or [0]) + 1
+                 if isinstance(r, dict) and self._revision_number(r.get("revision"))] or [0]) + 1
         rec = {"revision": n, "sha256": guidance["sha256"], "bytes": len(guidance["data"]),
                "source": guidance["source"], "captured_at": now_iso(), "reason": reason,
                "supersedes": current["revision"] if current else None, "first_returned_invocation": None}
@@ -2004,6 +2030,18 @@ class Controller:
         rnd["attempts"].append(attempt)
         self.save()
         snapshot = rnd_dir / f"snapshot-{n}"
+
+        def not_launched(exc, stage):
+            """Close the attempt durably as never launched. The full diagnostic (which may name private paths) stays
+            in the private attempt record; the stop reason, which is published, names only the failure type."""
+            detail = getattr(exc, "reason", None) or f"{type(exc).__name__}: {exc}"
+            attempt.update(ended=now_iso(), ok=False, fatal=False, launched=False,
+                           reasons=[f"not launched: {stage} failed ({detail})"])
+            self.save()
+            if isinstance(exc, Stop):
+                raise exc
+            raise Stop("BLOCKED", f"{stage} for round {rnd['round']} failed ({type(exc).__name__}); no reviewer was "
+                                  "launched; the attempt record in local `status`/state has the details") from exc
         try:
             try:  # input preparation: a known failure here closes the attempt as never launched
                 if snapshot.exists():
@@ -2016,21 +2054,19 @@ class Controller:
                 prompt = self.render("reviewer.md", self.reviewer_fields(rnd, inputs, snapshot))
                 write_text(rnd_dir / f"prompt-{n}.md", prompt)
             except (Stop, CommandError, subprocess.TimeoutExpired, OSError) as exc:
-                reason = getattr(exc, "reason", None) or f"{type(exc).__name__}: {exc}"
-                attempt.update(ended=now_iso(), ok=False, fatal=False, launched=False,
-                               reasons=[f"not launched: reviewer inputs could not be prepared ({reason})"])
-                self.save()
-                if isinstance(exc, Stop):
-                    raise
-                raise Stop("BLOCKED", f"reviewer inputs for round {rnd['round']} could not be prepared ({reason}); "
-                                      "no reviewer was launched") from exc
+                not_launched(exc, "reviewer input preparation")
 
             def on_start(pid):
-                attempt["pid"] = pid
+                attempt["pid"] = pid  # the process-start record: from here on the attempt counts as launched
                 self.save()
-            info = self.reviewer.run(prompt, snapshot, schema, result_path, rnd_dir / f"events-{n}.jsonl",
-                                     rnd_dir / f"stderr-{n}.txt", self.cfg["reviewer"]["timeout_minutes"] * 60,
-                                     on_start=on_start)
+            try:
+                info = self.reviewer.run(prompt, snapshot, schema, result_path, rnd_dir / f"events-{n}.jsonl",
+                                         rnd_dir / f"stderr-{n}.txt", self.cfg["reviewer"]["timeout_minutes"] * 60,
+                                         on_start=on_start)
+            except OSError as exc:  # stream setup or process creation failed before any process started
+                if "pid" in attempt:
+                    raise
+                not_launched(exc, "reviewer launch setup")
         finally:
             self.remove_snapshot(snapshot)
         prov = self.reviewer.provenance(info.get("thread_id"), since=attempt_started_epoch - 60)
@@ -3738,23 +3774,32 @@ class Controller:
                             "integrity": "problem" if problem else "intact", **({"problem": problem} if problem else {})}
             current = (rec["revision"], rec["sha256"]) if rec else (None, None)
         except Stop as stop:  # a null, malformed or dangling selection is a problem, never "none"
-            selected, current = {"integrity": "problem", "problem": stop.reason}, None
+            selected, current = {"integrity": "problem", "problem": stop.reason,
+                                 "recorded": s.get("guidance")}, None  # local only: for supervised repair
 
         def bound(obj):
             rev, sha = self.binding_of(obj)
             return {"guidance_revision": rev, "guidance_sha256": sha or "none",
                     "matches_selected": None if current is None else (rev, sha) == current}
 
-        launch = s["developer"].get("launch")
-        developer = {"invocation": launch.get("n"), "launch_recorded_at": launch.get("at"),
-                     "returned": bool(launch.get("returned")), **bound(launch)} if launch else None
+        # observations, never inferred: intent is saved before dispatch; a process start is recorded by the start
+        # callback (developer active_pid, reviewer attempt pid); a return/end is recorded afterwards. None = unknown.
+        dev, launch = s["developer"], s["developer"].get("launch")
+        developer = None
+        if launch:
+            returned = bool(launch.get("returned"))
+            developer = {"invocation": launch.get("n"), "intent_recorded_at": launch.get("at"),
+                         "process_start_recorded": True if returned or dev.get("active_pid") else None,
+                         "returned": returned, **bound(launch)}
         rnd = s["rounds"][-1] if s.get("rounds") else None
         review = None
         if rnd:
             attempt = (rnd.get("attempts") or rnd.get("earlier_attempts") or [None])[-1]
-            review = {"round": rnd["round"], "status": rnd.get("status"), **bound(rnd),
-                      "latest_attempt": {k: attempt.get(k) for k in ("n", "started", "ended", "ok", "launched")}
-                      if attempt else None}
+            if attempt:
+                started = False if attempt.get("launched") is False else (True if "pid" in attempt else None)
+                attempt = {"n": attempt.get("n"), "opened_at": attempt.get("started"), "process_start_recorded": started,
+                           "ended_at": attempt.get("ended"), "ok": attempt.get("ok")}
+            review = {"round": rnd["round"], "status": rnd.get("status"), **bound(rnd), "latest_attempt": attempt}
         return {"selected": selected, "latest_developer_invocation": developer, "latest_review_round": review}
 
     def status(self, remote=False):
@@ -4544,13 +4589,24 @@ def find_enrollment(value):
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", value or ""):
         raise UsageError("pass an enrollment ID (as printed by enroll), not a path")
     folder = host_dir() / "registry"  # the same host-wide registry that enrollment writes
+    malformed = []
     for entry in folder.glob("*.json") if folder.exists() else []:
-        data = read_json(entry)
+        try:
+            data = read_json(entry)
+        except (OSError, ValueError):
+            malformed.append(entry.name)
+            continue
+        if not isinstance(data, dict):
+            malformed.append(entry.name)
+            continue
         if data.get("enrollment_id") == value:
+            if not isinstance(data.get("dir"), str) or not data["dir"]:
+                raise UsageError(f"enrollment {value}'s registry claim {entry} records no state folder; inspect it")
             if not Path(data["dir"]).is_absolute():
                 raise UsageError(f"enrollment {value} records a relative state folder; inspect {entry}")
             return Path(data["dir"])
-    raise UsageError(f"enrollment {value} is not registered under {folder}")
+    raise UsageError(f"enrollment {value} is not registered under {folder}"
+                     + (f" (unreadable or malformed claims: {', '.join(malformed)})" if malformed else ""))
 
 
 LIST_ROW = {"enrollment": None, "repository": None, "branch": None,
@@ -4753,6 +4809,12 @@ def resume_command(controller, reason, max_rounds=None, resend_undelivered=False
         guidance = read_guidance(guidance_file)
     precheck = (lambda: controller.admit_guidance(guidance, max_rounds, resend_undelivered, enrollment_id)) \
         if guidance is not None else None
+    if guidance is not None:
+        try:  # the writer lock is anchored in the worktree's git dir: an unavailable worktree is a setup refusal
+            controller.git("rev-parse", "--absolute-git-dir")
+        except (CommandError, subprocess.TimeoutExpired, OSError) as exc:
+            raise UsageError(f"--guidance refused before any change: the enrolled worktree "
+                             f"{controller.state['repo_root']} cannot be used ({exc}). Nothing was captured or changed")
     try:
         return guarded(controller, "resume",
                        lambda: controller.resume(reason, max_rounds, resend_undelivered, guidance=guidance),
