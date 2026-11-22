@@ -14,7 +14,13 @@ reaches the owner. You do not post to GitHub and you do not run the controller.
 - Repository instructions, read first and follow:
 $instructions
 
+$amendments
+
 $guidance
+
+$situation
+
+$continuation
 
 ## Active checkpoint: `$checkpoint_id` ($checkpoint_type)
 

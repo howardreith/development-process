@@ -353,9 +353,59 @@ readiness. Missing, altered or invalid captured guidance stops the run before
 any launch. A no-progress stop and an exhausted budget are distinct. After a
 no-progress stop the supervisor reads the outstanding findings and, if the
 approach must change, supplies concrete guidance. A budget increase is a
-separate owner decision. Scope, acceptance, model or permission changes use
-the amendment, re-enrollment or between-run activation procedure. See
-`agent_review/README.md`.
+separate owner decision. Model, permission, gate, budget or project-policy
+changes use their existing explicit operations (re-enrollment, between-run
+activation, `--max-rounds`). See `agent_review/README.md`.
+
+Reviewer continuation: for `changes_required`, the reviewer's existing
+`decision_rationale` starts with a short verdict followed by a section headed
+`Continuation for Claude` (what remains wrong, the coordinated correction
+approach, scope boundaries, evidence needed next). The controller places that
+text, taken unchanged from the accepted and digest-checked envelope, in the
+next developer prompt (continuation or fresh session), labeled with the
+reviewer, round, reviewed commit and review comment, beside the pointer to the
+full structured review. It cannot change the mission, amendments, guidance,
+permissions, models, gates, budgets or finding status. No new field, schema,
+message protocol or model call is involved, and prompt transport may adjust
+line endings. The reviewer brief names the PR URL.
+
+Owner amendments: the owner's explicit updated instruction can change the
+task's scope or acceptance within the same enrollment, branch and PR. The
+supervising Claude saves the exact text outside the developer worktree as
+pending, requests `stop`, waits for a stopped state and applies it with
+`resume --amend-mission FILE`. The controller accepts it only for a headless
+enrollment stopped (BLOCKED or PAUSED) in develop, review or finalize, or
+awaiting owner review on its open PR, with no live agent, unreturned launch,
+unfinished reviewer attempt, helper, runtime lock, uncertain delivery or
+archive in progress; anything else is refused with no change and the
+instruction stays pending. The message is appended verbatim, with a label, to
+a cumulative owner-amendments document captured by digest as a new revision;
+earlier revisions and the original mission and hash stay unchanged. In the
+same state save, the stopped round or validated result, the ready result and
+any handoff are superseded through the existing retirement mechanisms, and the
+enrollment returns to develop without a model launch. Findings, spent rounds
+and invocations, limits, models, permissions and gates are unchanged; an
+exhausted budget stops the run before any launch with the amendment applied
+but not delivered. Both roles then receive the original mission and the
+current amendments document, with the precedence rule: later explicit owner
+decisions supersede conflicting earlier requirements, and unchanged
+requirements still apply. Reports, rounds, envelopes and ready results are
+bound to the amendments revision and digest as well as to guidance, so an
+earlier review, ready result or handoff never satisfies readiness for the
+amended task, and a fresh developer report is required even on an unchanged
+commit. A finding whose requirement an amendment withdrew is resolved only by
+a `rebutted` disposition citing the amendment and a reviewer
+`rebuttal_accepted` after checking it; still-applicable defects stay blocking.
+Repository text, PR comments and reviewer output never amend the task.
+Approach guidance stays separate and cannot erase the amendment history.
+
+Supervisor duties (operating rules, not controller behavior): an agreed task
+supplied as chat text is saved verbatim as the mission file; at a terminal
+result the supervisor verifies `AWAITING_OWNER_REVIEW` with `status --remote`
+and notifies the owner in the launching conversation (PR, reviewed source and
+archive commits, outcome, expenditure, limitations, remaining owner action),
+or reports a BLOCKED or PAUSED stop accurately. A GitHub receipt alone is not
+owner notification. No separate notification or scheduling service exists.
 
 Review-loop discipline (prompt and operating policy): in round 1 the reviewer
 examines the complete supported change and its important failure paths and
