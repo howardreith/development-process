@@ -4343,16 +4343,11 @@ class ResumeGuidanceTests(Base):
     NEW_NOTICE = "This revision is new since your last invocation."
 
     @staticmethod
-    def ack(state):
-        g = state["guidance"]
-        rec = next(r for r in g["revisions"] if r["revision"] == g["current"])
-        return f"{rec['revision']}:{rec['sha256']}"
-
-    @staticmethod
-    def fresh(env, checkpoint, dispositions=(), note="", **kw):
-        """A foreground report written after the latest guidance (its summary differs from any earlier report)."""
+    def fresh(env, checkpoint, dispositions=(), binding=None, **kw):
+        """A foreground report file prepared under the given guidance binding ((revision, sha256) or None)."""
         r = report(env, checkpoint, dispositions, **kw)
-        r["summary"] = f"simulated developer report {note or uuid.uuid4().hex[:8]}"
+        if binding:
+            r["guidance"] = {"revision": binding[0], "sha256": binding[1]}
         return r
 
     def doc(self, env, name, data):
@@ -4427,7 +4422,7 @@ class ResumeGuidanceTests(Base):
         after = env.developer.calls[devs:]
         self.assertEqual(3, len(after))
         for call in after:  # every developer invocation after capture carries the text, its digest and its scope
-            self.assertIn(self.GUIDANCE.strip(), call["prompt"])
+            self.assertIn(f"-----\n{self.GUIDANCE}\n----- END OWNER GUIDANCE -----", call["prompt"])  # exact text
             self.assertIn(digest, call["prompt"])
             self.assertIn("does not alter the mission, models, permissions, budgets, acceptance criteria or finding "
                           "status", call["prompt"])
@@ -4508,11 +4503,11 @@ class ResumeGuidanceTests(Base):
         self.assertEqual(digest, env.reviewer.calls[-1]["request"]["guidance_sha256"])
         self.assertEqual(1, len(ar.read_json(env.dir / "state.json")["guidance"]["revisions"]))
 
-    def no_progress_review(self, env, ctl, ack, expect_round_binding):
-        """A fresh foreground report on the unchanged commit, reviewed and blocked again (no progress)."""
+    def no_progress_review(self, env, ctl, binding, expect_round_binding):
+        """A foreground report prepared under binding on the unchanged commit, reviewed and blocked (no progress)."""
         env.reviewer.script += [{"decision": "changes_required", "findings": [finding("R1-F1")],
                                  "assessments": [("R1-F1", "rebuttal_rejected")]}]
-        self.assertIsNone(ctl.accept_report(self.fresh(env, "phase-1", [rebutted("R1-F1")]), guidance_ack=ack))
+        self.assertIsNone(ctl.accept_report(self.fresh(env, "phase-1", [rebutted("R1-F1")], binding)))
         ctl.transition("review", "simulated foreground report")
         with self.assertRaises(ar.Stop) as stop:
             ctl.review_round()
@@ -4532,23 +4527,34 @@ class ResumeGuidanceTests(Base):
         self.addCleanup(env.cleanup)
         ctl = self.blocked(env)
         head = git(env.work, "rev-parse", "HEAD")
-        saved = report(env, "phase-1", [rebutted("R1-F1")])  # the session's report file from before the guidance
+        # a complete report file the foreground session prepared before the owner's decision, never submitted
+        prepared_before = report(env, "phase-1", [rebutted("R1-F1")])
+        prepared_before["summary"] = "prepared before the guidance; never submitted"
         a, b = "first approach\n", "second approach\n"
         da, db = ar.sha256_bytes(a.encode()), ar.sha256_bytes(b.encode())
         code, out = self.resume(ctl, guidance=self.doc(env, "a.md", a))
         self.assertEqual(ar.EXIT_OK, code)
         self.assertIn(str(env.dir / "guidance"), out["result"])  # foreground: told where the captured copy is
-        self.assertIn(f"--guidance-ack 1:{da}", out["result"])
-        self.assertEqual(f"1:{da}", out["guidance"]["foreground_ack"])
+        self.assertIn(f'"guidance": {{"revision": 1, "sha256": "{da}"}}', out["result"])
+        self.assertEqual({"revision": 1, "sha256": da}, out["guidance"]["report_member"])
         self.assertEqual(head, env.controller().state["last_report_for"])  # a report exists for this very commit
         self.assert_needs_report(env)  # guidance changed (none -> revision 1): the old report does not count
 
-        ctl = env.controller()  # the foreground session replays its saved report file
-        self.assertIn("--guidance-ack 1:", ctl.accept_report(saved))
-        self.assertIn("revision 1", ctl.accept_report(saved, guidance_ack=f"1:{db}"))
-        self.assertIn("submitted before owner guidance revision 1", ctl.accept_report(saved, guidance_ack=f"1:{da}"))
+        ctl = env.controller()  # the session submits the file it prepared before the guidance: refused, on any H
+        self.assertIn('"guidance": {"revision": 1', ctl.accept_report(prepared_before))
+        self.assertIn("revision 1", ctl.accept_report({**prepared_before, "guidance": {"revision": 1, "sha256": db}}))
+        self.assertIn("must be", ctl.accept_report({**prepared_before, "guidance": "1:" + da}))
         self.assertEqual("develop", ctl.state["phase"])  # review still waits for a report bound to revision 1
-        self.no_progress_review(env, ctl, f"1:{da}", (1, da))
+        # a report prepared under revision 1 is accepted even though its conclusions equal the earlier submission
+        same_conclusions = {**report(env, "phase-1", [rebutted("R1-F1")]), "guidance": {"revision": 1, "sha256": da}}
+        env.reviewer.script += [{"decision": "changes_required", "findings": [finding("R1-F1")],
+                                 "assessments": [("R1-F1", "rebuttal_rejected")]}]
+        self.assertIsNone(ctl.accept_report(same_conclusions))
+        ctl.transition("review", "simulated foreground report")
+        with self.assertRaises(ar.Stop):
+            ctl.review_round()  # reviewed under revision 1, then no progress again
+        self.assertEqual((1, da, head), tuple(env.reviewer.calls[-1]["request"][k]
+                                              for k in ("guidance_revision", "guidance_sha256", "H")))
 
         self.assertEqual(ar.EXIT_OK, self.resume(env.controller(), guidance=self.doc(env, "b.md", b))[0])
         state = ar.read_json(env.dir / "state.json")
@@ -4556,24 +4562,27 @@ class ResumeGuidanceTests(Base):
         self.assertEqual(head, state["last_report_for"])
         self.assert_needs_report(env)  # same commit and a ready report, but revision 2 is new
 
-        ctl = env.controller()  # a foreground developer stop (acknowledging revision 2), persisted by the guard
+        (env.dir / "STOP").write_text("owner stop\n", encoding="utf-8")  # the owner stops; no report is submitted
+        ctl = env.controller()
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(ar.EXIT_PAUSED, ar.guarded(ctl, "review", lambda: ctl.accept_report(
-                self.fresh(env, "phase-1", status="paused"), guidance_ack=f"2:{db}")))
+            self.assertEqual(ar.EXIT_PAUSED, ar.guarded(ctl, "review", lambda: None, honor_stop=True))
         self.assertEqual(ar.EXIT_OK, self.resume(env.controller(), guidance=self.doc(env, "a-again.md", a))[0])
         state = ar.read_json(env.dir / "state.json")
         revs = state["guidance"]["revisions"]
-        self.assertEqual([(1, da, 1), (2, db, 1), (3, da, 2)], [(r["revision"], r["sha256"], r["supersedes"] or 1)
-                                                                 for r in revs])
+        self.assertEqual([(1, da, None), (2, db, 1), (3, da, 2)], [(r["revision"], r["sha256"], r["supersedes"])
+                                                                    for r in revs])
         self.assertEqual(3, state["guidance"]["current"])  # A again is a new revision, not a return to revision 1
         for rec, text in zip(revs, (a, b, a)):  # every earlier snapshot is kept
             self.assertEqual(text.encode(), (env.dir / "guidance" / rec["file"]).read_bytes())
-        self.assertEqual({"guidance_revision": 1, "guidance_sha256": da}, state["last_report_guidance"])
-        self.assert_needs_report(env)  # identical bytes to revision 1, but revision 1's report does not count
+        # isolation: the revision-1 checkpoint report is still bound to this very H with the same digest as revision
+        # 3; the revision number is the only difference, and it alone makes the report stale
+        self.assertEqual((head, {"guidance_revision": 1, "guidance_sha256": da}, "checkpoint_ready"),
+                         (state["last_report_for"], state["last_report_guidance"], state["last_report"]["status"]))
+        self.assertEqual((3, da), (revs[2]["revision"], revs[2]["sha256"]))
+        self.assert_needs_report(env)
         ctl = env.controller()
-        self.assertIn("--guidance-ack 3:", ctl.accept_report(self.fresh(env, "phase-1", [rebutted("R1-F1")]),
-                                                              guidance_ack=f"1:{da}"))
-        self.no_progress_review(env, ctl, f"3:{da}", (3, da))
+        self.assertIn("revision 3", ctl.accept_report(self.fresh(env, "phase-1", [rebutted("R1-F1")], (1, da))))
+        self.no_progress_review(env, ctl, (3, da), (3, da))  # a revision-3 report on that same H is reviewed
 
         self.assertEqual(ar.EXIT_OK, self.resume(env.controller(), guidance=self.doc(env, "a-copy.md", a))[0])
         g = ar.read_json(env.dir / "state.json")["guidance"]
@@ -4669,19 +4678,24 @@ class ResumeGuidanceTests(Base):
         self.assertEqual(rounds_before, len(state["rounds"]))  # detected before any request was recorded
         self.assertFalse([k for k in state["publications"] if k.startswith(f"r{rounds_before + 1:02d}-")])
 
-        # recovery in the review phase, after a restart: different content stays refused there, the identical
-        # document restores the snapshot (no revision) and the review proceeds bound to the original digest
+        # recovery in the review phase, after a restart: --guidance is refused there for any document, including
+        # the identical one; the documented procedure restores the selected bytes and an ordinary resume continues
         before = self.state_bytes(env)
-        with self.assertRaises(ar.UsageError) as refusal:
-            self.resume(env.controller(), guidance=self.doc(env, "other.md", "different\n"))
-        self.assertIn("develop phase", str(refusal.exception))
-        self.assertEqual(before, self.state_bytes(env))
+        for document in (self.doc(env, "other.md", "different\n"), path):
+            with self.assertRaises(ar.UsageError) as refusal:
+                self.resume(env.controller(), guidance=document)
+            self.assertIn("develop phase", str(refusal.exception))
+            self.assertEqual(before, self.state_bytes(env))
+        status = env.controller().status()["guidance"]
+        self.assertFalse(status["intact"])
+        Path(status["snapshot"]).write_bytes(path.read_bytes())  # the owner copies the identical document back
+        self.assertTrue(env.controller().status()["guidance"]["intact"])
         env.reviewer.script += [{"decision": "blocked", "assessments": [("R1-F1", "fix_verified")]}]
-        code, out = self.resume(env.controller(), "restore the guidance snapshot", guidance=path)
+        code, out = self.resume(env.controller(), "guidance snapshot restored")
         self.assertEqual(ar.EXIT_BLOCKED, code)
         self.assertIn("reviewer blocked", out["reason"])
         state = ar.read_json(env.dir / "state.json")
-        self.assertEqual((1, 2), (len(state["guidance"]["revisions"]), len(state["guidance"]["revisions"][0]["restored_at"])))
+        self.assertEqual((1, 1), (len(state["guidance"]["revisions"]), len(state["guidance"]["revisions"][0]["restored_at"])))
         self.assertEqual(rounds_before + 1, len(state["rounds"]))
         digest = ar.sha256_bytes(self.GUIDANCE.encode("utf-8"))
         self.assertEqual(self.GUIDANCE.encode("utf-8"), env.reviewer.calls[-1]["guidance"])
@@ -4790,6 +4804,20 @@ class ResumeGuidanceTests(Base):
                 refused(changes, expect)
         with self.subTest("budget extension in the same call"):  # 2 of 2 completed: --max-rounds cannot lift it
             refused({"limits": {**original["limits"], "max_review_rounds_per_checkpoint": 2}}, "budget", max_rounds=6)
+        for proposed in (6, 3):  # 2 of 5 completed: neither a higher nor a lower limit accompanies guidance
+            with self.subTest("budget change below the cap", proposed=proposed):
+                refused(expect="budget change", max_rounds=proposed)
+        with self.subTest("installed workflow fails its manifest (CLI)"):
+            manifest = env.wf / "MANIFEST.json"
+            ar.atomic_write_json(manifest, {"files": {}, "fingerprint": "simulated damaged installation"})
+            before = self.state_bytes(env)
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                code = ar.main(["resume", "--enrollment", original["enrollment_id"], "--reason", "x",
+                                "--guidance", str(path)], root=env.wf)
+            self.assertEqual((ar.EXIT_USAGE, before), (code, self.state_bytes(env)))
+            self.assertIn("differs from its MANIFEST", err.getvalue())
+            self.assertTrue((env.dir / "STOP").exists())
+            manifest.unlink()
         with self.subTest("resend combined"):
             refused(expect="--resend-undelivered", resend_undelivered=True)
         with self.subTest("foreground session mid-turn"):
@@ -4860,6 +4888,226 @@ class ResumeGuidanceTests(Base):
                 self.assertEqual((before["limits"], len(before["rounds"])), (seen["limits"], len(seen["rounds"])))
                 self.assertEqual(with_guidance, "guidance" in seen)
 
+    def paused_with_guidance(self, env, text=None):
+        """BLOCKED (no progress) -> guided resume -> the developer pauses at once: PAUSED in develop with guidance."""
+        self.blocked(env)
+        path = self.doc(env, "guidance.md", text or self.GUIDANCE)
+        if env.controller().state["mode"] == "headless":
+            env.developer.script += [lambda e: report(e, "phase-1", status="paused")]
+            self.assertEqual(ar.EXIT_PAUSED, self.resume(env.controller(), guidance=path)[0])
+        else:
+            self.assertEqual(ar.EXIT_OK, self.resume(env.controller(), guidance=path)[0])
+        state = ar.read_json(env.dir / "state.json")
+        return path, env.dir / "guidance" / state["guidance"]["revisions"][0]["file"]
+
+    def test_identical_guidance_is_refused_outside_develop(self):
+        env = self.env
+        path, snapshot = self.paused_with_guidance(env)
+        original = ar.read_json(env.dir / "state.json")
+        (env.dir / "STOP").write_text("owner stop\n", encoding="utf-8")
+        calls = (len(env.developer.calls), len(env.reviewer.calls), len(env.gh.comments_list))
+        for phase in ("review", "finalize"):  # simulated stopped states in those phases (state edited, labeled)
+            for damaged in (False, True):
+                with self.subTest(phase=phase, damaged=damaged):
+                    ar.atomic_write_json(env.dir / "state.json", {**original, "phase": phase, "status": "BLOCKED"})
+                    if damaged:
+                        snapshot.write_bytes(b"simulated damage\n")
+                    before = self.state_bytes(env)
+                    with self.assertRaises(ar.UsageError) as refusal:
+                        self.resume(env.controller(), guidance=path)
+                    self.assertIn("develop phase", str(refusal.exception))
+                    self.assertEqual(before, self.state_bytes(env))
+                    self.assertTrue((env.dir / "STOP").exists())
+                    self.assertEqual(calls, (len(env.developer.calls), len(env.reviewer.calls),
+                                             len(env.gh.comments_list)))
+                    snapshot.write_bytes(self.GUIDANCE.encode("utf-8"))
+
+    def test_admission_holds_the_helper_lock_and_nothing_rechecks_before_capture(self):
+        env = Env("foreground")
+        self.addCleanup(env.cleanup)
+        self.blocked(env)
+        path = self.doc(env, "guidance.md", self.GUIDANCE)
+        ctl = env.controller()
+        ctl.admit_guidance(ar.read_guidance(path))
+        with self.assertRaises(ar.UsageError):  # a push/verify helper cannot start between admission and capture
+            with env.controller().helper_lock("verify"):
+                pass
+        ctl.release_guidance_admission()
+        with env.controller().helper_lock("verify"):
+            pass
+        observed = []
+
+        def viewer():  # simulated: the first identity observation passes, every later one fails
+            observed.append(len(observed))
+            return "owner" if len(observed) == 1 else "someone-else"
+        env.gh.viewer = viewer
+        code, out = self.resume(env.controller(), guidance=path)
+        self.assertEqual((ar.EXIT_OK, 1), (code, len(observed)))  # admitted on one observation; none repeated
+        state = ar.read_json(env.dir / "state.json")
+        self.assertEqual((1, "ACTIVE"), (len(state["guidance"]["revisions"]), state["status"]))
+        self.assertFalse(any("refused" in n for n in state.get("notes", [])))
+
+    def test_a_stop_requested_after_the_guided_save_survives(self):
+        env = self.env
+        self.blocked(env)
+        path = self.doc(env, "guidance.md", self.GUIDANCE)
+        (env.dir / "STOP").write_text("first stop (resumed by the owner)\n", encoding="utf-8")
+
+        class StopDuringCleanup(ar.Controller):  # simulated: the owner runs `stop` right after the guided save
+            def save(self):
+                super().save()
+                if getattr(self, "_txn_depth", 0) == 0 and self.state.get("status") == "ACTIVE" and \
+                        not getattr(self, "_stopped", False):
+                    self._stopped = True
+                    ar.write_text(self.stop_path, "second stop (simulated owner request)\n")
+        calls = len(env.developer.calls)
+        invocations = ar.read_json(env.dir / "state.json")["developer"]["invocations"]
+        code, out = self.resume(env.controller(StopDuringCleanup), guidance=path)
+        self.assertEqual(ar.EXIT_PAUSED, code)
+        self.assertIn("second stop", out["reason"])
+        self.assertEqual("second stop (simulated owner request)\n", (env.dir / "STOP").read_text(encoding="utf-8"))
+        self.assertEqual((calls, invocations), (len(env.developer.calls),
+                                                ar.read_json(env.dir / "state.json")["developer"]["invocations"]))
+        self.assertEqual(1, len(ar.read_json(env.dir / "state.json")["guidance"]["revisions"]))
+        self.assertFalse(list(env.dir.glob("STOP.consumed-*")))
+
+    def test_failed_outer_state_save_keeps_the_committed_state(self):
+        from unittest import mock
+        env = self.env
+        self.blocked(env)
+        path = self.doc(env, "guidance.md", self.GUIDANCE)
+        (env.dir / "STOP").write_text("owner stop\n", encoding="utf-8")
+        real, failures = ar.atomic_write_json, []
+
+        def failing_once(target, obj):  # simulated: the first replacement of state.json fails, later ones succeed
+            if Path(target).name == "state.json" and not failures:
+                failures.append(target)
+                raise OSError("simulated failure replacing state.json")
+            return real(target, obj)
+        with mock.patch.object(ar, "atomic_write_json", failing_once):
+            code, out = self.resume(env.controller(), guidance=path)
+        self.assertEqual((ar.EXIT_PAUSED, 1), (code, len(failures)))
+        self.assertIn("operational failure", out["reason"])  # recorded by the command's own (successful) save
+        state = ar.read_json(env.dir / "state.json")
+        self.assertNotIn("guidance", state)  # the selection from the failed transaction was never persisted
+        self.assertEqual(2, state["findings"]["R1-F1"]["rounds_open"])
+        self.assertTrue((env.dir / "STOP").exists())
+        self.assertEqual(2, len(env.developer.calls))
+
+    def test_malformed_selection_stops_and_guidance_text_is_delivered_exactly(self):
+        env = self.env
+        text = "First line with trailing spaces   \n\n\tindented line\n\n   \n"
+        path, snapshot = self.paused_with_guidance(env, text)
+        prompt = env.developer.calls[-1]["prompt"]
+        digest = ar.sha256_bytes(text.encode("utf-8"))
+        self.assertIn(f"----- BEGIN OWNER GUIDANCE (sha256 {digest}) -----\n{text}\n----- END OWNER GUIDANCE -----",
+                      prompt)
+        self.assertEqual(text.encode("utf-8"), snapshot.read_bytes())
+
+        broken = ar.read_json(env.dir / "state.json")  # simulated damage: the selected record is null
+        broken["guidance"]["revisions"] = [None]
+        ar.atomic_write_json(env.dir / "state.json", broken)
+        code, out = self.resume(env.controller(), "ordinary resume")
+        self.assertEqual(ar.EXIT_BLOCKED, code)
+        self.assertIn("well-formed", out["reason"])
+        self.assertIn("well-formed", out["guidance"]["problem"])
+        with self.assertRaises(ar.Stop) as stop:
+            env.controller().run_loop()
+        self.assertIn("well-formed", stop.exception.reason)
+        self.assertEqual(3, len(env.developer.calls))
+
+    def test_guidance_lost_during_reviewer_preparation_is_recoverable(self):
+        env = self.env
+        self.blocked(env)
+        path = self.doc(env, "guidance.md", self.GUIDANCE)
+        digest = ar.sha256_bytes(self.GUIDANCE.encode("utf-8"))
+
+        class LosesGuidanceWhilePreparing(ar.Controller):  # simulated loss after review_attempt's first check
+            def write_review_inputs(self, rnd, rnd_dir, snapshot, guidance_rec=None):
+                self.guidance_path(guidance_rec).unlink()
+                return super().write_review_inputs(rnd, rnd_dir, snapshot, guidance_rec)
+
+        def fix(e):
+            sha = e.commit("feature.txt", "rewritten\n", "rewrite")
+            e.push()
+            return report(e, "phase-1", [fixed("R1-F1", sha)])
+        env.developer.script += [fix]
+        reviews = len(env.reviewer.calls)
+        code, out = self.resume(env.controller(LosesGuidanceWhilePreparing), guidance=path)
+        self.assertEqual(ar.EXIT_BLOCKED, code)
+        self.assertIn("missing or altered", out["reason"])
+        state = ar.read_json(env.dir / "state.json")  # restart: no reviewer ran and the attempt says so
+        attempt = state["rounds"][-1]["attempts"][-1]
+        self.assertEqual((False, False), (attempt["ok"], attempt["launched"]))
+        self.assertIn("ended", attempt)
+        self.assertEqual(reviews, len(env.reviewer.calls))
+        before = self.state_bytes(env)  # --guidance stays develop-only (this is the review phase)
+        with self.assertRaises(ar.UsageError):
+            self.resume(env.controller(), guidance=path)
+        self.assertEqual(before, self.state_bytes(env))
+        Path(env.controller().status()["guidance"]["snapshot"]).write_bytes(path.read_bytes())  # documented restore
+        env.reviewer.script += [{"decision": "blocked", "assessments": [("R1-F1", "fix_verified")]}]
+        code, out = self.resume(env.controller(), "guidance snapshot restored")
+        self.assertIn("reviewer blocked", out["reason"])
+        self.assertEqual(reviews + 1, len(env.reviewer.calls))  # exactly one review, under the original binding
+        self.assertEqual((1, digest), (env.reviewer.calls[-1]["request"]["guidance_revision"],
+                                       env.reviewer.calls[-1]["request"]["guidance_sha256"]))
+        self.assertEqual(self.GUIDANCE.encode("utf-8"), env.reviewer.calls[-1]["guidance"])
+
+    def test_queued_request_is_not_replayed_without_intact_guidance(self):
+        env = self.env
+        self.blocked(env)
+        path = self.doc(env, "guidance.md", self.GUIDANCE)
+
+        def fix(e):
+            sha = e.commit("feature.txt", "rewritten\n", "rewrite")
+            e.push()
+            return report(e, "phase-1", [fixed("R1-F1", sha)])
+        env.developer.script += [fix]
+        # simulated outage: GitHub rejects every post after the dispositions comment, so the request stays queued
+        env.gh.on_post = lambda rec: setattr(env.gh, "fail_next", 99) if "finding dispositions" in rec["body"] else None
+        code, out = self.resume(env.controller(), guidance=path)
+        self.assertEqual(ar.EXIT_PAUSED, code)
+        env.gh.on_post, env.gh.fail_next = None, 0
+        state = ar.read_json(env.dir / "state.json")
+        key = f"r{state['rounds'][-1]['round']:02d}-request"
+        self.assertEqual("pending", state["publications"][key]["state"])
+        ar.atomic_write_json(env.dir / "state.json", {**state, "status": "ACTIVE"})  # simulated crash, not a stop
+        Path(env.controller().status()["guidance"]["snapshot"]).unlink()
+        heading = f"review request — round {state['rounds'][-1]['round']}"
+        ctl = env.controller()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(ar.EXIT_BLOCKED, ar.guarded(ctl, "run", ctl.run_loop))
+        self.assertIn("is not sent", ar.read_json(env.dir / "state.json")["status_reason"])
+        self.assertEqual(0, sum(heading in h for h in env.gh.headings()))  # nothing reached the PR
+        Path(env.controller().status()["guidance"]["snapshot"]).write_bytes(path.read_bytes())
+        env.reviewer.script += [{"decision": "blocked", "assessments": [("R1-F1", "fix_verified")]}]
+        code, out = self.resume(env.controller(), "guidance snapshot restored")
+        self.assertIn("reviewer blocked", out["reason"])
+        self.assertEqual(1, sum(heading in h for h in env.gh.headings()))  # exactly one request after repair
+
+    def test_redirected_guidance_folder_is_refused(self):
+        env = Env("foreground")
+        self.addCleanup(env.cleanup)
+        self.blocked(env)
+        path = self.doc(env, "guidance.md", self.GUIDANCE)
+        elsewhere = env.root / "elsewhere"
+        elsewhere.mkdir()
+        link = env.dir / "guidance"
+        if os.name == "nt":
+            import _winapi
+            _winapi.CreateJunction(str(elsewhere), str(link))
+        else:
+            os.symlink(elsewhere, link)
+        self.addCleanup(lambda: os.rmdir(link) if os.name == "nt" else os.unlink(link))
+        (env.dir / "STOP").write_text("owner stop\n", encoding="utf-8")
+        before = self.state_bytes(env)
+        with self.assertRaises(ar.UsageError) as refusal:
+            self.resume(env.controller(), guidance=path)
+        self.assertIn("link, a junction", str(refusal.exception))
+        self.assertEqual((before, []), (self.state_bytes(env), list(elsewhere.iterdir())))
+        self.assertTrue((env.dir / "STOP").exists())
+
     def test_interrupted_guided_resume_recovers_to_one_consistent_outcome(self):
         env = self.env
         self.blocked(env)
@@ -4880,10 +5128,9 @@ class ResumeGuidanceTests(Base):
         self.assertEqual(2, len(env.developer.calls))
 
         ctl = env.controller()  # 2. the process dies after the save, before the stop request is consumed
-        class CrashingStop(type(stop)):
-            def unlink(self, missing_ok=False):
-                raise OSError("simulated crash before the STOP file was removed")
-        ctl.stop_path = CrashingStop(str(stop))
+        def crash(expected):
+            raise OSError("simulated crash before the STOP file was consumed")
+        ctl.consume_stop = crash
         with self.assertRaises(OSError):
             ctl.resume("owner guidance", guidance=ar.read_guidance(path))
         state = ar.read_json(env.dir / "state.json")  # the new revision, recorded with its resume ...
@@ -4934,7 +5181,7 @@ class ResumeGuidanceTests(Base):
         invocations = broken["developer"]["invocations"]
         code, out = self.resume(env.controller(), "ordinary resume")
         self.assertEqual(ar.EXIT_BLOCKED, code)
-        self.assertIn("does not resolve to a recorded revision", out["reason"])
+        self.assertIn("does not resolve to a well-formed recorded revision", out["reason"])
         self.assertIn("does not resolve", out["guidance"]["problem"])
         with self.assertRaises(ar.Stop):
             env.controller().develop_step()
@@ -4958,11 +5205,12 @@ class StaleGuidanceResultTests(Base):
         with ctl.txn():
             rec, _ = ctl.capture_guidance({"source": "simulated", "data": text.encode(), "text": text,
                                           "sha256": ar.sha256_bytes(text.encode())}, "simulated selection change")
-        return f"{rec['revision']}:{rec['sha256']}"
+        return rec["revision"], rec["sha256"]
 
-    def submit_acked(self, ctl, checkpoint, ack, note):
-        r = ResumeGuidanceTests.fresh(self.env, checkpoint, note=note)
-        self.assertIsNone(ctl.accept_report(r, guidance_ack=ack))
+    def submit_acked(self, ctl, checkpoint, binding, note):
+        r = ResumeGuidanceTests.fresh(self.env, checkpoint, binding=binding)
+        r["summary"] = f"simulated developer report {note}"
+        self.assertIsNone(ctl.accept_report(r))
         ctl.transition("review", "simulated foreground report")
         return ctl.review_round()
 
@@ -5039,15 +5287,23 @@ class ForegroundTurnTests(unittest.TestCase):
             tool = rec("assistant", "2026-11-21T10:00:01.000Z", "tool_use")
             result = rec("user", "2026-11-21T10:00:02.000Z")
             done = rec("assistant", "2026-11-21T10:00:03.000Z", "end_turn")
-            cases = (([prompt, tool], False, "mid-turn"), ([prompt, tool, result], False, "still answering"),
+            cases = (([prompt, tool], False, "'tool_use'"), ([prompt, tool, result], False, "still answering"),
                      ([prompt, tool, result, done], True, "ended"),
                      ([prompt, tool, result, done, rec("user", "2026-11-21T10:05:00.000Z")], False, "still answering"),
+                     ([prompt, tool, result, done, rec("assistant", "2026-11-21T10:05:30.000Z", None)], False,
+                      "affirmatively"),
                      ([prompt, tool, result, done, rec("assistant", "2026-11-21T10:06:00.000Z", "tool_use", True)],
                       True, "ended"),  # a sub-agent's record is not the main thread
-                     ([{"type": "summary"}], False, "no conversation turn"))
+                     ([{"type": "summary"}], False, "no conversation turn"),
+                     ([prompt, tool, result, done, '{"type": "user", "timestamp": "2026-11-21T10:07:00.0'], False,
+                      "partially written"),  # a completed turn followed by a partial new record
+                     ([prompt, rec("assistant", "2026-11-21T10:00:05.000Z", "max_tokens")], False, "affirmatively"),
+                     ([prompt, rec("assistant", "2026-11-21T10:00:05.000Z", "")], False, "affirmatively"),
+                     ([prompt, rec("assistant", "2026-11-21T10:00:05.000Z", "stop_sequence")], True, "ended"))
             for rows, idle, detail in cases:
                 with self.subTest(detail=detail, rows=len(rows)):
-                    log.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+                    log.write_text("\n".join(r if isinstance(r, str) else json.dumps(r) for r in rows) + "\n",
+                                   encoding="utf-8")
                     ended, why = dev.session_turn_ended(sid)
                     self.assertEqual(idle, ended)
                     self.assertIn(detail, why)

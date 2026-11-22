@@ -221,55 +221,69 @@ python $ar resume --enrollment <id> --reason "change the repair approach" --guid
 - **Supported state.** An idle `BLOCKED` or `PAUSED` enrollment in the
   `develop` phase. Idle means no running developer (including an interrupted
   headless launch whose session process is still alive; in foreground mode,
-  the enrolled interactive session's transcript must show that its last turn
-  ended, so a turn in progress, a pending tool call or an unreadable
-  transcript refuses), no reviewer attempt without an end record, no
-  push/verify helper holding the helper lock and no configured runtime lock.
-  Neither the enrolled round budget nor the developer invocation budget may be
-  exhausted, and a `--max-rounds` in the same call cannot lift an exhausted
-  budget (extend it with an ordinary `resume --max-rounds` first; guidance
-  never accompanies a budget extension). `--resend-undelivered` cannot be
-  combined with `--guidance`. In any other status or phase (`ACTIVE`,
+  the enrolled interactive session's transcript must affirmatively show that
+  its last turn ended — an assistant record with stop reason `end_turn` or
+  `stop_sequence` — so a turn in progress, a pending tool call, an unknown
+  stop reason, a partially written last record or an unreadable transcript
+  refuses), no reviewer attempt without an end record, no push/verify helper
+  holding the helper lock and no configured runtime lock. Neither the
+  enrolled round budget nor the developer invocation budget may be exhausted,
+  and guidance never changes a budget: a `--max-rounds` that differs from the
+  enrolled limit is refused (change the budget with an ordinary
+  `resume --max-rounds` as a separate decision). `--resend-undelivered` cannot
+  be combined with `--guidance`. In any other status or phase (`ACTIVE`,
   `AWAITING_OWNER_REVIEW`, `review`, `finalize`, …) `--guidance` is refused
-  with exit code 4; it is never ignored. The one exception is recovery:
-  re-supplying the current revision's exact document (which adds no revision)
-  is also accepted in `review` and `finalize`. `resume` without `--guidance`
-  behaves exactly as before.
+  with exit code 4 for every document, including the current one; it is
+  never ignored. `resume` without `--guidance` behaves exactly as before.
 - **Validation before any change.** The file is read (at most 64 KiB + 1
-  byte), decoded as UTF-8 and hashed before the writer lock is taken; a
-  missing or non-regular file, invalid UTF-8, an empty or whitespace-only
-  document, or one over 64 KiB is refused. Under the writer lock, after the
-  host/worktree claims, the controller checks read-only that the
+  byte), decoded as UTF-8 and hashed before anything else, and a workflow
+  that fails to load (for example an installed copy that does not match its
+  manifest) is a refusal too. A missing or non-regular file, invalid UTF-8,
+  an empty or whitespace-only document, or one over 64 KiB is refused. Under
+  the writer lock, after the host/worktree claims, the controller takes the
+  helper lock and keeps it until capture, then checks read-only that the
   owner-selected enrollment ID, the loaded state, its directory and both
   ownership claims name the same enrollment (a misdirected registry entry is
-  refused), then status, phase, idleness and budgets, then the usual
-  identity, workflow-fingerprint and mission guard. Any failure is a refusal
-  (exit 4) that leaves `state.json`, the `STOP` file, every counter and the
-  PR untouched and launches nothing. Content is never validated as natural
+  refused), then status, phase, idleness, budgets and the containment of the
+  private guidance folder (a link or junction is refused), then the usual
+  identity, workflow-fingerprint and mission guard. Nothing re-runs these
+  checks between admission and capture. Any failure is a refusal (exit 4)
+  that leaves `state.json`, the `STOP` file, every counter and the PR
+  untouched and launches nothing. Content is never validated as natural
   language.
 - **Capture.** The exact bytes are copied to
   `<enrollment>/guidance/r<NNN>-<sha256 prefix>.md` and recorded in
   `state.json` (`guidance.revisions`: revision, sha256, size, source path,
-  reason, time) in the same state save as the resume. The `STOP` file is
-  consumed only after that save: an interruption leaves either the complete
-  earlier state with its `STOP` file (an unselected snapshot file is inert),
-  or the new revision recorded with the stop request still pending, which
-  pauses at the next boundary until resumed again. Editing or deleting the
-  original file afterwards changes nothing.
+  reason, time) in the same state save as the resume; if that save fails,
+  the last committed state is reloaded before the failure is recorded. Only
+  after the save is the stop request consumed, and only the one observed at
+  admission: it is moved aside and compared, and a newer request written by
+  `stop` meanwhile is put back, so it still pauses before any launch. An
+  interruption leaves either the complete earlier state with its `STOP` file
+  (an unselected snapshot file is inert), or the new revision recorded with
+  the stop request still pending, which pauses at the next boundary until
+  resumed again. Editing or deleting the original file afterwards changes
+  nothing.
 - **Delivery.** Every later developer prompt (start or continuation, including
-  correction re-invocations) contains the captured text, its revision and
-  sha256 and the path of the in-state copy; its guidance section tells the
-  first invocation after a new revision that a fresh report is required. The
+  correction re-invocations) contains the captured text exactly as captured
+  (between marker lines), its revision and sha256 and the path of the
+  in-state copy, which is the authoritative document; its guidance section
+  tells the first invocation after a new revision that a fresh report is
+  required. The
   reviewer gets a copy as `.agent-review-inputs/owner-guidance.md` inside its
   snapshot, and its prompt names that copy and the digest. Both prompts state
   that the guidance supplements the repair approach under the mission and does
   not alter models, permissions, budgets, acceptance criteria or finding
   status. In foreground mode the controller launches no developer: `resume`
   prints the in-state path and digest, `status` shows them (`guidance`,
-  including `foreground_ack`), and `review --report` is refused until the
-  session acknowledges the revision with `--guidance-ack <revision>:<sha256>`.
-  A report identical to one submitted before that revision was captured is
-  refused as a replay. The controller publishes only the guidance binding
+  including `report_member`), and the report file itself must name the
+  revision it was prepared under in a top-level member
+  `"guidance": {"revision": N, "sha256": "…"}` matching the guidance in
+  force. The controller checks and removes that member before the
+  `agent-review.developer.v1` schema applies, so unguided reports keep their
+  format; a report file prepared before the revision (without the member, or
+  naming another revision) is refused, while a report prepared under it is
+  accepted even if its conclusions are unchanged. The controller publishes only the guidance binding
   (revision and digest) and keeps the document in private state; text that
   the agents write in their reports, dispositions and findings is published
   as usual and may quote or paraphrase the guidance.
@@ -290,17 +304,23 @@ python $ar resume --enrollment <id> --reason "change the repair approach" --guid
   none) is not accepted and does not satisfy readiness. Earlier rounds keep
   their original binding.
 - **Failure modes.** Before every developer launch, before a review request is
-  recorded or published, and before every reviewer launch, the controller
-  verifies the snapshot against its digest (one bounded read; the developer's
-  text is decoded from that verified buffer). A missing or altered snapshot,
-  or a selection that names no recorded revision, stops the enrollment
-  `BLOCKED` with that reason, before any launch or charge; an ordinary
-  `resume` refuses to continue past it (the `STOP` file and counters stay).
-  Re-supplying the identical document with `resume --guidance` restores the
-  snapshot in `develop`, `review` or `finalize`; different content is refused
-  until the current revision is restored, so its record is never lost.
-  Enrollments that never received guidance, including state written before
-  this option existed, load, run and archive unchanged.
+  recorded, published or re-sent from the outbox after a restart, and before
+  every reviewer launch, the controller verifies the snapshot against its
+  digest (one bounded read; the developer's text is decoded from that
+  verified buffer). A missing or altered snapshot, a selection that names no
+  well-formed recorded revision, or a redirected guidance folder stops the
+  enrollment `BLOCKED` with that reason, before any launch or charge; an
+  ordinary `resume` refuses to continue past it (the `STOP` file and counters
+  stay). If the damage is found while reviewer inputs are being prepared, the
+  attempt is closed as not launched, so recovery needs no reconciliation.
+  To recover: in the `develop` phase, re-supply the identical document with
+  `resume --guidance` (no new revision); in any phase, copy the identical
+  document back to the snapshot path that the stop reason and `status` show,
+  confirm that `status` reports `"intact": true`, and run an ordinary
+  `resume`. Different content is refused until the current revision is
+  restored, so its record is never lost. Enrollments that never received
+  guidance, including state written before this option existed, load, run
+  and archive unchanged.
 
 ### Prepared mission: Black Tentacles (not started)
 
@@ -387,7 +407,7 @@ which run the candidate's own code. Do not reinstall or activate the controlling
 | Head or merge base moved | HISTORICAL review or correction comment; new report needed | Reconcile, `resume` |
 | Material change after ready or handoff | Ready result invalidated; superseded handoffs detected and reopened | `resume` |
 | Round cap / no progress | BLOCKED with a visible status comment | Decide; `resume --reason … [--max-rounds N]` (restarts the no-progress counters), adding `--guidance <file>` to change the repair approach |
-| Owner guidance snapshot missing or altered | BLOCKED before any launch | Re-supply the identical document with `resume --guidance` |
+| Owner guidance snapshot missing or altered | BLOCKED before any launch | In `develop`, re-supply the identical document with `resume --guidance`; otherwise copy it back to the snapshot path (`status` shows path and digest) and `resume` |
 | Developer `blocked` / `needs_owner_decision` | Dispositions published; BLOCKED / PAUSED | Decide, `resume --reason` |
 | Operational error (git/gh/process/decoding) | Persisted PAUSED and posted when identity is established | Fix, `resume` |
 | Workflow reinstalled | PAUSED until `activate`; validated or ready results from the old version are re-reviewed | Review, `activate` |
