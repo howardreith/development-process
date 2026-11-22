@@ -372,9 +372,14 @@ does not become a second implementation writer in an enrolled worktree.
   unfinished attempt.
 - **Supervised recovery.** A damaged selected snapshot is never repaired
   automatically, and `--guidance` refuses until it is fixed. Restore the
-  identical captured bytes to the path that the stop reason and
-  `status.guidance.selected.snapshot` show (the sha256 must match), confirm
-  `"integrity": "intact"`, then run an ordinary `resume`. A damaged selection
+  identical captured bytes to the path that local
+  `status.guidance.selected.snapshot` shows (the published stop reason names
+  only the revision and digest; the sha256 must match), confirm
+  `"integrity": "intact"`, then run an ordinary `resume`. The same applies to
+  an earlier revision's file: resubmitting that document never recreates it,
+  and `--guidance` refuses (exit 4, nothing changed) until the identical bytes
+  are restored. A failure to write a new capture file is also an exit-4
+  refusal with the path in the local message; nothing is selected or published. A damaged selection
   record in `state.json` needs supervised repair of the enrollment state, or a
   cancel and re-enrollment. Enrollments that never received guidance,
   including state written before this option existed, load, run and archive
@@ -510,7 +515,7 @@ which run the candidate's own code. Do not reinstall or activate the controlling
 | Developer invocation budget exhausted | BLOCKED (`developer invocation budget exhausted`) | Separate owner decision. No `resume` option raises it (`--max-rounds` does not), and guidance is refused. Use the existing re-enrollment procedure |
 | Owner guidance snapshot missing or altered, or selection invalid | BLOCKED before any launch; `--guidance` refuses | Restore the identical captured bytes to the snapshot path (`status` shows path and digest; integrity must read `intact`), then ordinary `resume`. A damaged selection record needs supervised state repair or re-enrollment |
 | Developer `blocked` / `needs_owner_decision` | Dispositions published; BLOCKED / PAUSED | Decide, `resume --reason` |
-| Operational error (git/gh/process/decoding) | Persisted PAUSED and posted when identity is established | Fix, `resume` |
+| Operational error (git/gh/process/decoding/filesystem) | Persisted PAUSED and posted when identity is established. A filesystem error is posted by type and errno only; the local `status` reason names the path | Fix, `resume` |
 | Workflow reinstalled | PAUSED until `activate`; validated or ready results from the old version are re-reviewed | Review, `activate` |
 | Mission, mission snapshot, permission file or a record changed | BLOCKED | Restore or re-enroll |
 | Abandon an enrollment | `cancel`: CANCELLED, claims released, history kept | — |

@@ -87,6 +87,15 @@ class UsageError(Exception):
     """Refused: bad input, wrong target or lock held. Nothing is published."""
 
 
+class LockUnavailable(UsageError):
+    """A lock file could not be opened at all (not contention): a setup refusal."""
+
+
+class RefusedUnchanged(UsageError):
+    """A refusal raised inside a command after admission but before anything changed: the command guard records
+    no note for it, so the state file stays byte-identical."""
+
+
 class NotDelivered(Exception):
     """GitHub definitely did not store the request (rejected with 4xx, or no connection was made)."""
 
@@ -1023,8 +1032,11 @@ class Lock:
         self.holder = self.path.with_name(self.path.name + ".holder.json")
 
     def __enter__(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        handle = open(self.path, "a+", encoding="utf-8")
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            handle = open(self.path, "a+", encoding="utf-8")
+        except OSError as exc:  # e.g. a directory or an inaccessible file where the lock file belongs
+            raise LockUnavailable(f"lock file {self.path} cannot be opened ({type(exc).__name__}: {exc})")
         try:
             _os_lock(handle)
         except OSError:
@@ -1142,6 +1154,8 @@ class Controller:
 
     def reload(self):
         self.state = read_json(self.state_path)
+        if not isinstance(self.state, dict):
+            raise UsageError(f"the enrollment state {self.state_path} is not a JSON object; repair it under supervision")
         if self.state.get("schema_version") != STATE_SCHEMA:
             raise UsageError("unsupported enrollment state version")
         self._migrate()
@@ -1448,6 +1462,8 @@ class Controller:
         lock = self.helper_lock("resume-guidance")  # held from these checks until capture: no helper interleaves
         try:
             lock.__enter__()
+        except LockUnavailable as exc:
+            raise UsageError(f"--guidance refused: {exc}. Nothing was captured or changed")
         except UsageError as exc:
             raise UsageError(f"--guidance refused: a developer helper (push/verify) holds this enrollment's helper lock "
                              f"({exc})")
@@ -1538,8 +1554,7 @@ class Controller:
             raise UsageError(f"--guidance refused: {folder} exists but is not a folder, so nothing can be captured "
                              "there; move it aside under supervision. Nothing was captured or changed")
         path = self.guidance_path(guidance["sha256"])
-        recorded = [r["revision"] for r in s["guidance"]["revisions"]
-                    if isinstance(r, dict) and r.get("sha256") == guidance["sha256"]] if current else []
+        recorded = self.recorded_revisions(guidance["sha256"])
         intact = self.read_guidance_snapshot(guidance["sha256"]) is not None
         if recorded and not intact:  # a previously selected snapshot is never recreated from a new submission
             raise UsageError(f"--guidance refused: this document's content was captured before (revision(s) "
@@ -1551,15 +1566,48 @@ class Controller:
                              "match it and is never overwritten; restore its captured bytes or remove it if no revision "
                              "references it. Nothing was captured or changed")
 
+    def recorded_revisions(self, sha):
+        """Revision numbers of the recorded revisions holding this digest ([] if none). A record for this digest whose
+        revision number is not well formed is refused (RefusedUnchanged): reselection never guesses at damaged history."""
+        g = self.state.get("guidance")
+        revisions = g.get("revisions") if isinstance(g, dict) else None
+        found = []
+        for r in revisions if isinstance(revisions, list) else []:
+            if isinstance(r, dict) and r.get("sha256") == sha:
+                if self._revision_number(r.get("revision")) is None:
+                    raise RefusedUnchanged(f"--guidance refused: the recorded history for this document's digest {sha} "
+                                           "is malformed (a revision record without a valid revision number); repair "
+                                           "it under supervision. Nothing was captured or changed")
+                found.append(r["revision"])
+        return found
+
     def stage_guidance(self, guidance):
-        """Write the captured bytes to their content-addressed file (if not already there) and verify them. The file is
-        unreferenced until the selection is saved; an existing file is never overwritten."""
-        path = self.guidance_path(guidance["sha256"])
-        if not path.exists():
+        """Make the captured bytes available in their content-addressed file before selection. A digest already
+        recorded in a revision is only reused: its file must still be intact, and it is never recreated (that would be
+        an automatic repair). Only an unrecorded digest is written, and an existing file is never overwritten. Every
+        refusal here happens before anything changed (the file is unreferenced until the selection is saved)."""
+        sha = guidance["sha256"]
+        path = self.guidance_path(sha)
+        if self.recorded_revisions(sha):
+            if self.read_guidance_snapshot(sha) is None:
+                raise RefusedUnchanged(f"--guidance refused: this document's content was captured before, but its "
+                                       f"content file {path} is missing or altered; it is never recreated or repaired "
+                                       "automatically. Restore the identical captured bytes under supervision, then "
+                                       "retry. Nothing was captured or changed")
+            return
+        if path.exists():
+            if self.read_guidance_snapshot(sha) is None:
+                raise RefusedUnchanged(f"--guidance refused: the existing content file {path} for this document's digest "
+                                       "does not match it and is never overwritten. Nothing was captured or changed")
+            return  # an unreferenced earlier capture of the same bytes (e.g. after a failed save)
+        try:
             atomic_write_bytes(path, guidance["data"])
-        if self.read_guidance_snapshot(guidance["sha256"]) is None:  # public-safe reason; the path is in local status
-            raise Stop("BLOCKED", f"could not capture the owner guidance (sha256 {guidance['sha256']}): its content file "
-                                  "does not match its digest")
+        except OSError as exc:  # local diagnostic only: refusals are never published
+            raise RefusedUnchanged(f"--guidance refused: the guidance could not be captured to {path} "
+                                   f"({type(exc).__name__}: {exc}). Nothing was selected or changed")
+        if self.read_guidance_snapshot(sha) is None:
+            raise RefusedUnchanged(f"--guidance refused: the captured content file {path} does not match its digest "
+                                   "after writing; it is unreferenced. Nothing was selected or changed")
 
     def select_guidance(self, guidance, reason):
         """Select a staged document (state only, inside the caller's transaction). Content identical to the current
@@ -2024,6 +2072,11 @@ class Controller:
     def review_attempt(self, rnd, rnd_dir):
         # before anything is recorded or launched: the round's owner guidance must be current and intact
         guidance_rec, _ = self.require_guidance(self.binding_of(rnd))
+        try:  # resolves the configured executable: a lookup failure opens no attempt and launches nothing
+            reviewer = self.reviewer
+        except UsageError as exc:
+            raise Stop("BLOCKED", f"the reviewer for round {rnd['round']} could not be prepared ({exc}); no attempt "
+                                  "was opened and no reviewer was launched") from exc
         rnd["attempt_seq"] = n = rnd.get("attempt_seq", 0) + 1  # monotonic across owner-granted budgets
         attempt = {"n": n, "started": now_iso()}
         attempt_started_epoch = time.time()
@@ -2060,9 +2113,9 @@ class Controller:
                 attempt["pid"] = pid  # the process-start record: from here on the attempt counts as launched
                 self.save()
             try:
-                info = self.reviewer.run(prompt, snapshot, schema, result_path, rnd_dir / f"events-{n}.jsonl",
-                                         rnd_dir / f"stderr-{n}.txt", self.cfg["reviewer"]["timeout_minutes"] * 60,
-                                         on_start=on_start)
+                info = reviewer.run(prompt, snapshot, schema, result_path, rnd_dir / f"events-{n}.jsonl",
+                                    rnd_dir / f"stderr-{n}.txt", self.cfg["reviewer"]["timeout_minutes"] * 60,
+                                    on_start=on_start)
             except OSError as exc:  # stream setup or process creation failed before any process started
                 if "pid" in attempt:
                     raise
@@ -2821,12 +2874,16 @@ class Controller:
         log_dir.mkdir(parents=True, exist_ok=True)
         write_text(log_dir / f"prompt-{n:03d}.md", prompt)
         # Charge the budget and record launch intent before dispatch.
-        dev.update(invocations=n, launch={"n": n, "at": now_iso(), "resume": resume, "returned": False,
-                                          **(self.guidance_binding() if guidance_rec else {})})
+        # active_pid is cleared in the same save: assert_no_active_developer established that any earlier process is
+        # gone, and a start is attributed to this invocation only by its own callback (launch["pid"])
+        dev.update(invocations=n, active_pid=None,
+                   launch={"n": n, "at": now_iso(), "resume": resume, "returned": False,
+                           **(self.guidance_binding() if guidance_rec else {})})
         self.save()
 
         def on_start(pid):
             dev["active_pid"] = pid
+            dev["launch"]["pid"] = pid
             self.save()
 
         def on_soft_deadline():
@@ -3789,7 +3846,7 @@ class Controller:
         if launch:
             returned = bool(launch.get("returned"))
             developer = {"invocation": launch.get("n"), "intent_recorded_at": launch.get("at"),
-                         "process_start_recorded": True if returned or dev.get("active_pid") else None,
+                         "process_start_recorded": True if returned or launch.get("pid") else None,
                          "returned": returned, **bound(launch)}
         rnd = s["rounds"][-1] if s.get("rounds") else None
         review = None
@@ -4785,17 +4842,23 @@ def guarded(controller, command, fn, mutate=True, honor_stop=False, precheck=Non
             print(json.dumps({"result": result, **controller.status()}, indent=2))
             return EXIT_OK
         except UsageError as exc:
-            controller.state.setdefault("notes", []).append(f"{now_iso()} {command} refused: {exc}")
-            controller.save()
+            if not isinstance(exc, RefusedUnchanged):
+                controller.state.setdefault("notes", []).append(f"{now_iso()} {command} refused: {exc}")
+                controller.save()
             raise
         except (Stop, CommandError, subprocess.TimeoutExpired, OSError, ValueError, KeyError, TypeError) as exc:
             stop = exc if isinstance(exc, Stop) else Stop("PAUSED", f"operational failure during {command}: {exc}")
+            public = stop.reason
+            if isinstance(exc, OSError):  # its text names local paths: the full diagnostic stays in local state
+                public = (f"operational failure during {command}: {type(exc).__name__}"
+                          + (f" (errno {exc.errno})" if exc.errno is not None else "")
+                          + "; the local `status` reason names the affected path")
             controller.state["status"], controller.state["status_reason"] = stop.status, stop.reason
             controller.state.setdefault("transitions", []).append(
                 {"at": now_iso(), "from": controller.state.get("phase"), "to": controller.state.get("phase"),
                  "why": f"{stop.status}: {stop.reason}"})
             controller.save()
-            controller.publish_status(stop.status, stop.reason)
+            controller.publish_status(stop.status, public)
             print(json.dumps({"stopped": stop.status, "reason": stop.reason, **controller.status()}, indent=2))
             return EXIT_BLOCKED if stop.status == "BLOCKED" else EXIT_PAUSED
 

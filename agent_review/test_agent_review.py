@@ -23,6 +23,7 @@ import tempfile
 import time
 import uuid
 import unittest
+from unittest import mock
 from pathlib import Path
 
 # Importable both as a top-level module (discover -s agent_review, or the gate's script path) and as
@@ -5261,6 +5262,207 @@ class ResumeGuidanceTests(Base):
         self.assertIn("reviewer blocked", out["reason"])
         self.assertEqual(reviews + 1, len(env.reviewer.calls))
         self.assertEqual(1, sum(f"review request — round {n} —" in c["body"] for c in env.gh.comments_list))
+
+
+    # -- round-2 corrections of enrollment 57a2 (R1-F2, R1-F4, R1-F6, R1-F7, R1-F8, R2-F1) -------------------------
+    def outward(self, env):
+        """Everything published or committed for the PR: simulated comments and archived records."""
+        records = env.work / "docs" / "agent-reviews"
+        files = [p.read_text(encoding="utf-8") for p in records.rglob("*") if p.is_file()] if records.exists() else []
+        return [c["body"] for c in env.gh.comments_list] + files
+
+    def test_guided_setup_failures_on_the_real_command_path_refuse_with_exit_4(self):
+        env = self.env
+        self.blocked(env)
+        ar.write_text(env.dir / "STOP", "owner stop (simulated)\n")
+        path = self.doc(env, "guidance.md", self.GUIDANCE)
+        enrollment = ar.read_json(env.dir / "state.json")["enrollment_id"]
+        calls, posted = len(env.developer.calls), len(env.gh.comments_list)
+
+        def cli():
+            before = self.state_bytes(env)
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                code = ar.main(["resume", "--enrollment", enrollment, "--reason", "x", "--guidance", str(path)],
+                               root=env.wf)
+            self.assertEqual((ar.EXIT_USAGE, before), (code, self.state_bytes(env)))
+            self.assertTrue((env.dir / "STOP").exists())
+            self.assertEqual((calls, posted), (len(env.developer.calls), len(env.gh.comments_list)))
+            return err.getvalue()
+        with self.subTest("a directory occupies the helper lock file"):
+            lock = env.dir / "helper.lock"
+            lock.unlink(missing_ok=True)
+            lock.mkdir()  # simulated environment fault: the lock file cannot be opened at all
+            try:
+                self.assertIn("cannot be opened", cli())
+            finally:
+                lock.rmdir()
+        with self.subTest("the enrollment state decodes to a non-object"):
+            saved = self.state_bytes(env)
+            (env.dir / "state.json").write_bytes(b"[]\n")  # simulated damage to the private state file
+            try:
+                self.assertIn("not a JSON object", cli())
+            finally:
+                (env.dir / "state.json").write_bytes(saved)
+        env.developer.script += [self.paused]  # once the faults are cleared the same command is admitted
+        self.assertEqual(ar.EXIT_PAUSED, self.resume(env.controller(), guidance=path)[0])
+
+    def test_reselecting_a_digest_with_damaged_history_is_refused_unchanged(self):
+        env = self.env
+        self.blocked(env)
+        a, b = "approach A\n", "approach B\n"
+        for name, text in (("a.md", a), ("b.md", b)):
+            env.developer.script += [self.paused]
+            self.assertEqual(ar.EXIT_PAUSED, self.resume(env.controller(), guidance=self.doc(env, name, text))[0])
+        state = ar.read_json(env.dir / "state.json")
+        del state["guidance"]["revisions"][0]["revision"]  # labeled: damage only A's historical record
+        ar.atomic_write_json(env.dir / "state.json", state)
+        before, stop = self.state_bytes(env), (env.dir / "STOP").exists()
+        calls, posted = len(env.developer.calls), len(env.gh.comments_list)
+        with self.assertRaises(ar.UsageError) as refusal:
+            self.resume(env.controller(), guidance=self.doc(env, "a-again.md", a))
+        self.assertIn("malformed", str(refusal.exception))
+        self.assertEqual((before, stop, calls, posted), (self.state_bytes(env), (env.dir / "STOP").exists(),
+                                                         len(env.developer.calls), len(env.gh.comments_list)))
+        self.assertEqual(2, ar.read_json(env.dir / "state.json")["guidance"]["current"])
+
+    def test_a_recorded_snapshot_lost_during_admission_is_not_recreated(self):
+        env = self.env
+        self.blocked(env)
+        a, b = "approach A\n", "approach B\n"
+        for name, text in (("a.md", a), ("b.md", b)):
+            env.developer.script += [self.paused]
+            self.assertEqual(ar.EXIT_PAUSED, self.resume(env.controller(), guidance=self.doc(env, name, text))[0])
+        snapshot = self.snapshot(env, a)
+        self.assertTrue(snapshot.is_file())  # intact when the reselection starts
+
+        def viewer():  # simulated: A's content file disappears while admission waits for the remote identity reads
+            snapshot.unlink(missing_ok=True)
+            return "owner"
+        env.gh.viewer = viewer
+        before, stop = self.state_bytes(env), (env.dir / "STOP").exists()
+        calls, posted = len(env.developer.calls), len(env.gh.comments_list)
+        try:
+            with self.assertRaises(ar.UsageError) as refusal:
+                self.resume(env.controller(), guidance=self.doc(env, "a-again.md", a))
+        finally:
+            del env.gh.viewer
+        self.assertIn("never recreated", str(refusal.exception))
+        self.assertFalse(snapshot.exists())
+        self.assertEqual((before, stop, calls, posted), (self.state_bytes(env), (env.dir / "STOP").exists(),
+                                                         len(env.developer.calls), len(env.gh.comments_list)))
+        self.assertEqual(2, ar.read_json(env.dir / "state.json")["guidance"]["current"])  # B is still selected
+        snapshot.write_bytes(a.encode())  # supervised restoration of the identical captured bytes
+        env.developer.script += [self.paused]
+        self.assertEqual(ar.EXIT_PAUSED, self.resume(env.controller(), guidance=self.doc(env, "a-again.md", a))[0])
+        self.assertEqual(3, ar.read_json(env.dir / "state.json")["guidance"]["current"])
+
+    def test_capture_write_failure_is_a_local_refusal(self):
+        env = self.env
+        self.blocked(env)
+        path = self.doc(env, "guidance.md", self.GUIDANCE)
+        target = self.snapshot(env, self.GUIDANCE)
+        obstacle = target.with_name(target.name + f".{os.getpid()}.tmp")
+        obstacle.mkdir(parents=True)  # simulated fault: the capture's temporary file cannot be created
+        before, stop = self.state_bytes(env), (env.dir / "STOP").exists()
+        calls, posted = len(env.developer.calls), len(env.gh.comments_list)
+        with self.assertRaises(ar.UsageError) as refusal:
+            self.resume(env.controller(), guidance=path)
+        self.assertIn("could not be captured", str(refusal.exception))
+        self.assertIn(str(target.parent), str(refusal.exception))  # the local diagnostic names the path
+        self.assertEqual((before, stop, calls, posted), (self.state_bytes(env), (env.dir / "STOP").exists(),
+                                                         len(env.developer.calls), len(env.gh.comments_list)))
+        self.assertFalse(target.exists())
+        obstacle.rmdir()
+        env.developer.script += [self.paused]
+        self.assertEqual(ar.EXIT_PAUSED, self.resume(env.controller(), guidance=path)[0])
+
+    def test_round_directory_failure_publishes_no_private_path(self):
+        env = self.env
+        self.blocked(env)
+        path = self.doc(env, "guidance.md", self.GUIDANCE)
+        n = len(ar.read_json(env.dir / "state.json")["rounds"]) + 1
+        obstacle = env.dir / "rounds" / f"r{n:02d}"
+        obstacle.write_text("simulated fault: a file where the round directory belongs\n", encoding="utf-8")
+        env.developer.script += [self.fix]
+        code, out = self.resume(env.controller(), guidance=path)
+        self.assertEqual(ar.EXIT_PAUSED, code)
+        state = ar.read_json(env.dir / "state.json")
+        self.assertIn(env.dir.name, state["status_reason"])  # the local diagnostic keeps the path ...
+        public = [c["body"] for c in env.gh.comments_list if "operational failure during resume" in c["body"]]
+        self.assertEqual(1, len(public))
+        self.assertIn("FileExistsError", public[0])
+        obstacle.unlink()  # the owner clears the fault; the run continues to the owner handoff
+
+        def final_work(e):
+            e.commit("final.txt", "f\n", "final")
+            e.push()
+            return report(e, "final")
+        env.developer.script += [final_work]
+        env.reviewer.script += [{"decision": "checkpoint_passed", "assessments": [("R1-F1", "fix_verified")]},
+                                {"decision": "ready_for_owner_review"}]
+        code, out = self.resume(env.controller(), "round directory fault cleared")
+        self.assertEqual((ar.EXIT_OK, "AWAITING_OWNER_REVIEW"), (code, out["result"]))
+        notices = [t for t in self.outward(env) if "operational failure during resume" in t]
+        self.assertGreaterEqual(len(notices), 2)  # the PR comment and its archived record
+        for text in notices:  # ... never in the published notice or its archived record
+            self.assertNotIn(env.root.name, text)
+
+    def test_missing_reviewer_executable_opens_no_attempt(self):
+        env = self.env
+        self.blocked(env)
+        path = self.doc(env, "guidance.md", self.GUIDANCE)
+        ctl = env.controller()
+        ctl._reviewer = None  # normal lazy construction of the real Codex boundary
+        name = ar.expand(ctl.cfg["reviewer"].get("executable", "codex"))
+        self.assertFalse(os.path.isabs(name))  # the shipped configuration needs a PATH lookup
+        which = shutil.which
+        env.developer.script += [self.fix]
+        reviews = len(env.reviewer.calls)
+        with mock.patch.object(ar.shutil, "which", lambda cmd, *a, **k: None if cmd == name else which(cmd, *a, **k)):
+            code, out = self.resume(ctl, guidance=path)  # simulated: the reviewer executable is absent from PATH
+        self.assertEqual(ar.EXIT_BLOCKED, code)
+        self.assertIn("could not be prepared", out["reason"])
+        state = ar.read_json(env.dir / "state.json")  # restart: nothing to reconcile
+        self.assertEqual([], state["rounds"][-1]["attempts"])
+        self.assertIsNone(env.controller().status()["guidance"]["latest_review_round"]["latest_attempt"])
+        env.reviewer.script += [{"decision": "blocked", "assessments": [("R1-F1", "fix_verified")]}]
+        code, out = self.resume(env.controller(), "reviewer executable restored")
+        self.assertIn("reviewer blocked", out["reason"])
+        self.assertEqual(reviews + 1, len(env.reviewer.calls))
+
+    def test_a_dead_developers_pid_is_not_the_next_invocations_start(self):
+        env = self.env
+        self.blocked(env)
+        env.developer.script += [self.paused]
+        self.assertEqual(ar.EXIT_PAUSED, self.resume(env.controller(), guidance=self.doc(env, "g.md", self.GUIDANCE))[0])
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        state = ar.read_json(env.dir / "state.json")  # labeled: invocation n started, then died before returning
+        n = state["developer"]["invocations"]
+        state["developer"]["launch"].update(returned=False, pid=dead.pid)
+        state["developer"]["active_pid"] = dead.pid
+        ar.atomic_write_json(env.dir / "state.json", state)
+        seen = {}
+
+        def fails_before_start(e):  # simulated launch failure before the process-start callback
+            seen["before_start"] = env.controller().status()["guidance"]["latest_developer_invocation"]
+            raise OSError("simulated launch failure before process creation")
+        env.developer.script += [fails_before_start]
+        code, _ = self.resume(env.controller(), "retry after the interrupted invocation")
+        self.assertEqual(ar.EXIT_PAUSED, code)
+        self.assertEqual((n + 1, None, False), tuple(seen["before_start"][k] for k in (
+            "invocation", "process_start_recorded", "returned")))
+        after = env.controller().status()["guidance"]["latest_developer_invocation"]  # restart
+        self.assertEqual((n + 1, None, False), (after["invocation"], after["process_start_recorded"], after["returned"]))
+        self.assertIsNone(ar.read_json(env.dir / "state.json")["developer"]["active_pid"])
+
+        def started(e):
+            return self.paused(e)
+        started.start_pid = os.getpid()
+        env.developer.script += [started]
+        self.resume(env.controller(), "retry")
+        after = env.controller().status()["guidance"]["latest_developer_invocation"]
+        self.assertEqual((n + 2, True, True), (after["invocation"], after["process_start_recorded"], after["returned"]))
 
 
 class StaleGuidanceResultTests(Base):
