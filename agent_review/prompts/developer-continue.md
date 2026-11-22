@@ -18,6 +18,8 @@ $allowed_commands
 
 Mission (sha256 `$mission_sha256`): `$mission_path`
 
+$guidance
+
 ## Active checkpoint: `$checkpoint_id` ($checkpoint_type)
 
 Scope: $checkpoint_scope
@@ -39,6 +41,13 @@ For every pending finding, decide on the evidence:
 - `deferred_optional`: only for genuinely optional polish, with rationale.
 - `unresolved_blocker`: you cannot resolve it; explain precisely.
 Do not silently drop a finding or mark your own rebuttal accepted.
+
+Correct root causes in one coherent batch. For a repeated finding, explain the
+failing production path, reproduce that exact boundary and check affected
+neighbors. A test that supplies the answer, bypasses the real orchestration, or
+only tests a neighboring condition does not establish the fix. Optional polish
+remains optional; do not grow generic recovery or compatibility infrastructure
+to satisfy speculative findings.
 
 When done, return the structured report (`agent-review.developer.v1`) with
 `status` `checkpoint_ready`, `candidate_commit` equal to the pushed clean HEAD,
