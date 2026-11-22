@@ -1130,8 +1130,10 @@ AMENDMENT_FINDINGS = ("Every pending finding still needs a disposition. A findin
                       "Never mark it `fixed` and never call a valid historical finding a false positive. A defect that "
                       "still applies under the effective task remains blocking whatever amendment exists.")
 AMENDMENT_REVIEW = ("Answer a rebuttal that cites an owner amendment with `rebuttal_accepted` only after verifying that "
-                    "the cited amendment covers that finding and that the remaining supported behavior is sound; the "
-                    "original finding stays in the record and is not a false positive. A defect that still applies "
+                    "the cited amendment covers that finding and that the remaining supported behavior is sound. Your "
+                    "assessment rationale must itself name the amendment (for example `OWNER AMENDMENT 2`), the "
+                    "requirement it withdrew and why that covers the finding; the original finding stays in the record "
+                    "and is not a false positive. A defect that still applies "
                     "under the effective task stays blocking whatever amendment exists, and an earlier continuation "
                     "cannot reintroduce a requirement the owner withdrew.")
 INSTRUCTION_KINDS = {
@@ -1607,6 +1609,12 @@ class Controller:
                 self.verify_inputs(rebind=False)
             except (Stop, UsageError, CommandError, subprocess.TimeoutExpired, OSError, ValueError) as exc:
                 raise UsageError(f"{option} refused before any change: {getattr(exc, 'reason', exc)}")
+            confirmed = []
+            if kind == "amendments":  # after the target identity guard: authenticated, read-only reconciliation
+                try:
+                    confirmed = self.reconcile_uncertain_deliveries(option)
+                except (Stop, CommandError, subprocess.TimeoutExpired, OSError, ValueError) as exc:
+                    raise UsageError(f"{option} refused: {getattr(exc, 'reason', exc)}; nothing was captured or changed")
             # last, after the remote identity checks and immediately before capture: runtime lock files can be shared
             # with other projects' enrollments, which the writer and helper locks do not exclude
             if self.runtime_active():
@@ -1616,7 +1624,40 @@ class Controller:
         except BaseException:
             lock.__exit__()
             raise
-        self._guidance_admission = {"kind": kind, "sha256": guidance["sha256"], "lock": lock, "document": document}
+        self._guidance_admission = {"kind": kind, "sha256": guidance["sha256"], "lock": lock, "document": document,
+                                    "confirmed": confirmed}
+
+    def reconcile_uncertain_deliveries(self, option):
+        """Read-only: for every part whose POST outcome is unknown (posting_since, no comment ID), look for the exact
+        marked body from the expected actor on the enrolled PR with the existing reconciliation. Returns the confirmed
+        (key, part index, comment) references to persist with the application; a part still absent is ambiguous and
+        refused, and conflicting copies raise Stop from reconcile (refused by the caller)."""
+        confirmed, missing = [], []
+        number = self.state["pr"]["number"]
+        for key, pub in sorted(self.state.get("publications", {}).items()):
+            for index, part in enumerate(pub.get("parts", [])):
+                if part.get("posting_since") and not part.get("comment_id"):
+                    found = self.reconcile(number, part["marker"], self.outbox_body(key, part))
+                    if found:
+                        confirmed.append((key, index, found))
+                    else:
+                        missing.append(key)
+        if missing:
+            raise UsageError(f"{option} refused: delivery of {', '.join(sorted(set(missing)))} is uncertain (an earlier "
+                             "POST may have been stored but is not visible on the PR). Check the PR and settle it with "
+                             "an ordinary resume first. Nothing was captured or changed")
+        return confirmed
+
+    def record_confirmed_deliveries(self, confirmed):
+        """Persist references found by reconcile_uncertain_deliveries (inside the caller's transaction); a publication
+        whose every part is now confirmed is posted, exactly as send() records it."""
+        for key, index, found in confirmed:
+            pub = self.state["publications"][key]
+            part = pub["parts"][index]
+            part.update(comment_id=found["id"], url=found.get("url"))
+            part.pop("posting_since", None)
+            if pub["state"] == "pending" and all(q.get("comment_id") for q in pub["parts"]):
+                pub.update(state="posted", posted_at=now_iso())
 
     def release_guidance_admission(self):
         admission, self._guidance_admission = getattr(self, "_guidance_admission", None), None
@@ -1680,6 +1721,12 @@ class Controller:
         problem = self.guidance_problem(amendments, "amendments") if amendments else None
         if problem:  # guidance never runs on top of a damaged effective task
             raise UsageError(f"--guidance refused: {problem}. Nothing was captured or changed")
+        try:  # every later review request publishes it: checked against that policy while nothing has changed
+            sanitize("\n".join(self.guidance_public_section({"guidance_revision": 0, "guidance_sha256": guidance["sha256"]},
+                                                            guidance["text"])))
+        except Stop as stop:
+            raise UsageError(f"--guidance refused: the guidance could not be published in review requests "
+                             f"({stop.reason}); revise it to be PR-safe. Nothing was captured or changed")
         folder = self.dir / "guidance"
         if folder.exists() and not folder.is_dir():
             raise UsageError(f"--guidance refused: {folder} exists but is not a folder, so nothing can be captured "
@@ -1723,11 +1770,17 @@ class Controller:
         if s["mode"] != "headless":
             raise UsageError(f"{option} is supported only for headless enrollments; this enrollment uses foreground mode "
                              "(give the interactive session the instruction directly). Nothing was captured or changed")
-        if (s["status"], s["phase"]) not in AMENDMENT_STATES:
+        stopped_handoff = s["phase"] == "done" and s["status"] in GUIDANCE_STATUSES and bool(s.get("handoff"))
+        if (s["status"], s["phase"]) not in AMENDMENT_STATES and not stopped_handoff:
             raise UsageError(f"{option} is accepted only at a safe stopping boundary: a BLOCKED or PAUSED enrollment in "
-                             "the develop, review or finalize phase, or an owner-review handoff (AWAITING_OWNER_REVIEW); "
-                             f"this enrollment is {s['status']} in phase {s['phase']}. Request `stop`, wait until "
-                             "`status` shows it stopped, then retry. Nothing was captured or changed")
+                             "the develop, review or finalize phase, or an owner-review handoff (AWAITING_OWNER_REVIEW, "
+                             "or stopped after it with the handoff still recorded); this enrollment is "
+                             f"{s['status']} in phase {s['phase']}. Request `stop`, wait until `status` shows it stopped "
+                             "(after an activation: `run`, which pauses at once on the stop file), then retry. Nothing "
+                             "was captured or changed")
+        if (s.get("last_report") or {}).get("runtime_restoration") == "pending":
+            raise UsageError(f"{option} refused: the last developer report declares a runtime restoration still "
+                             "pending; it must finish (and be reported) first. Nothing was captured or changed")
         if max_rounds is not None and int(max_rounds) != int(self.limits["max_review_rounds_per_checkpoint"]):
             raise UsageError(f"{option} cannot be combined with a budget change (--max-rounds); an amendment never "
                              "changes a budget. Change it with an ordinary `resume --max-rounds` as a separate owner "
@@ -1746,19 +1799,16 @@ class Controller:
         active = self.active()
         if active and active["status"] in ("requested", "reviewing"):
             for attempt in active.get("attempts") or []:
+                if "ended" in attempt:
+                    continue  # a recorded end is the outcome; a reused PID is not the reviewer
                 if pid_alive(attempt.get("pid")):
                     raise UsageError(f"{option} refused: reviewer attempt {attempt.get('n')} of round {active['round']} "
                                      f"is still running (pid {attempt['pid']}). Nothing was captured or changed")
-                if "ended" not in attempt:
-                    raise UsageError(f"{option} refused: reviewer attempt {attempt.get('n')} of round {active['round']} "
-                                     "has no recorded end; let an ordinary `resume` reconcile it first. Nothing was "
-                                     "captured or changed")
-        uncertain = sorted(k for k, p in s.get("publications", {}).items()
-                           if any(q.get("posting_since") and not q.get("comment_id") for q in p.get("parts", [])))
-        if uncertain:
-            raise UsageError(f"{option} refused: delivery of {', '.join(uncertain)} is uncertain (an earlier POST may have "
-                             "been stored). Check the PR and settle it with an ordinary resume first. Nothing was "
-                             "captured or changed")
+                raise UsageError(f"{option} refused: reviewer attempt {attempt.get('n')} of round {active['round']} "
+                                 "has no recorded end; let an ordinary `resume` reconcile it first. Nothing was "
+                                 "captured or changed")
+        # publications of uncertain delivery are reconciled read-only against the PR after the identity guard
+        # (admit_guidance); one still ambiguous then is refused
         if s.get("archive_pending"):
             raise UsageError(f"{option} refused: an archive commit is in progress; let an ordinary resume complete it "
                              "first. Nothing was captured or changed")
@@ -1772,11 +1822,21 @@ class Controller:
         if folder.exists() and not folder.is_dir():
             raise UsageError(f"{option} refused: {folder} exists but is not a folder, so nothing can be captured there; "
                              "move it aside under supervision. Nothing was captured or changed")
-        if current and current.get("message_sha256") == message["sha256"]:
-            raise UsageError(f"{option} refused: this exact message is already the latest applied owner amendment "
-                             f"(revision {current['revision']}); nothing was captured or changed. Use an ordinary "
-                             "`resume` to continue")
+        if current and current.get("message_sha256") == message["sha256"] and current.get("source") == message["source"]:
+            # a replay of the same saved submission (same pending file, same bytes); a separately saved message with
+            # the same words is a new owner decision and becomes its own labeled entry
+            raise UsageError(f"{option} refused: this saved submission ({message['source']}) is already the latest "
+                             f"applied owner amendment (revision {current['revision']}); nothing was captured or "
+                             "changed. Use an ordinary `resume` to continue, or save a newly received owner message in "
+                             "a new file")
         document = self.amendment_document(message, current)
+        try:  # the publication policy that will render it in every later review request, checked while still pending
+            sanitize("\n".join(self.amendments_public_section(
+                {"amendment_revision": document["revision"], "amendment_sha256": document["sha256"]},
+                document["text"])))
+        except Stop as stop:
+            raise UsageError(f"{option} refused: the amended task could not be published in review requests "
+                             f"({stop.reason}); revise the saved text to be PR-safe. Nothing was captured or changed")
         path = self.guidance_path(document["sha256"], "amendments")
         if path.exists() and self.read_guidance_snapshot(document["sha256"], "amendments") is None:
             raise UsageError(f"{option} refused: the existing content file {path} for this document's digest does not "
@@ -1884,10 +1944,7 @@ class Controller:
             else:  # requested or reviewing with every attempt ended (admission checked)
                 active["status"] = "superseded"
                 invalidated.append(f"round {active['round']} request")
-                request = s.get("publications", {}).get(f"r{active['round']:02d}-request")
-                if request and request["state"] == "pending" and not any(
-                        q.get("comment_id") or q.get("posting_since") for q in request["parts"]):
-                    request["state"] = "superseded"  # never sent: withdrawn, not posted for a round that will not run
+                self.retire_request(active, why)
             s["active_round"] = None
         receipts = [k for k, p in s.get("publications", {}).items()
                     if k.startswith("final-status-") and VERDICT_KEY_RE.match(k) and p["state"] != "superseded"]
@@ -1898,8 +1955,17 @@ class Controller:
             s.setdefault("superseded_handoffs", []).append({**handoff, "why": why, "at": now_iso()})
             invalidated.append("owner-review handoff")
         if s.get("ready_review"):
-            s.setdefault("superseded_ready", []).append({**s["ready_review"], "why": why, "at": now_iso()})
+            ready = s["ready_review"]
+            s.setdefault("superseded_ready", []).append({**ready, "why": why, "at": now_iso()})
             invalidated.append("ready result")
+            verdict = s.get("publications", {}).get(f"r{ready['round']:02d}-review")
+            if not (receipts or handoff) and verdict and any(q.get("comment_id") for q in verdict["parts"]):
+                # the accepted ready verdict is public but no handoff receipt exists yet: say it is no longer current
+                self.queue(f"r{ready['round']:02d}-ready-superseded",
+                           f"### Workflow — correction — round {ready['round']} ready verdict is not current\n\nThe "
+                           f"`ready_for_owner_review` decision above for `{short(ready['H'])}` no longer applies: {why}. "
+                           "The review is preserved for the record; the work returns to development under the amended "
+                           "task.\n\n_Automated workflow status; not a human review._\n")
         if receipts or handoff:
             self.queue_status("REOPENED", f"The owner amended the task (owner amendment {n}). The earlier owner-review "
                                           "handoff is preserved above and is no longer current; the work returns to "
@@ -1909,6 +1975,23 @@ class Controller:
         self.transition("develop", f"{why}; invalidated: {', '.join(invalidated) or 'nothing outstanding'}",
                         save=False)
         return invalidated
+
+    def retire_request(self, rnd, why):
+        """A superseded round's review request (inside the caller's transaction): parts not yet sent are never sent,
+        and any part already on the PR gets a queued public correction; the delivered parts stay the archived
+        record (the existing superseded-publication archive rule)."""
+        request = self.state.get("publications", {}).get(f"r{rnd['round']:02d}-request")
+        if not request or request["state"] == "superseded":
+            return
+        delivered = [q for q in request["parts"] if q.get("comment_id")]
+        if delivered:
+            self.queue(f"r{rnd['round']:02d}-request-withdrawn",
+                       f"### Workflow — correction — round {rnd['round']} review request is withdrawn\n\nThe review "
+                       f"request posted (in whole or in part: {len(delivered)} of {len(request['parts'])} part(s)) for "
+                       f"`{short(rnd['H'])}` will not be reviewed: {why}. It is preserved for the record; any part not "
+                       "yet posted will not be sent.\n\n_Automated workflow status; not a human review._\n")
+        request["state"] = "superseded"
+        request["visible_parts"] = len(delivered)
 
     def pr_view(self):
         number = self.state["pr"]["number"]
@@ -2012,6 +2095,9 @@ class Controller:
         record = pubs.get(key)
         if record is None:
             text, redactions = sanitize(body)
+            # one line-ending form for the digest, the outbox file and its re-read (outbox_body reads with universal
+            # newlines): a CR/CRLF in model-authored text (e.g. a reviewer rationale) must not fail the integrity check
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
             chunks = [text[i:i + COMMENT_LIMIT] for i in range(0, len(text), COMMENT_LIMIT)] or [""]
             parts = []
             for index, chunk in enumerate(chunks, 1):
@@ -2186,10 +2272,14 @@ class Controller:
             if self.state["mode"] == "headless" else (None, None)
         provenance = self.verify_foreground_developer() if self.state["mode"] == "foreground" else \
             (self.state["developer"].get("log") or [{}])[-1]
-        self.state.setdefault("reports", []).append({"at": now_iso(), "report": report})
+        # every stored report keeps the instructions its returning invocation was given (history, never freshness)
+        bindings = {"guidance_revision": report_binding[0], "guidance_sha256": report_binding[1],
+                    "amendment_revision": report_amendments[0], "amendment_sha256": report_amendments[1]}
+        self.state.setdefault("reports", []).append({"at": now_iso(), "report": report, **bindings})
         if report["status"] != "checkpoint_ready" or report["runtime_restoration"] == "pending":
             self.state["last_report"] = report  # stops are remembered; ready reports only once accepted
             self.state["last_report_for"] = None
+            self.state["last_report_instructions"] = bindings  # always the bindings of the report last_report names
         self.save()
         if report["runtime_restoration"] == "pending":
             raise Stop("PAUSED", "developer reports a runtime restoration still pending; it must finish first")
@@ -2238,6 +2328,7 @@ class Controller:
             ledger[item["finding_id"]].setdefault("dispositions", []).append({"round": self.last_round_no(), **item})
         # the report answers the owner guidance current when it was accepted; a later revision needs a fresh report
         self.state.update(last_report=report, last_report_for=head, last_report_provenance=provenance,
+                          last_report_instructions=bindings,
                           last_report_guidance={"guidance_revision": report_binding[0],
                                                 "guidance_sha256": report_binding[1]},
                           last_report_amendments={"amendment_revision": report_amendments[0],
@@ -3551,14 +3642,21 @@ class Controller:
         try:
             document = admission["document"]
             self.stage_guidance(document, kind="amendments")
-            self.stop_path.unlink(missing_ok=True)
             with self.txn():
                 self.rebind_settings_if_needed()
+                self.record_confirmed_deliveries(admission.get("confirmed") or [])
                 rec = self.select_amendment(document, reason)
                 invalidated = self.apply_amendment(rec)
+                # last, after the retirement observations (which may read the PR) and immediately before the commit:
+                # runtime lock files can be shared with other projects' enrollments
+                if self.runtime_active():
+                    raise RefusedUnchanged("--amend-mission refused: a runtime transaction lock appeared ("
+                                           + ", ".join(self.cfg.get("runtime_lock_paths", [])) + "); let it restore "
+                                           "first. Nothing was selected or changed")
                 self._resume_updates(reason, None, f"; owner amendment {rec['revision']} applied (amendments sha256 "
                                      f"{short(rec['sha256'])}" + (f"; invalidated {', '.join(invalidated)}"
                                                                     if invalidated else "") + ")")
+            self.stop_path.unlink(missing_ok=True)  # consumed only once the application is committed
         finally:
             self.release_guidance_admission()
         return self._continue_after_resume()

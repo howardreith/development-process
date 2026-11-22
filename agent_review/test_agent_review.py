@@ -188,8 +188,9 @@ def review_result(request, decision, findings=(), assessments=()):
             "checkpoint_id": request["checkpoint_id"], "checkpoint_type": request["checkpoint_type"],
             "candidate_commit": request["H"], "decision": decision, "decision_rationale": "simulated response",
             "findings": list(findings),
-            "prior_finding_assessments": [{"finding_id": f, "assessment": a, "rationale": "simulated"}
-                                          for f, a in assessments],
+            "prior_finding_assessments": [{"finding_id": a[0], "assessment": a[1],
+                                           "rationale": a[2] if len(a) > 2 else "simulated"}
+                                          for a in assessments],
             "evidence_assessment": {"inspected": ["feature.txt"], "executed_verification": [],
                                     "source_inspection_only": ["feature.txt"], "required_gaps": [], "limitations": []},
             "summary": {"delivered_behavior": "simulated", "scope_reviewed": "simulated", "pending_later_phase_work": [],
@@ -4767,6 +4768,11 @@ class ResumeGuidanceTests(Base):
         self.blocked(env)
         state = ar.read_json(env.dir / "state.json")  # simulate a state file written before this change
         state.pop("last_report_guidance")
+        state.pop("last_report_instructions", None)  # report-history bindings did not exist either
+        state.pop("last_report_amendments", None)
+        for entry in state.get("reports", []):
+            for key in ("guidance_revision", "guidance_sha256", "amendment_revision", "amendment_sha256"):
+                entry.pop(key, None)
         for rnd in state["rounds"]:
             for key in ("guidance_revision", "guidance_sha256"):
                 rnd.pop(key)
@@ -5883,6 +5889,9 @@ class OwnerAmendmentTests(OwnerFlowFixture, Base):
             self.assertEqual("amended", after["develop_context"])
             self.assertIn("owner amendment 1", after["superseded_ready"][-1]["why"])
             self.assertFalse(self.headings_with(env, "awaiting owner review"))
+            # the accepted ready verdict was already public: it gets a visible supersession before any handoff exists
+            self.assertTrue(self.headings_with(env, "Codex GPT-6.2 Astra — review — round 2"))
+            self.assertEqual(1, len(self.headings_with(env, "round 2 ready verdict is not current")))
 
         with self.subTest("review: a validated result whose publication failed"):
             env = Env("headless")
@@ -5996,11 +6005,30 @@ class OwnerAmendmentTests(OwnerFlowFixture, Base):
         self.assertEqual((2, rec2["sha256"]), (env.reviewer.calls[-1]["request"]["amendment_revision"],
                                                env.reviewer.calls[-1]["request"]["amendment_sha256"]))
 
+    GATE = {"gates": {"check": {"argv": [sys.executable, "-c", "print('Ran 1 test'); print('OK')"],
+                                "timeout_minutes": 5}}, "required_gates": ["check"]}
+    ASSESSMENT = ("OWNER AMENDMENT 1 withdrew requirement X, which is exactly what R1-F1 required; the remaining "
+                  "phase-1 behavior is sound under the effective task (simulated assessment)")
+
+    @staticmethod
+    def gated(checkpoint, edit=None, dispositions=lambda sha: ()):
+        """A developer invocation that commits, pushes and runs the project's required gate through the controller
+        (the developer's `verify`) before reporting; edit=None reports the unchanged candidate."""
+        def act(e):
+            sha = e.commit(*edit) if edit else None
+            if edit:
+                e.push()
+            e.controller().run_gate("check")
+            return report(e, checkpoint, dispositions(sha))
+        return act
+
     def test_a_withdrawn_requirement_needs_a_cited_rebuttal_and_reviewer_assessment_while_an_unrelated_defect_blocks(self):
-        env = self.env
+        env = Env("headless", cfg_overrides=self.GATE)  # a real, non-empty required project gate
+        self.addCleanup(env.cleanup)
+        self.assertEqual(["check"], self.state(env)["project"]["required_gates"])
         withdrawn, unrelated = finding("R1-F1"), finding("R1-F2")
         withdrawn["title"], unrelated["title"] = "requirement X is not implemented", "feature.txt has a defect"
-        env.developer.script += [self.work("phase1.txt", "phase-1"), self.paused()]
+        env.developer.script += [self.gated("phase-1", ("phase1.txt", "p1\n", "phase 1")), self.paused()]
         env.reviewer.script += [{"decision": "changes_required", "findings": [withdrawn, unrelated],
                                  "override": {"decision_rationale": self.CONTINUATION}}]
         code, out = self.run_command(env.controller())
@@ -6009,34 +6037,51 @@ class OwnerAmendmentTests(OwnerFlowFixture, Base):
         settings = (before["developer_settings_file"], before["developer_settings_sha256"])
         cfg = before["project"]
         devs = len(env.developer.calls)
-        seen = {}
+        seen, reviews_at_rejection = {}, {}
+        cite = {"finding_id": "R1-F1", "disposition": "rebutted", "commits": [],
+                "evidence": "OWNER AMENDMENT 1 withdrew requirement X; the finding was valid under the original "
+                            "mission and no longer applies (simulated)"}
 
-        def dispose(e):
+        def dispose_without_gate(e):  # a new candidate reported before its required receipt exists
             seen.update(self.state(e))  # what the application persisted when this invocation launched
             sha = e.commit("feature.txt", "partial attempt\n", "attempt R1-F2")
             e.push()
-            cite = {"finding_id": "R1-F1", "disposition": "rebutted", "commits": [],
-                    "evidence": "OWNER AMENDMENT 1 withdrew requirement X; the finding was valid under the original "
-                                "mission and no longer applies (simulated)"}
+            reviews_at_rejection["n"] = len(e.reviewer.calls)
             return report(e, "phase-1", [cite, fixed("R1-F2", sha)])
 
-        def fix_for_real(e):
-            sha = e.commit("feature.txt", "corrected\n", "fix R1-F2")
-            e.push()
-            return report(e, "phase-1", [fixed("R1-F2", sha)])
-        env.developer.script += [dispose, fix_for_real, self.work("final.txt", "final")]
+        def dispose_after_gate(e):  # the report-correction invocation: same candidate, now with its receipt
+            e.controller().run_gate("check")
+            sha = git(e.work, "rev-parse", "HEAD")
+            return report(e, "phase-1", [cite, fixed("R1-F2", sha)])
+        env.developer.script += [dispose_without_gate, dispose_after_gate,
+                                 self.gated("phase-1", ("feature.txt", "corrected\n", "fix R1-F2"),
+                                            lambda sha: [fixed("R1-F2", sha)]),
+                                 self.gated("final", ("final.txt", "f\n", "final"))]
         restated = dict(unrelated, actual="still defective (simulated)")
         env.reviewer.script += [
             # attempt 1 (simulated): a pass while the unrelated blocker is still open is rejected by validation
             {"decision": "checkpoint_passed", "findings": [restated],
-             "assessments": [("R1-F1", "rebuttal_accepted"), ("R1-F2", "fix_rejected")]},
+             "assessments": [("R1-F1", "rebuttal_accepted", self.ASSESSMENT), ("R1-F2", "fix_rejected")]},
             {"decision": "changes_required", "findings": [restated],
-             "assessments": [("R1-F1", "rebuttal_accepted"), ("R1-F2", "fix_rejected")]},
+             "assessments": [("R1-F1", "rebuttal_accepted", self.ASSESSMENT), ("R1-F2", "fix_rejected")]},
             {"decision": "checkpoint_passed", "assessments": [("R1-F2", "fix_verified")]},
             {"decision": "ready_for_owner_review"}]
         code, out = self.resume(env.controller(), "owner withdraws requirement X",
                                 amendment=self.doc(env, "withdraw.md", self.WITHDRAW))
         self.assertEqual((ar.EXIT_OK, "AWAITING_OWNER_REVIEW"), (code, out["result"]))
+        # the required gate was enforced on the amended candidate: rejected before any reviewer dispatch, then the
+        # report-correction invocation carried the selected amendment and proceeded with the real receipt
+        correction = env.developer.calls[devs + 1]
+        self.assertIn("rejected your last report", correction["prompt"])
+        self.assertIn("passing controller-run gates on this candidate: check", correction["prompt"])
+        self.assertIn(self.WITHDRAW, correction["prompt"])
+        self.assertEqual(1, reviews_at_rejection["n"])  # only round 1 had been reviewed when the report was rejected
+        r2 = self.state(env)["rounds"][1]  # round 2 reviewed the amended candidate with its passing receipt
+        self.assertEqual([], env.controller().missing_gates(r2["H"]))
+        receipt = ar.read_json(sorted((env.dir / "evidence").glob(f"gate-check-{r2['H'][:12]}-*.json"))[-1])
+        self.assertEqual(("check", r2["H"], True), (receipt["gate"], receipt["candidate"], receipt["passed"]))
+        stored = [r for r in self.state(env)["reports"] if r["report"]["candidate_commit"] == r2["H"]]
+        self.assertEqual([1, 1], [r["amendment_revision"] for r in stored])  # the rejected and the corrected report
         # the application kept the spent counters, limits and configuration
         self.assertEqual((before["rounds_completed"], before["developer"]["invocations"] + 1, before["limits"]),
                          (seen["rounds_completed"], seen["developer"]["invocations"], seen["limits"]))
@@ -6064,6 +6109,11 @@ class OwnerAmendmentTests(OwnerFlowFixture, Base):
         self.assertEqual(("resolved", "rebuttal_accepted", "requirement X is not implemented", 1),
                          (f1["status"], f1["assessments"][-1]["assessment"], f1["finding"]["title"], f1["first_round"]))
         self.assertEqual(["rebutted"], [d["disposition"] for d in f1["dispositions"]])  # never recorded as fixed
+        self.assertEqual(self.ASSESSMENT, f1["assessments"][-1]["rationale"])  # retained: names the amendment
+        review2 = next(c["body"] for c in env.gh.comments_list if "Codex GPT-6.2 Astra — review — round 2" in c["body"])
+        self.assertIn(f"- **R1-F1** — `rebuttal_accepted` — {self.ASSESSMENT}", review2)  # published and archived
+        records = env.work / "docs" / "agent-reviews" / "pr-7"
+        self.assertIn(self.ASSESSMENT, next(records.glob("*-r02-review.md")).read_text(encoding="utf-8"))
         self.assertEqual(["fix_rejected", "fix_verified"], [a["assessment"] for a in f2["assessments"]])
         self.assertEqual(("accepted", "changes_required", ["R1-F2"]),
                          (state["rounds"][1]["status"], state["rounds"][1]["decision"], state["rounds"][1]["open_findings"]))
@@ -6125,9 +6175,15 @@ class OwnerAmendmentTests(OwnerFlowFixture, Base):
         reviewing = [{"round": 1, "status": "reviewing", "attempts": [{"n": 1, "started": ar.now_iso()}],
                       "H": "0" * 40, "checkpoint_id": "phase-1"}]  # simulated attempt without an end record
         publications = copy(original.get("publications", {}))
+        chunk = "simulated body whose POST outcome is unknown\n"  # simulated outbox record (labeled), absent on the PR
+        marker = f"<!-- agent-review:v1 enrollment={original['enrollment_id']} key=r09-request part=1/1 " \
+                 f"sha256={ar.sha256_text(chunk)} -->"
+        body_file = env.dir / "outbox" / "r09-request-part1.md"
+        ar.write_text(body_file, f"{marker}\n{chunk}")
         publications["r09-request"] = {"key": "r09-request", "state": "pending", "seq": 99, "redactions": [],
-                                       "parts": [{"marker": "m", "body_file": "x", "sha256": "0", "comment_id": None,
-                                                  "url": None, "posting_since": ar.now_iso()}]}  # simulated
+                                       "parts": [{"marker": marker, "body_file": str(body_file),
+                                                  "sha256": ar.sha256_text(chunk), "comment_id": None, "url": None,
+                                                  "posting_since": ar.now_iso()}]}
         for label, changes, expect in (  # every simulated state is labeled; the command path is real
                 ("ACTIVE (a run that has not stopped)", {"status": "ACTIVE"}, "safe stopping boundary"),
                 ("cancelled", {"status": "CANCELLED", "phase": "cancelled"}, "not permitted"),
@@ -6164,15 +6220,340 @@ class OwnerAmendmentTests(OwnerFlowFixture, Base):
                                 "--guidance", str(path), "--amend-mission", str(path)], root=env.wf)
             self.assertEqual((ar.EXIT_USAGE, before), (code, self.state_bytes(env)))
             self.assertIn("one at a time", err.getvalue())
-        with self.subTest("the same message twice"):
+        with self.subTest("a declared pending restoration without any lock file"):
+            last = {**original["last_report"], "runtime_restoration": "pending"}  # simulated stopped report (labeled)
+            refused({"last_report": last}, "restoration still pending")
+        with self.subTest("unpublishable text (a lone private-key opening delimiter)"):
+            # assembled at run time so that no source version carries the delimiter (the guarded push scans them)
+            unsafe = self.doc(env, "unsafe.md", "Quote this line verbatim: -----BEGIN RSA " + "PRIVATE KEY-----\n")
+            before = self.state_bytes(env)
+            with self.assertRaises(ar.UsageError) as refusal:
+                self.resume(env.controller(), amendment=unsafe)
+            self.assertIn("could not be published", str(refusal.exception))
+            self.assertEqual(before, self.state_bytes(env))
+            self.assertFalse((env.dir / "amendments").exists())
+            with self.assertRaises(ar.UsageError) as refusal:  # the same policy guards guidance (neighbor path)
+                self.resume(env.controller(), guidance=unsafe)
+            self.assertIn("could not be published", str(refusal.exception))
+            self.assertEqual(before, self.state_bytes(env))
+        with self.subTest("a replay of the same saved submission"):
             env.developer.script += [self.paused()]
             self.assertEqual(ar.EXIT_PAUSED, self.resume(env.controller(), "apply", amendment=path)[0])
             ar.write_text(env.dir / "STOP", "owner stop (simulated)\n")
             before = self.state_bytes(env)
             with self.assertRaises(ar.UsageError) as refusal:
-                self.resume(env.controller(), "apply again", amendment=self.doc(env, "copy.md", self.A1))
+                self.resume(env.controller(), "apply again", amendment=path)
             self.assertIn("already the latest applied owner amendment", str(refusal.exception))
             self.assertEqual(before, self.state_bytes(env))
+
+
+class ContinuationCrlfTests(OwnerFlowFixture, Base):
+    def test_a_crlf_continuation_is_published_delivered_unchanged_archived_and_reaches_the_handoff(self):
+        env = self.env
+        crlf = self.CONTINUATION.replace("5c1e", "CRLF-77").replace("\n", "\r\n")  # simulated Codex output (labeled)
+
+        def correct(e):
+            sha = e.commit("feature.txt", "rewritten\n", "rewrite feature.txt (R1-F1)")
+            e.push()
+            return report(e, "phase-1", [fixed("R1-F1", sha)])
+        env.developer.script = [self.work("phase1.txt", "phase-1"), correct, self.work("final.txt", "final")]
+        env.reviewer.script = [{"decision": "changes_required", "findings": [finding("R1-F1")],
+                                "override": {"decision_rationale": crlf}},
+                               {"decision": "checkpoint_passed", "assessments": [("R1-F1", "fix_verified")]},
+                               {"decision": "ready_for_owner_review"}]
+        code, out = self.run_command(env.controller())
+        self.assertEqual((ar.EXIT_OK, "AWAITING_OWNER_REVIEW"), (code, out["result"]))
+        state = self.state(env)
+        private = json.loads(Path(state["rounds"][0]["envelope_path"]).read_bytes())
+        self.assertEqual(crlf, private["result"]["decision_rationale"])  # the private rationale is exact
+        self.assertIn(crlf, env.developer.calls[1]["prompt"])  # given unchanged to the developer
+        review = next(c["body"] for c in env.gh.comments_list if "Codex GPT-6.2 Astra — review — round 1" in c["body"])
+        self.assertNotIn("\r", review)  # the public rendering uses LF and passed its integrity check
+        self.assertIn(crlf.replace("\r\n", "\n").strip(), review)
+        records = env.work / "docs" / "agent-reviews" / "pr-7"
+        self.assertIn("DISTINCTIVE-CONTINUATION-CRLF-77", next(records.glob("*-r01-review.md")).read_text(encoding="utf-8"))
+        archived = json.loads(next(records.glob("*-r01-review-envelope.json")).read_text(encoding="utf-8"))
+        self.assertEqual(crlf, archived["result"]["decision_rationale"])  # JSON keeps the escaped CR LF
+        self.assertTrue(env.controller().status(remote=True)["handoff_current"])
+
+
+class AmendmentBoundaryTests(OwnerFlowFixture, Base):
+    """Round-1 corrections: restoration and runtime boundaries, delivery reconciliation, public retirement of
+    superseded work, distinct owner messages, stopped handoffs, report history, status evidence and activation."""
+    A1 = "Owner amendment (simulated): add one more acceptance example.\n"
+
+    def validated_review_stop(self, env):
+        """Stopped in review with a validated phase-1 result whose verdict could not be posted (definitively)."""
+        env.developer.script += [self.work("phase1.txt", "phase-1")]
+        env.reviewer.script += [{"decision": "checkpoint_passed"}]
+        env.reviewer.during_run = lambda: setattr(env.gh, "fail_next", 99)
+        code, out = self.run_command(env.controller())
+        env.reviewer.during_run, env.gh.fail_next = None, 0
+        self.assertEqual(ar.EXIT_PAUSED, code)
+        self.assertEqual("validated", self.state(env)["rounds"][-1]["status"])
+
+    def test_a_pending_restoration_and_a_late_runtime_lock_keep_the_update_pending(self):
+        env = self.env
+        env.developer.script += [lambda e: report(e, "phase-1", status="paused", restoration="pending")]
+        code, out = self.run_command(env.controller())
+        self.assertEqual(ar.EXIT_PAUSED, code)
+        self.assertIn("runtime restoration still pending", out["reason"])
+        self.assertFalse((env.root / "runtime.lock").exists())  # no lock file: only the report says so
+        path = self.doc(env, "a1.md", self.A1)
+        before, calls = self.state_bytes(env), len(env.developer.calls)
+        with self.assertRaises(ar.UsageError) as refusal:
+            self.resume(env.controller(), amendment=path)
+        self.assertIn("restoration still pending", str(refusal.exception))
+        self.assertEqual((before, calls), (self.state_bytes(env), len(env.developer.calls)))
+
+        env2 = Env("headless")  # a shared runtime lock appears during the application's last publication lookup
+        self.addCleanup(env2.cleanup)
+        self.validated_review_stop(env2)
+        ar.write_text(env2.dir / "STOP", "owner update pending (simulated)\n")
+        lock = env2.root / "runtime.lock"
+
+        def comments(number):  # simulated: another project's enrollment takes the shared lock meanwhile
+            lock.write_text("simulated shared runtime transaction\n", encoding="utf-8")
+            return FakeGitHub.comments(env2.gh, number)
+        env2.gh.comments = comments
+        path2 = self.doc(env2, "a1.md", self.A1)
+        before, calls, posted = self.state_bytes(env2), len(env2.developer.calls), len(env2.gh.comments_list)
+        try:
+            with self.assertRaises(ar.UsageError) as refusal:
+                self.resume(env2.controller(), amendment=path2)
+        finally:
+            del env2.gh.comments
+        self.assertIn("runtime transaction lock appeared", str(refusal.exception))
+        self.assertEqual((before, calls, posted), (self.state_bytes(env2), len(env2.developer.calls),
+                                                   len(env2.gh.comments_list)))
+        self.assertTrue((env2.dir / "STOP").exists())
+        lock.unlink()
+        env2.developer.script += [self.paused()]
+        self.assertEqual(ar.EXIT_PAUSED, self.resume(env2.controller(), amendment=path2)[0])
+        self.assertEqual(1, self.state(env2)["amendments"]["current"])
+
+    def test_a_lost_post_response_is_reconciled_before_application_and_the_obsolete_request_is_withdrawn(self):
+        env = self.env
+        hidden = {"on": True}
+
+        def comments(number):  # simulated listing lag: the stored request is not yet visible
+            return [c for c in FakeGitHub.comments(env.gh, number)
+                    if not (hidden["on"] and "review request — round 1" in c["body"])]
+        env.gh.comments = comments
+        env.gh.lose_next_response = 1  # simulated: the request POST is stored but its response is lost
+        env.developer.script += [self.work("phase1.txt", "phase-1")]
+        code, out = self.run_command(env.controller())
+        self.assertEqual(ar.EXIT_PAUSED, code)
+        self.assertIn("ambiguous", out["reason"])
+        part = self.state(env)["publications"]["r01-request"]["parts"][0]
+        self.assertTrue(part["posting_since"] and not part["comment_id"])
+        path = self.doc(env, "a1.md", self.A1)
+        before = self.state_bytes(env)
+        with self.assertRaises(ar.UsageError) as refusal:  # still not visible: ambiguous, refused unchanged
+            self.resume(env.controller(), amendment=path)
+        self.assertIn("uncertain", str(refusal.exception))
+        self.assertEqual(before, self.state_bytes(env))
+        hidden["on"] = False  # the stored comment becomes visible
+        env.developer.script += [self.paused()]
+        try:
+            code, out = self.resume(env.controller(), amendment=path)
+        finally:
+            del env.gh.comments
+        self.assertEqual(ar.EXIT_PAUSED, code)
+        state = self.state(env)
+        request = state["publications"]["r01-request"]
+        self.assertEqual(("superseded", 1), (request["state"], request["visible_parts"]))
+        self.assertTrue(request["parts"][0]["comment_id"])
+        self.assertEqual(1, len(self.headings_with(env, "review request — round 1")))  # never re-posted
+        self.assertEqual(1, len(self.headings_with(env, "round 1 review request is withdrawn")))
+        self.assertEqual([], env.reviewer.calls)  # no obsolete review
+        self.assertIn(self.A1, env.developer.calls[-1]["prompt"])
+
+    def test_a_partly_delivered_request_keeps_its_delivered_part_and_never_sends_the_rest(self):
+        env = self.env
+
+        def big(e):  # a report long enough to split its review request into two parts
+            e.commit("phase1.txt", "p1\n", "phase 1")
+            e.push()
+            r = report(e, "phase-1")
+            r["summary"] = "simulated long summary " + "x" * (ar.COMMENT_LIMIT + 100)
+            return r
+        env.developer.script += [big]
+        # simulated outage after the first part: the second part is definitively rejected on every attempt
+        env.gh.on_post = lambda rec: setattr(env.gh, "fail_next", 99) if "part=1/2" in rec["body"] else None
+        code, out = self.run_command(env.controller())
+        env.gh.on_post, env.gh.fail_next = None, 0
+        self.assertEqual(ar.EXIT_PAUSED, code)
+        parts = self.state(env)["publications"]["r01-request"]["parts"]
+        self.assertEqual((2, True, None), (len(parts), bool(parts[0]["comment_id"]), parts[1]["comment_id"]))
+        env.developer.script += [self.paused()]
+        self.assertEqual(ar.EXIT_PAUSED, self.resume(env.controller(), amendment=self.doc(env, "a1.md", self.A1))[0])
+        posted = [c["body"] for c in env.gh.comments_list if "key=r01-request " in c["body"]]
+        self.assertEqual(1, len(posted))  # part two was never sent after supersession
+        self.assertIn("part=1/2", posted[0])
+        self.assertEqual(1, len(self.headings_with(env, "round 1 review request is withdrawn")))
+        self.assertEqual([], env.reviewer.calls)
+        env.controller().archive("manual")  # the delivered part is the archived record
+        record = next((env.work / "docs" / "agent-reviews" / "pr-7").glob("*-r01-request.md")).read_text(encoding="utf-8")
+        self.assertIn("Superseded record: 1 of 2 part(s) were published", record)
+        self.assertEqual(1, sum("key=r01-request " in c["body"] for c in env.gh.comments_list))
+
+    def test_identical_words_received_again_become_a_new_entry_while_a_replay_is_refused(self):
+        env = self.env
+        first = self.doc(env, "20261122T100000Z.md", self.A1)
+        env.developer.script += [self.paused()]
+        self.pause_in_develop_quick(env)
+        env.developer.script += [self.work("example.txt", "phase-1")]  # the requested work is completed and reviewed
+        env.reviewer.script += [{"decision": "blocked"}]
+        code, out = self.resume(env.controller(), "first decision", amendment=first)
+        self.assertEqual(ar.EXIT_BLOCKED, code)
+        with self.assertRaises(ar.UsageError):  # the same saved submission again: a replay
+            self.resume(env.controller(), "replay", amendment=first)
+        second = self.doc(env, "20261122T120000Z.md", self.A1)  # a newly received decision, same words
+        env.developer.script += [self.paused()]
+        self.assertEqual(ar.EXIT_PAUSED, self.resume(env.controller(), "second decision", amendment=second)[0])
+        state = self.state(env)
+        rec = state["amendments"]["revisions"][-1]
+        data = (env.dir / "amendments" / f"{rec['sha256']}.md").read_bytes()
+        self.assertEqual(2, data.count(self.A1.encode()))
+        self.assertLess(data.index(b"BEGIN OWNER AMENDMENT 1 ("), data.index(b"BEGIN OWNER AMENDMENT 2 ("))
+        self.assertEqual(2, env.developer.calls[-1]["prompt"].count(self.A1))
+
+    def pause_in_develop_quick(self, env):
+        code, out = self.run_command(env.controller())
+        self.assertEqual(ar.EXIT_PAUSED, code)
+
+    def test_a_handoff_paused_by_an_operational_failure_and_an_ended_attempt_with_a_reused_pid_are_eligible(self):
+        env = self.env
+        self.to_handoff(env)
+
+        def failing_pr(number):
+            raise OSError("simulated temporary PR read failure")
+        env.gh.pr = failing_pr
+        try:
+            code, out = self.resume(env.controller(), "ordinary resume")
+        finally:
+            del env.gh.pr
+        self.assertEqual(ar.EXIT_PAUSED, code)
+        state = self.state(env)
+        self.assertEqual(("PAUSED", "done", True), (state["status"], state["phase"], bool(state["handoff"])))
+        reviews = len(env.reviewer.calls)
+        env.developer.script += [self.paused("final")]
+        self.assertEqual(ar.EXIT_PAUSED, self.resume(env.controller(), amendment=self.doc(env, "a1.md", self.A1))[0])
+        state = self.state(env)
+        self.assertEqual((None, "develop", reviews), (state["handoff"], state["phase"], len(env.reviewer.calls)))
+        self.assertEqual(1, len(self.headings_with(env, "the owner-review handoff above is not current")))
+
+        env2 = Env("headless")  # three invalid reviewer outputs: stopped in review with ended attempts
+        self.addCleanup(env2.cleanup)
+        env2.developer.script += [self.work("phase1.txt", "phase-1")]
+        env2.reviewer.script += [{"raw": "not json (simulated)"}] * 3
+        code, out = self.run_command(env2.controller())
+        self.assertEqual(ar.EXIT_BLOCKED, code)
+        state = self.state(env2)
+        self.assertEqual(("review", "reviewing", 3), (state["phase"], state["rounds"][-1]["status"],
+                                                      len(state["rounds"][-1]["attempts"])))
+        state["rounds"][-1]["attempts"][-1]["pid"] = os.getpid()  # labeled: a live, unrelated process reuses the PID
+        ar.atomic_write_json(env2.dir / "state.json", state)
+        env2.developer.script += [self.paused()]
+        self.assertEqual(ar.EXIT_PAUSED, self.resume(env2.controller(), amendment=self.doc(env2, "a1.md", self.A1))[0])
+        state = self.state(env2)
+        self.assertEqual(("superseded", 3), (state["rounds"][-1]["status"], len(env2.reviewer.calls)))
+        self.assertEqual(1, len(self.headings_with(env2, "round 1 review request is withdrawn")))
+
+    def test_report_history_keeps_bindings_and_status_distinguishes_reviewer_delivery(self):
+        env = self.env
+        a1, a2 = self.doc(env, "a1.md", self.A1), self.doc(env, "a2.md", "Owner amendment (simulated): also X.\n")
+        env.developer.script += [self.paused()]
+        self.pause_in_develop_quick(env)
+
+        def ready_then_stop(e):  # a ready report under revision 1, then the supervisor's stop before any request
+            ar.write_text(e.dir / "STOP", "owner update pending (simulated)\n")
+            return report(e, "phase-1")
+        env.developer.script += [ready_then_stop]
+        code, out = self.resume(env.controller(), "first update", amendment=a1)
+        self.assertEqual(ar.EXIT_PAUSED, code)
+        state = self.state(env)
+        self.assertEqual(("review", []), (state["phase"], state["rounds"]))
+        env.developer.script += [self.paused()]
+        self.assertEqual(ar.EXIT_PAUSED, self.resume(env.controller(), "second update", amendment=a2)[0])
+        state = ar.read_json(env.dir / "state.json")  # restart: what persisted
+        revs = {r["revision"]: r["sha256"] for r in state["amendments"]["revisions"]}
+        self.assertEqual([("paused", None, "none"), ("checkpoint_ready", 1, revs[1]), ("paused", 2, revs[2])],
+                         [(r["report"]["status"], r["amendment_revision"], r["amendment_sha256"] or "none")
+                          for r in state["reports"]])
+        self.assertEqual((2, revs[2]), (state["last_report_instructions"]["amendment_revision"],
+                                        state["last_report_instructions"]["amendment_sha256"]))
+        self.assertEqual("paused", state["last_report"]["status"])
+        self.assertIsNone(state["last_report_for"])  # the freshness guard: the stopped report is not reviewable
+        ctl = env.controller()
+        ctl.transition("review", "simulated: review requested without a fresh report")
+        self.assertEqual("needs_report", ctl.review_round())
+
+        def ready_publication_fails(e):  # a fresh revision-2 report; then GitHub rejects the review request
+            setattr(e.gh, "fail_next", 99)
+            return report(e, "phase-1")
+        env.developer.script += [ready_publication_fails]
+        code, out = self.resume(env.controller(), "continue under revision 2")
+        env.gh.fail_next = 0
+        self.assertEqual(ar.EXIT_PAUSED, code)
+        a = out["amendments"]
+        self.assertEqual((True, True), (a["latest_developer_invocation"]["returned"],
+                                        a["latest_developer_invocation"]["matches_selected"]))
+        self.assertEqual((True, None), (a["latest_review_round"]["matches_selected"],
+                                        a["latest_review_round"]["latest_attempt"]))  # allocated; no reviewer input
+        env.reviewer.script += [{"decision": "blocked"}]
+        code, out = self.resume(env.controller(), "publication outage over")
+        self.assertEqual(ar.EXIT_BLOCKED, code)
+        attempt = out["amendments"]["latest_review_round"]["latest_attempt"]
+        self.assertEqual((True, True), (attempt["process_start_recorded"], attempt["ok"]))
+        self.assertTrue(attempt["ended_at"])
+        self.assertIn("Owner amendment (simulated): also X.", env.reviewer.calls[-1]["amendments"].decode())
+
+    def test_activation_at_a_handoff_reaches_a_stopped_boundary_without_dispatching_the_old_review(self):
+        env = self.env
+        self.to_handoff(env)
+        ar.write_text(env.dir / "STOP", "activate the amendment-capable controller (simulated)\n")  # `stop`
+        prompt = env.wf / "prompts" / "reviewer.md"  # a reviewed new version (simulated: changed workflow bytes)
+        prompt.write_text(prompt.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+        ctl = env.controller()
+        with ctl.lock("activate"):  # the `activate` command path
+            ctl.reload()
+            ctl.assert_claims()
+            ctl.activate()
+            ctl.settle_after_activation()
+        state = self.state(env)
+        self.assertEqual(("ACTIVE", "review", None), (state["status"], state["phase"], state["ready_review"]))
+        path = self.doc(env, "a1.md", self.A1)
+        with self.assertRaises(ar.UsageError) as refusal:  # ACTIVE: not yet a stopped boundary
+            self.resume(env.controller(), amendment=path)
+        self.assertIn("safe stopping boundary", str(refusal.exception))
+        reviews = len(env.reviewer.calls)
+        code, out = self.run_command(env.controller())  # documented branch (b): `run` pauses at once on the stop file
+        self.assertEqual(ar.EXIT_PAUSED, code)
+        self.assertIn("stop requested", out["reason"])
+        self.assertEqual(reviews, len(env.reviewer.calls))
+        env.developer.script += [self.paused("final")]
+        self.assertEqual(ar.EXIT_PAUSED, self.resume(env.controller(), amendment=path)[0])
+        self.assertEqual(reviews, len(env.reviewer.calls))  # the old review was never dispatched
+        self.assertIn(self.A1, env.developer.calls[-1]["prompt"])
+
+    def test_an_exhausted_invocation_budget_is_not_lifted_by_max_rounds(self):
+        env = self.env
+        env.developer.script += [self.paused()]
+        self.pause_in_develop_quick(env)
+        state = self.state(env)  # labeled: the developer-invocation cap is reached at this stop
+        state["limits"]["max_developer_invocations"] = state["developer"]["invocations"]
+        ar.atomic_write_json(env.dir / "state.json", state)
+        calls = len(env.developer.calls)
+        code, out = self.resume(env.controller(), "owner update", amendment=self.doc(env, "a1.md", self.A1))
+        self.assertEqual(ar.EXIT_BLOCKED, code)
+        self.assertIn("developer invocation budget exhausted", out["reason"])
+        self.assertEqual(1, out["amendments"]["selected"]["revision"])  # applied, not delivered
+        code, out = self.resume(env.controller(), "owner extends review rounds", max_rounds=9)
+        self.assertEqual(ar.EXIT_BLOCKED, code)  # the review-round remedy does not lift the invocation cap
+        self.assertIn("developer invocation budget exhausted", out["reason"])
+        self.assertEqual(calls, len(env.developer.calls))
 
 
 class ToolTranscriptTests(unittest.TestCase):

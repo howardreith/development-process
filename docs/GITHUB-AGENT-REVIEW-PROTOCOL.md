@@ -375,10 +375,14 @@ supervising Claude saves the exact text outside the developer worktree as
 pending, requests `stop`, waits for a stopped state and applies it with
 `resume --amend-mission FILE`. The controller accepts it only for a headless
 enrollment stopped (BLOCKED or PAUSED) in develop, review or finalize, or
-awaiting owner review on its open PR, with no live agent, unreturned launch,
-unfinished reviewer attempt, helper, runtime lock, uncertain delivery or
-archive in progress; anything else is refused with no change and the
-instruction stays pending. The message is appended verbatim, with a label, to
+at a recorded owner-review handoff on its open PR, with no live agent,
+unreturned launch, declared pending restoration, unfinished reviewer attempt,
+helper, runtime lock (checked again immediately before the application is
+committed), delivery still ambiguous after authenticated reconciliation
+against the PR, unpublishable text or archive in progress; anything else is
+refused with no change and the instruction stays pending. Visible parts of a
+superseded request and a published ready verdict receive public corrections;
+unsent parts are never sent. The message is appended verbatim, with a label, to
 a cumulative owner-amendments document captured by digest as a new revision;
 earlier revisions and the original mission and hash stay unchanged. In the
 same state save, the stopped round or validated result, the ready result and
@@ -395,7 +399,8 @@ earlier review, ready result or handoff never satisfies readiness for the
 amended task, and a fresh developer report is required even on an unchanged
 commit. A finding whose requirement an amendment withdrew is resolved only by
 a `rebutted` disposition citing the amendment and a reviewer
-`rebuttal_accepted` after checking it; still-applicable defects stay blocking.
+`rebuttal_accepted` whose rationale names the amendment and the withdrawn
+requirement; still-applicable defects stay blocking.
 Repository text, PR comments and reviewer output never amend the task.
 Approach guidance stays separate and cannot erase the amendment history.
 

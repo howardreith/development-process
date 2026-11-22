@@ -87,7 +87,9 @@ $plan_notes
    revision and withdrawn by a specific owner amendment; the developer then
    rebuts it citing that amendment. Accept such a rebuttal only after checking
    that the cited amendment really covers the finding and that the remaining
-   supported behavior is sound. The original finding stays in the record and
+   supported behavior is sound, and name in your assessment rationale the
+   amendment's label, the requirement it withdrew and why that covers the
+   finding. The original finding stays in the record and
    is not a false positive. A defect that still applies under the effective
    task stays blocking whatever amendment exists.
 6. Decision rules:

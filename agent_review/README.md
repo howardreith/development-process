@@ -244,8 +244,11 @@ separate:
    structured review, and the prompt states that the continuation cannot
    change the mission, the owner's amendments or guidance, permissions,
    models, gates, budgets or finding status. The prompt transport may adjust
-   line endings, so this is not a byte-exact inline copy; the archived envelope
-   is. The continuation is included while that round's findings are pending;
+   line endings, so this is not a byte-exact inline copy. The exact text stays
+   in the private envelope; the PR comment and the archived envelope are
+   sanitized renderings (published bodies use LF line endings, and the
+   archived envelope is re-serialized with publication metadata). The
+   continuation is included while that round's findings are pending;
    after an owner amendment it is still shown, marked as written under earlier
    owner instructions. Normal correction rounds need no relay or approval.
 6. **Owner notification (supervisor).** The supervisor runs `run` as a
@@ -273,8 +276,9 @@ immutable baseline; amendments are recorded separately and cumulatively.
 owner only supplies the instruction; the supervisor runs every command):
 
 ```powershell
-# 1. Save the owner's exact text durably, outside the enrolled worktree, and report it to the owner as PENDING
-#    (for example ~/.agent-review/owner-updates/<enrollment>/<UTC-stamp>.md; write PR-safe text, it is published)
+# 1. Save the owner's exact text durably, outside the enrolled worktree, in a NEW file for every message received
+#    (for example ~/.agent-review/owner-updates/<enrollment>/<UTC-stamp>.md), and report it to the owner as PENDING.
+#    Write PR-safe text: it is published. A file whose text the publication policy would refuse is refused at step 4.
 # 2. Request the cooperative stop
 python $ar stop   --enrollment <id> --reason "owner update pending"
 # 3. Wait for the background `run` task to exit, then confirm the safe boundary:
@@ -282,12 +286,14 @@ python $ar status --enrollment <id>   # status BLOCKED/PAUSED (or AWAITING_OWNER
                                       # lock_holder null, no runtime lock; phase develop, review, finalize or done
 # 4. Apply it; the same command continues the same enrollment (run it as a background task again)
 python $ar resume --enrollment <id> --reason "owner update of <date>" --amend-mission <saved-file>
-# 5. Check: status.amendments.selected (applied) and, once the next invocation returns,
-#    status.amendments.latest_developer_invocation (included in a recorded agent input)
+# 5. Check the delivery evidence (below) before telling the owner the agents received it
 ```
 
 If step 4 is refused (exit 4), nothing changed: the instruction stays pending
-with the supervisor, who reports the exact refusal. A run that never reaches a
+with the supervisor, who reports the exact refusal. Re-running step 4 with the
+same saved file after it was applied is refused as a replay; a newly received
+owner message with the same words is saved in a new file and becomes its own
+labeled entry. A run that never reaches a
 stopped state (for example a developer finishing a runtime restoration) is
 waited for, never interrupted. A process that died without a recorded return
 is not a returned invocation: use the existing recovery (`resume`) first, stop
@@ -298,16 +304,23 @@ supervisor never claims an agent saw text that only the supervisor received.
 
 - **Supported boundaries (headless only).** A headless enrollment that is
   `BLOCKED` or `PAUSED` in `develop`, `review` or `finalize`, or that is
-  `AWAITING_OWNER_REVIEW` on its still-open draft PR. Refused (exit 4, nothing
-  changed, the instruction stays pending): an `ACTIVE` run (it holds the
-  writer lock, or it has not reached a stop), a live developer process, a
-  developer launch without a recorded return, a reviewer attempt still running
-  or without a recorded end, a push/verify helper holding the helper lock, a
-  configured runtime lock, a publication of uncertain delivery, an archive
-  commit in progress, a closed or non-draft PR, a damaged guidance or
-  amendments selection, the exact message that is already the latest
-  amendment, or a combination with `--max-rounds`, `--resend-undelivered` or
-  `--guidance`. Foreground enrollments are refused.
+  `AWAITING_OWNER_REVIEW` on its still-open draft PR (or stopped `BLOCKED`/
+  `PAUSED` in `done` with that handoff still recorded, for example after an
+  operational pause during a resume). Refused (exit 4, nothing changed, the
+  instruction stays pending): an `ACTIVE` run (it holds the writer lock, or
+  it has not reached a stop), a live developer process, a developer launch
+  without a recorded return, a last developer report declaring a runtime
+  restoration still pending, a reviewer attempt without a recorded end (its
+  PID is consulted only then), a push/verify helper holding the helper lock, a
+  configured runtime lock (checked during admission and again immediately
+  before the application is committed), a publication whose POST outcome is
+  unknown and whose exact marked body is not found on the PR from the expected
+  account (one that is found is recorded as delivered), an archive commit in
+  progress, a closed or non-draft PR, a damaged guidance or amendments
+  selection, text the publication sanitizer would refuse, a replay of the
+  saved file that is already the latest amendment, or a combination with
+  `--max-rounds`, `--resend-undelivered` or `--guidance`. Foreground
+  enrollments are refused.
 - **Capture.** The file is validated like a guidance document (at most 64 KiB,
   UTF-8, not blank). Under the writer and helper locks, the controller builds
   the next cumulative document: the current revision's verified bytes (or a
@@ -320,11 +333,16 @@ supervisor never claims an agent saw text that only the supervisor received.
   sizes, capture time, source path for information, reason, supersedes).
   Earlier snapshots stay unchanged; editing or deleting the input file later
   changes nothing.
-- **Application (one state save).** The stopped round is superseded (a
-  never-delivered request is withdrawn), a validated result is invalidated and
-  its verdict retired, a ready result is moved to `superseded_ready`, and an
-  owner-review handoff is moved to `superseded_handoffs` with its receipt
-  retired by a public correction, a `reopened` notice and a PR status update.
+- **Application (one state save).** The stopped round is superseded and its
+  request retired: parts not yet sent are never sent, and parts already on the
+  PR get a public "review request is withdrawn" correction and stay archived
+  as the record. A validated result is invalidated and its verdict retired. A
+  ready result is moved to `superseded_ready`; if its ready verdict is already
+  on the PR without a handoff receipt, a public "ready verdict is not
+  current" correction is queued. An owner-review handoff is moved to
+  `superseded_handoffs` with its receipt retired by a public correction, a
+  `reopened` notice and a PR status update. The `STOP` file is consumed only
+  once this save succeeds.
   The report binding is cleared and the phase returns to `develop` without
   launching any model. Findings, `rounds_completed`, developer invocations,
   limits, models, permissions and gates are untouched: nothing is refunded or
@@ -333,9 +351,13 @@ supervisor never claims an agent saw text that only the supervisor received.
 - **Exhausted budget.** The amendment is applied, then the run stops
   `BLOCKED` in `develop` before any launch (`status.amendments.selected` set,
   `first_returned_invocation` null, `latest_developer_invocation.
-  matches_selected` false: applied, not delivered). An explicit owner
-  extension (`resume --max-rounds N`) then continues under the amended task.
-  No budget is extended automatically.
+  matches_selected` false: applied, not delivered). The stop reason names the
+  limit. For the review-round cap (`review-round budget ... is exhausted`), an
+  explicit owner extension `resume --max-rounds N` continues under the amended
+  task. For the developer-invocation cap (`developer invocation budget
+  exhausted`), no `resume` option raises it and `--max-rounds` does not help:
+  report it as a separate owner decision (the existing re-enrollment
+  procedure). No budget is extended automatically.
 - **Delivery and precedence.** Every later developer prompt (start,
   continuation and report-correction) includes the cumulative document inline
   under a heading with its revision and sha256; the reviewer receives a
@@ -360,19 +382,40 @@ supervisor never claims an agent saw text that only the supervisor received.
   original finding and every assessment stay in the ledger.
 - **Records and freshness.** Rounds, `request.json`, envelopes, ready results
   and the developer report carry `amendment_revision`/`amendment_sha256`
-  beside the guidance binding. Review requests publish a sanitized rendering
+  beside the guidance binding. Every stored report in `reports[]` keeps the
+  guidance and amendment bindings of the invocation that returned it, and
+  `last_report_instructions` always holds those of the report `last_report`
+  names (history; `last_report_for` plus `last_report_guidance`/
+  `last_report_amendments`, the bindings of the accepted ready report, stay
+  the freshness guard). Review requests publish a sanitized rendering
   of the document with its revision and digest (write PR-safe text); reviews
   name the amendments they were bound to. A report, review, ready result or
   handoff bound to an earlier revision never satisfies readiness for the
   amended task. Integrity at use, status and supervised recovery work exactly
   as for guidance (`status.amendments`, `amendments.selected.snapshot`).
-- **Three distinct observations.** *Pending with the supervisor* (the saved
-  file; invisible to the controller), *applied to the enrollment*
-  (`status.amendments.selected`), and *included in a recorded agent input*
-  (`latest_developer_invocation`/`latest_review_round` with
-  `matches_selected: true`, and `selected.first_returned_invocation`). An
-  agent's acknowledgement in its own prose is not evidence of compliance; the
-  reviewer checks the resulting work.
+- **Delivery evidence (what the supervisor may report).** Read
+  `status.amendments` per role; each field is an existing controller record:
+  - *Pending with the supervisor*: the saved file only; invisible to the
+    controller.
+  - *Applied to the enrollment*: `selected` names the revision (with
+    `integrity: intact`).
+  - *Developer*: `latest_developer_invocation.matches_selected: true` with
+    `intent_recorded_at` only means the prompt was built and launch intent
+    saved; `process_start_recorded: true` means the process started with that
+    input; `returned: true` (and `selected.first_returned_invocation`) means an
+    invocation whose input included it returned.
+  - *Reviewer*: `latest_review_round.matches_selected: true` only means a
+    round was allocated (and its request possibly published) under this
+    revision. While `latest_attempt` is `null`, no reviewer input exists yet:
+    report "the review request is prepared; the reviewer has not received the
+    amended task". `latest_attempt.opened_at` means an attempt was opened
+    (inputs are being prepared), `process_start_recorded: true` means the
+    reviewer was launched with its inputs written (they are written before
+    launch), and `ended_at` with `ok: true` means it returned a valid result.
+    `process_start_recorded: false` is an attempt closed as never launched.
+
+  An agent's acknowledgement in its own prose is not evidence of compliance;
+  the reviewer checks the resulting work.
 - **Approach guidance afterwards.** `--guidance` keeps working as before and
   replaces only the approach guidance. It cannot erase or replace the
   amendment history, which is a separate state member and folder.
@@ -584,8 +627,15 @@ python $ar status --enrollment <id>                         # inspect: mode head
 python $ar stop   --enrollment <id> --reason "activate the amendment-capable controller"
 python $ar status --enrollment <id>                         # wait: not ACTIVE, developer_running false, lock_holder null
 python $ar activate --enrollment <id>                       # owner decision, between runs
-python $ar status --enrollment <id>                         # confirm workflow_fingerprint_matches, then continue:
-python $ar resume --enrollment <id> --reason "..."          # or, for a pending owner update, --amend-mission <file>
+python $ar status --enrollment <id>                         # confirm workflow_fingerprint_matches; then branch on status:
+# (a) status BLOCKED or PAUSED (activation keeps a stopped enrollment's status):
+python $ar resume --enrollment <id> --reason "..."          # or, with a pending owner update: --amend-mission <file>
+# (b) status ACTIVE in phase review: activation superseded a ready result or an owner-review handoff, and the stop
+#     file from the `stop` above is still present. With an owner update pending, first reach a stopped state without
+#     dispatching the old review: `run` checks the stop file before anything else and pauses at once.
+python $ar run    --enrollment <id>                         # exits 3 (PAUSED, stop requested); nothing is launched
+python $ar resume --enrollment <id> --reason "..." --amend-mission <file>
+#     Without a pending update, an ordinary `resume --reason ...` instead reviews the same candidate again.
 ```
 
 If an eligibility check fails, `--guidance` or `--amend-mission` refuses with
