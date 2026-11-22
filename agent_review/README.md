@@ -324,14 +324,15 @@ yet in this attempt"). A gate marker without a receipt is shown as interrupted
 when its helper PID is gone, and as "identity unconfirmed" when that PID is
 alive (a PID can be reused). Event content is sanitized whole before it is
 shortened. The state must name the requested enrollment (otherwise nothing of
-it is shown). `--once` prints one observation; `--log FILE` also appends the
-feed to a separate file the owner can tail. A path inside the enrollment's
-records, its worktree or the worktree's git dir, inside the host registry and
-locks, or an existing file with other hard links, is refused:
+it is shown). An action replayed at attachment is labeled "before this watch
+started"; silence is measured from the latest complete event record, not only
+from the latest displayable row. `--once` prints one observation. `watch` never
+opens a file for writing: to keep or tail the feed, redirect the console output
+to a file of your choosing outside the enrollment's records and worktree:
 
 ```powershell
-python $ar watch --enrollment <id> --log C:/Dev/<id>-live.log
-Get-Content -Wait -Tail 40 C:/Dev/<id>-live.log
+python $ar watch --enrollment <id> *> C:/Dev/watch-<id>.log   # in one terminal
+Get-Content -Wait -Tail 40 C:/Dev/watch-<id>.log              # in another
 ```
 
 **Owner task changes from the session.** The owner tells the session; it saves

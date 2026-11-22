@@ -7680,11 +7680,10 @@ class ForegroundRoundTwoTests(ForegroundFixture, Base):
         pending.parent.mkdir(parents=True, exist_ok=True)
         ar.write_text(pending, json.dumps({"gate": "unit", "candidate": "1" * 40, "started": ar.now_iso(),
                                            "pid": 999999}) + "\n")
-        log = env.root / "watch.log"
         with contextlib.redirect_stdout(io.StringIO()) as shown:
-            self.assertEqual(ar.EXIT_OK, ar.main(["watch", "--enrollment", self.state(env)["enrollment_id"], "--once",
-                                                  "--log", str(log)], root=env.wf))
-        for text in (shown.getvalue(), log.read_text(encoding="utf-8")):
+            self.assertEqual(ar.EXIT_OK, ar.main(["watch", "--enrollment", self.state(env)["enrollment_id"], "--once"],
+                                                 root=env.wf))
+        for text in (shown.getvalue(),):
             self.assertNotIn(token, text)
             for line in body:
                 self.assertNotIn(line, text)
@@ -7695,27 +7694,6 @@ class ForegroundRoundTwoTests(ForegroundFixture, Base):
         self.assertIn("final rounds 1/", status)  # the current checkpoint, not a sum across checkpoints
         self.assertIn("has no receipt and its helper is not running (interrupted)", status)
         self.assertNotIn("old review note", status)
-
-    def test_watch_never_writes_into_what_it_observes_and_checks_identity(self):
-        other = self.fg_env()  # first: each fixture points the host registry at its own folder
-        env = self.fg_env()
-        enrollment = self.state(env)["enrollment_id"]
-        before = self.state_bytes(env)
-        alias = env.root / "alias.log"
-        os.link(env.dir / "state.json", alias)  # a separate path naming the same file
-        for target in (alias, env.dir / "watch.log", env.work / "watch.log"):
-            with contextlib.redirect_stderr(io.StringIO()) as err:
-                self.assertEqual(ar.EXIT_USAGE, ar.main(["watch", "--enrollment", enrollment, "--once",
-                                                         "--log", str(target)], root=env.wf))
-            self.assertIn("watch refused", err.getvalue())
-        self.assertEqual(before, self.state_bytes(env))
-        self.assertFalse((env.work / "watch.log").exists())
-        rows = []
-        ar.watch_enrollment(other.dir, rows.append, once=True, expected_id=enrollment)
-        self.assertEqual(1, len(rows))
-        self.assertIn("identity mismatch", rows[0])
-        for field in ("ACTIVE", "candidate", "rounds", "latest action"):  # nothing copied from the unrelated state
-            self.assertNotIn(field, rows[0])
 
     def test_a_long_amendment_is_delivered_in_parts_and_a_missing_part_keeps_admission_closed(self):
         env = self.fg_env()
@@ -7909,33 +7887,6 @@ class ForegroundRoundThreeTests(ForegroundFixture, Base):
         status = [r for r in rows if "| reviewer Codex, round 2 attempt 2" in r][-1]
         self.assertIn("latest action: Codex: ATTEMPT-TWO first note", status)
 
-    def test_watch_refuses_worktree_aliases_and_ownership_records_as_its_log(self):
-        import gc
-        import warnings
-        env = self.fg_env()
-        enrollment = self.state(env)["enrollment_id"]
-        claim = ar.registry_path("owner/repo", env.branch)
-        marker = Path(git(env.work, "rev-parse", "--absolute-git-dir")) / "agent-review-enrollment.json"
-        alias = env.root / "worktree-alias.log"
-        os.link(env.work / "README.md", alias)  # an external name for a worktree file
-        protected = {p: p.read_bytes() for p in (env.work / "README.md", claim, marker, env.dir / "state.json")}
-        for target in (alias, claim, marker):
-            with self.subTest(target=target.name):
-                with contextlib.redirect_stderr(io.StringIO()) as err:
-                    self.assertEqual(ar.EXIT_USAGE, ar.main(["watch", "--enrollment", enrollment, "--once", "--log",
-                                                             str(target)], root=env.wf))
-                self.assertIn("watch refused", err.getvalue())
-        self.assertEqual(protected, {p: p.read_bytes() for p in protected})
-        log = env.root / "separate.log"
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            with contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(ar.EXIT_OK, ar.main(["watch", "--enrollment", enrollment, "--once", "--log",
-                                                      str(log)], root=env.wf))
-            gc.collect()
-        self.assertIn("ACTIVE/develop", log.read_text(encoding="utf-8"))
-        self.assertFalse([w for w in caught if issubclass(w.category, ResourceWarning)])  # the log handle is closed
-
     def test_amendment_parts_are_sized_by_their_serialized_display(self):
         env = self.fg_env()
         enrollment = self.state(env)["enrollment_id"]
@@ -7966,6 +7917,135 @@ class ForegroundRoundThreeTests(ForegroundFixture, Base):
         env.developer.show(displays[-1])
         env.reviewer.script = [{"decision": "ready_for_owner_review"}]
         self.assertEqual("ready_for_owner_review", self.review_cmd(env, cite=task["report_citation"])[1]["result"])
+
+
+
+class ForegroundRoundFourTests(ForegroundFixture, Base):
+    """Round-4 corrections (PR #7): watch opens no file for writing (the console feed is redirected by the owner's
+    shell if wanted) and is identity-checked; the capped amendment's blocker is restored after a resolved publication
+    outage; a transcript failure at reviewer admission publishes no private filename; watch measures silence from the
+    latest complete event and finds the latest displayable action on attachment."""
+
+    def test_watch_has_no_file_output_and_leaves_every_record_untouched(self):
+        other = self.fg_env()  # first: each fixture points the host registry at its own folder
+        env = self.fg_env()
+        enrollment = self.state(env)["enrollment_id"]
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            ar.build_parser().parse_args(["watch", "--enrollment", enrollment, "--log", "x.log"])  # no such option
+        claim = ar.registry_path("owner/repo", env.branch)
+        marker = Path(git(env.work, "rev-parse", "--absolute-git-dir")) / "agent-review-enrollment.json"
+        roots = (env.dir, env.work, Path(git(env.work, "rev-parse", "--absolute-git-dir")), claim.parent)
+        before = {p: p.read_bytes() for root in roots for p in root.rglob("*") if p.is_file()}
+        self.assertIn(claim, before)
+        self.assertIn(marker, before)
+        with contextlib.redirect_stdout(io.StringIO()) as shown:
+            self.assertEqual(ar.EXIT_OK, ar.main(["watch", "--enrollment", enrollment, "--once"], root=env.wf))
+        self.assertIn("ACTIVE/develop", shown.getvalue())
+        after = {p: p.read_bytes() for root in roots for p in root.rglob("*") if p.is_file()}
+        self.assertEqual(before, after)  # nothing created, changed or removed in any protected location
+        rows = []
+        ar.watch_enrollment(other.dir, rows.append, once=True, expected_id=enrollment)
+        self.assertEqual(1, len(rows))
+        self.assertIn("identity mismatch", rows[0])
+        for field in ("ACTIVE", "candidate", "rounds", "latest action"):
+            self.assertNotIn(field, rows[0])
+
+    def test_a_resolved_publication_outage_at_the_cap_restores_the_budget_blocker(self):
+        env = Env("foreground", max_rounds=1, plan={"schema_version": "agent-review.plan.v1", "mission_id": "f",
+                                                    "title": "f", "checkpoints": [{"id": "final", "type": "final",
+                                                                                   "scope": "s", "exit_conditions": ["e"]}]})
+        self.addCleanup(env.cleanup)
+        env.commit("feature.txt", "v2\n", "feature v2")
+        env.push()
+        env.reviewer.script = [{"decision": "ready_for_owner_review"}]
+        self.assertEqual("ready_for_owner_review", self.review_cmd(env)[1]["result"])
+        self.assertEqual("AWAITING_OWNER_REVIEW", self.finalize_cmd(env)[1]["status"])
+        original, failures = env.gh.edit_body, {"left": 1}
+
+        def edit_body(number, body_file):  # SIMULATED: the queued PR-body edit fails once
+            if failures["left"]:
+                failures["left"] -= 1
+                raise ar.CommandError(["gh", "pr", "edit"], subprocess.CompletedProcess([], 1, "", "simulated outage"))
+            return original(number, body_file)
+        env.gh.edit_body = edit_body
+        code, out = self.resume(env.controller(), "owner amends at the cap", amendment=self.doc(env, "u1.md", self.A1))
+        self.assertEqual(ar.EXIT_PAUSED, code, out)  # the outage is reported while it lasts
+        self.assertNotIn("handoff superseded by owner amendment 1", env.gh.body)
+        for attempt in (1, 2):  # recovery with the original limit, then a replay
+            with self.subTest(attempt=attempt):
+                with self.assertRaises(ar.UsageError):
+                    self.resume(env.controller(), "owner recovery after the outage")
+                state = self.state(env)
+                self.assertEqual(("BLOCKED", env.controller().budget_block_reason()),
+                                 (state["status"], state["status_reason"]))
+                self.assertIn("handoff superseded by owner amendment 1", env.gh.body)
+                self.assertEqual(1, len(self.headings_with(env, "Workflow — reopened")))
+                self.assertEqual(1, len(self.headings_with(env, "the owner-review handoff above is not current")))
+                blocked = [h for h in env.gh.headings() if "Workflow — blocked" in h]
+                self.assertEqual(2, len(blocked))  # the original block, then exactly one restored after the outage
+                self.assertEqual(({"final": 1}, 0), (state["rounds_completed"], state["developer"]["invocations"]))
+                self.assertTrue(env.controller().helper_authority_problems())
+        with self.assertRaises(ar.UsageError):
+            self.review_cmd(env)
+
+    def test_a_transcript_failure_at_reviewer_admission_publishes_no_private_filename(self):
+        env = self.fg_env()
+        env.commit("feature.txt", "v2\n", "feature v2")
+        env.push()
+        secret = str(env.root / "private-dir" / "SECRET-TRANSCRIPT-NAME-91.jsonl")
+        original = env.developer.session_provenance
+        state = {"fail": False}
+
+        def provenance(session_id, since=None):
+            if state["fail"]:
+                raise PermissionError(13, "Permission denied", secret)  # SIMULATED unreadable transcript
+            return original(session_id, since)
+        env.developer.session_provenance = provenance
+
+        def break_transcript():
+            state["fail"] = True
+        env.reviewer.during_run = break_transcript
+        env.reviewer.script = [{"raw": "not json (SIMULATED retryable failure)"}, {"decision": "ready_for_owner_review"}]
+        code, out, _ = self.review_cmd(env)
+        self.assertEqual(ar.EXIT_BLOCKED, code, out)
+        self.assertEqual(1, len(env.reviewer.calls))
+        self.assertEqual({}, self.state(env)["rounds_completed"])
+        public = "\n".join(c["body"] for c in env.gh.comments_list)
+        self.assertNotIn("SECRET-TRANSCRIPT-NAME-91", public)
+        self.assertNotIn("SECRET-TRANSCRIPT-NAME-91", out["reason"])
+        self.assertIn("PermissionError", out["reason"])
+        self.assertTrue(any("SECRET-TRANSCRIPT-NAME-91" in n for n in self.state(env)["notes"]))  # local diagnosis
+
+    def test_watch_measures_silence_from_the_latest_event_and_finds_the_latest_action(self):
+        env = Env("headless")
+        self.addCleanup(env.cleanup)
+        state = self.state(env)  # labeled: an aged reviewer attempt is running
+        started = (ar.dt.datetime.now(ar.dt.timezone.utc) - ar.dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        state["rounds"] = [{"round": 1, "status": "reviewing", "H": "0" * 40, "attempts": [{"n": 1, "started": started}]}]
+        ar.atomic_write_json(env.dir / "state.json", state)
+        events = env.dir / "rounds" / "r01" / "events-1.jsonl"
+        events.parent.mkdir(parents=True)
+        records = [{"type": "item.started", "item": {"type": "command_execution", "command": "rg -n VISIBLE-CMD-4e"}}]
+        records += [{"type": "item.completed", "item": {"type": "reasoning", "text": "filtered"}}] * 20
+        events.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+        old = time.time() - 3600
+        os.utime(events, (old, old))
+        rows = []
+        ar.watch_enrollment(env.dir, rows.append, once=True, stall_minutes=10)
+        status = [r for r in rows if "reviewer Codex, round 1 attempt 1" in r][-1]
+        self.assertIn("latest action: Codex ▸ $ rg -n VISIBLE-CMD-4e", status)  # despite 20 later filtered records
+        self.assertTrue(any("no new agent events for 1h00m" in r for r in rows), rows)  # genuinely quiet
+        with open(events, "a", encoding="utf-8") as f:  # a fresh, non-displayable metadata event
+            f.write(json.dumps({"type": "turn.started"}) + "\n")
+        rows = []
+        ar.watch_enrollment(env.dir, rows.append, once=True, stall_minutes=10)
+        status = [r for r in rows if "reviewer Codex, round 1 attempt 1" in r][-1]
+        self.assertIn("latest action: Codex ▸ $ rg -n VISIBLE-CMD-4e", status)
+        self.assertFalse(any("no new agent events" in r for r in rows), rows)  # a record just arrived
+        later = lambda: ar.dt.datetime.now(ar.dt.timezone.utc) + ar.dt.timedelta(minutes=30)  # noqa: E731
+        rows = []
+        ar.watch_enrollment(env.dir, rows.append, once=True, stall_minutes=10, now=later)
+        self.assertTrue(any("no new agent events for" in r for r in rows), rows)
 
 
 if __name__ == "__main__":
