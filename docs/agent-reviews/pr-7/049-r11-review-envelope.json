@@ -1,0 +1,172 @@
+{
+  "B": "a2a14d8e4b0e080bed34683ae2dc8eb123e4524b",
+  "H": "41a185a71eff60ea83b8245ff367603109969429",
+  "M": "a2a14d8e4b0e080bed34683ae2dc8eb123e4524b",
+  "amendment_revision": null,
+  "amendment_sha256": "none",
+  "checkpoint_id": "final",
+  "checkpoint_type": "final",
+  "fatal": false,
+  "guidance_revision": null,
+  "guidance_sha256": "none",
+  "invocation": {
+    "completed": true,
+    "duration_s": 393.2,
+    "errors": [],
+    "exit_code": 0,
+    "failed": false,
+    "observed": {
+      "approval_policy": "never",
+      "cli_version": "0.170.0",
+      "network": "restricted",
+      "observed_effort": "max",
+      "observed_model": "gpt-6.2-astra",
+      "plan_type": "pro",
+      "rollout_found": true,
+      "sandbox": "read-only",
+      "source": "Codex session rollout (CLI-recorded thread settings; not model-authored)",
+      "subagent_suspected": false,
+      "turn_efforts": [
+        "max"
+      ],
+      "turn_models": [
+        "gpt-6.2-astra"
+      ],
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 1767296,
+        "input_tokens": 1916000,
+        "output_tokens": 14853,
+        "reasoning_output_tokens": 9114,
+        "total_tokens": 1930853
+      }
+    },
+    "requested": {
+      "effort": "max",
+      "model": "gpt-6.2-astra",
+      "sandbox": "read-only"
+    },
+    "thread_id": "01a2069d-3ddc-7381-832b-843aa9bb92f3",
+    "timed_out": false
+  },
+  "mission": {
+    "id": "foreground-development-mission",
+    "sha256": "6767591f278db8c3b2021a138bb6528aadb6e373a052fbbd420485cb4c475122"
+  },
+  "ok": true,
+  "path": "~\\.agent-review\\state\\devproc-claude-foreground-development-20261122110938-f02a\\rounds\\r11\\envelope-1.json",
+  "pr": 7,
+  "project_sha256": "bfa331169cea8fba3787ed5e96ca38b201fd5e1dc5c32dc93204de79f638664d",
+  "protocol": "agent-review.v1",
+  "publication": "r11-review",
+  "published": [
+    {
+      "comment_id": 7091513340,
+      "of": 1,
+      "part": 1,
+      "url": "https://github.com/howardreith/development-process/pull/7#issuecomment-7091513340"
+    }
+  ],
+  "raw_result_if_rejected": null,
+  "reasons": [],
+  "repository": "howardreith/development-process",
+  "request_id": "devproc-claude-foreground-development-20261122110938-f02a-r11-b51f76",
+  "response_sha256": "94567bf23e150c015e3bbb96c66e0f75fa68fa78c6f902742e1f7096ec1c1c6b",
+  "result": {
+    "candidate_commit": "41a185a71eff60ea83b8245ff367603109969429",
+    "checkpoint_id": "final",
+    "checkpoint_type": "final",
+    "decision": "ready_for_owner_review",
+    "decision_rationale": "Both pending fixes are verified. A conflicting PR comment prevents verdict acceptance and invalidates a handoff, and the foreground log now announces a reviewer only after process creation. The required unit gate passed on the exact candidate. The two remaining findings are optional cleanup.",
+    "evidence_assessment": {
+      "executed_verification": [
+        "The controller ran the required unit gate on 41a185a71eff60ea83b8245ff367603109969429. It exited 0 in 807.0 seconds with the worktree unchanged. I verified the log's SHA-256 against the receipt. It records 328 tests with one opt-in headless smoke test skipped.",
+        "All six round-11 regression cases passed, including repeated notice recovery, CRLF reuse, verdict accounting, verdict and receipt revalidation, failure before reviewer dispatch, and activity visible before reviewer return.",
+        "Read-only Git checks confirmed that H has the same controller and test blobs as correction commit 1dcbe1d. The controller hashes at ba32530, 97e3784 and b81d2fe also match the earlier interactive demonstration records."
+      ],
+      "inspected": [
+        "The enrolled mission, repository instructions, operating guide, protocol, full feature diff, developer report, prior findings ledger and round-11 correction diff.",
+        "The publication and reviewer launch paths in agent_review/agent_review.py, their command and handoff consumers, and the corresponding behavior tests in agent_review/test_agent_review.py.",
+        "The candidate-bound receipt and log in .agent-review-inputs/evidence, the foreground transcript notice, and the scoped interface and regression records in planning/evidence/pr-7-foreground-cycle.md."
+      ],
+      "limitations": [
+        "The actual Claude interface observations belong to earlier identified commits. They document the same session continuing from accepted feedback, pre-exit activity through a monitor or terminal tail, and a labeled demonstration amendment reaching real Codex with GitHub simulated. The full foreground session log was withheld.",
+        "The unchanged owner bundle is reported to have one KeyError on 1dcbe1d from indexing rounds_completed[\"final\"] before any round was charged. Enrollment initializes that map empty. The integrated test checks its established zero-spend meaning and passed at H. The standalone bundle and mutation runs are documented in the scoped record."
+      ],
+      "required_gaps": [],
+      "source_inspection_only": [
+        "I traced the production CodexReviewer.run callback from subprocess creation and the shared publication check through verdict acceptance, finalize, status --remote and resume. The candidate gate used real temporary Git repositories, controller state and stream setup, with simulated GitHub and successful reviewer responses."
+      ]
+    },
+    "findings": [
+      {
+        "acceptance_ids": [
+          "Part B.2",
+          "Protocol \u00a77"
+        ],
+        "actual": "missing_publications builds an unused comment-ID map and collects marker matches for every part. For delivered parts, part_identity_problem immediately searches the same listing for those matches again.",
+        "blocking_rationale": "The shared helper still enforces the correct identity check. The extra scan affects only the work performed during revalidation.",
+        "blocks_readiness": false,
+        "category": "optional_polish",
+        "expected": "Delivered parts can use the shared identity check once. A withdrawn, never-sent part needs only an absence check.",
+        "id": "R11-F1",
+        "location": {
+          "file": "agent_review/agent_review.py",
+          "line": 4980
+        },
+        "priority": "P3",
+        "requested_correction": "Remove the unused map and move the separate marker search inside the branch for a withdrawn part with no recorded comment ID.",
+        "requested_evidence": "The existing publication, withdrawal and handoff tests cover this cleanup.",
+        "title": "Handoff revalidation scans each delivered part's marker twice",
+        "trigger": "Finalize, remote status or resume checks the published parts of a PR."
+      },
+      {
+        "acceptance_ids": [
+          "Part A.3"
+        ],
+        "actual": "CallbackLiveReviewerR11 calls on_start(424242) and forwards the same callback through LiveReviewer to FakeReviewer.run, which calls it again with None. That writes a second start line and replaces the fixture's recorded PID.",
+        "blocking_rationale": "The fixture observes the first start line and live activity before return. The production reviewer invokes its callback once.",
+        "blocks_readiness": false,
+        "category": "optional_polish",
+        "expected": "The successful reviewer fixture should report one process start for one simulated attempt.",
+        "id": "R11-F2",
+        "location": {
+          "file": "agent_review/test_agent_review.py",
+          "line": 9689
+        },
+        "priority": "P3",
+        "requested_correction": "Consume the callback before delegating to the base fixture.",
+        "requested_evidence": "The existing success case can assert one start announcement followed by activity before return and the terminal result.",
+        "title": "The successful reviewer fixture invokes its start callback twice",
+        "trigger": "The round-11 success control runs the simulated streaming reviewer."
+      }
+    ],
+    "prior_finding_assessments": [
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R10-F1",
+        "rationale": "The sole expected-author marker match must now have the recorded comment ID, and that comment's normalized body must match the digest-verified outbox body. The candidate tests confirm stable correction across two recoveries, CRLF-only reuse, zero rounds charged for a conflicted verdict, and loss of handoff currency when either the verdict or receipt is conflicted."
+      },
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R10-F2",
+        "rationale": "The running announcement now comes from the process-start callback. The real stream-opening failure fixture confirmed zero reviewer dispatch, a BLOCKED command result, accurate watch status, and a live-log failure line naming the round, attempt and candidate without exposing the private path. The success control observed reviewer activity before return."
+      }
+    ],
+    "request_id": "devproc-claude-foreground-development-20261122110938-f02a-r11-b51f76",
+    "round": 11,
+    "schema_version": "agent-review.review.v1",
+    "summary": {
+      "delivered_behavior": "Interactive enrollment selects the foreground Claude session. It receives the accepted Astra verdict, candidate, reference and continuation on stdout while reviewer and gate activity are available in the live log. Existing headless jobs can be watched from their event files. Foreground amendments reach both roles and invalidate older readiness decisions.",
+      "pending_later_phase_work": [],
+      "remaining_owner_review": [
+        "Judge whether the foreground experience meets the owner's day-to-day needs and decide whether to merge draft PR #7 after the controller records and revalidates the archive handoff."
+      ],
+      "scope_reviewed": "The complete foreground-development mission for draft PR #7, including the PR #6 documentation correction, with this correction round focused on R10-F1, R10-F2 and their callers.",
+      "unresolved_questions": []
+    }
+  },
+  "round": 11,
+  "validated_at": "2026-11-23T04:21:31Z",
+  "workflow_fingerprint": "591a9f2599ea196565b0fd1de90758c4c5276700eeb31dc173ea9bd6496ddb79"
+}

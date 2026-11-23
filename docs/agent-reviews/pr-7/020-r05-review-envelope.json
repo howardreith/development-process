@@ -1,0 +1,250 @@
+{
+  "B": "a2a14d8e4b0e080bed34683ae2dc8eb123e4524b",
+  "H": "167b8db88fafb2a6a283d88ca0dbc7eb220a38b4",
+  "M": "a2a14d8e4b0e080bed34683ae2dc8eb123e4524b",
+  "amendment_revision": null,
+  "amendment_sha256": "none",
+  "checkpoint_id": "final",
+  "checkpoint_type": "final",
+  "fatal": false,
+  "guidance_revision": null,
+  "guidance_sha256": "none",
+  "invocation": {
+    "completed": true,
+    "duration_s": 522.3,
+    "errors": [],
+    "exit_code": 0,
+    "failed": false,
+    "observed": {
+      "approval_policy": "never",
+      "cli_version": "0.170.0",
+      "network": "restricted",
+      "observed_effort": "max",
+      "observed_model": "gpt-6.2-astra",
+      "plan_type": "pro",
+      "rollout_found": true,
+      "sandbox": "read-only",
+      "source": "Codex session rollout (CLI-recorded thread settings; not model-authored)",
+      "subagent_suspected": false,
+      "turn_efforts": [
+        "max"
+      ],
+      "turn_models": [
+        "gpt-6.2-astra"
+      ],
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 2486272,
+        "input_tokens": 2634911,
+        "output_tokens": 20413,
+        "reasoning_output_tokens": 12753,
+        "total_tokens": 2655324
+      }
+    },
+    "requested": {
+      "effort": "max",
+      "model": "gpt-6.2-astra",
+      "sandbox": "read-only"
+    },
+    "thread_id": "01a20519-246f-7d02-b623-dae24306657c",
+    "timed_out": false
+  },
+  "mission": {
+    "id": "foreground-development-mission",
+    "sha256": "6767591f278db8c3b2021a138bb6528aadb6e373a052fbbd420485cb4c475122"
+  },
+  "ok": true,
+  "path": "~\\.agent-review\\state\\devproc-claude-foreground-development-20261122110938-f02a\\rounds\\r05\\envelope-1.json",
+  "pr": 7,
+  "project_sha256": "bfa331169cea8fba3787ed5e96ca38b201fd5e1dc5c32dc93204de79f638664d",
+  "protocol": "agent-review.v1",
+  "publication": "r05-review",
+  "published": [
+    {
+      "comment_id": 7085965329,
+      "of": 1,
+      "part": 1,
+      "url": "https://github.com/howardreith/development-process/pull/7#issuecomment-7085965329"
+    }
+  ],
+  "raw_result_if_rejected": null,
+  "reasons": [],
+  "repository": "howardreith/development-process",
+  "request_id": "devproc-claude-foreground-development-20261122110938-f02a-r05-38a2e0",
+  "response_sha256": "87c3f00b4256b3875a5414d0f5964a59935a461ce11a759eb430bc9ef194c709",
+  "result": {
+    "candidate_commit": "167b8db88fafb2a6a283d88ca0dbc7eb220a38b4",
+    "checkpoint_id": "final",
+    "checkpoint_type": "final",
+    "decision": "changes_required",
+    "decision_rationale": "The required unit gate passed. Three prior fixes are verified. A continuing watch can still misreport event arrival, and amendment recovery can record a false budget blocker or leave the PR showing a resolved outage.\n\n## Continuation for Claude\n\nReport the stop on draft PR #7 at candidate `167b8db`. This is round 5 of 5. Further development in this enrollment requires an explicit owner extension.\n\nIf authorized, limit budget-blocker restoration to an amendment actually applied at the persisted cap. Save the restored status and its queued PR notice in one transaction, then settle the publication. Preserve the no-progress reason and counters when a proposed limit is refused. In `watch`, track complete records observed between polls and use the controller\u2019s invocation and attempt history to order actions across streams.\n\nExercise the refused-limit, interrupted-publication and continuous-watch cases in the findings using the existing Git and controller fixtures. Run the required `unit` gate on the corrected candidate through the pinned controller. Keep the existing model policy, permissions, publication path and owner handoff boundary.",
+    "evidence_assessment": {
+      "executed_verification": [
+        "The controller receipt for H records `python -m unittest discover -s agent_review -p \"test_*.py\" -v`, exit 0, 698.1 seconds and an unchanged worktree. The log reports 292 tests run with one skip. Its SHA-256 matches the receipt.",
+        "The candidate log records all four ForegroundRoundFourTests as passing, including the ordinary outage recovery, private transcript diagnostic, console-only watch and filtered-event attachment cases.",
+        "Read-only Git and hash checks confirmed HEAD, the merge base, the enrolled mission digest and the controller source digests cited for the three earlier foreground demonstrations."
+      ],
+      "inspected": [
+        "The fixed request, mission Parts A\u2013C, repository instructions, operating guide, protocol, six-file feature diff and correction diff from `8c233d0` to H.",
+        "The developer report, pending findings ledger, transcript notice, candidate gate receipt and log, and `planning/evidence/pr-7-foreground-cycle.md`."
+      ],
+      "limitations": [
+        "The reviewer used read-only inspection. The actual Claude interface demonstrations are documented at earlier, identified controller revisions. Their isolated fixtures used real Codex and simulated GitHub.",
+        "The foreground tool transcript is withheld because it contains unrelated work. The separate mutation runs are developer-reported. The candidate gate skipped the opt-in headless live smoke."
+      ],
+      "required_gaps": [
+        "A corrected candidate needs behavioral evidence for refused budget changes, interruption while restoring the public blocker, and a single watcher following appends and role changes."
+      ],
+      "source_inspection_only": [
+        "The refused-limit and no-progress paths, the interruption between the restored status save and outbox creation, and the watcher's timing and cross-stream ordering were traced in source. The passing round-four fixtures do not execute those paths."
+      ]
+    },
+    "findings": [
+      {
+        "acceptance_ids": [
+          "Part A.4",
+          "Part B.2",
+          "Protocol \u00a710"
+        ],
+        "actual": "The branch tests the proposed limit and the presence of any selected amendment. With one round spent out of five, `resume --max-rounds 1` can persist and publish that the budget is exhausted at 1/5, then return a refusal. At the real cap, an ordinary resume can also overwrite an unrelated no-progress reason. A later authorized extension then misses the no-progress counter reset in `_resume_updates`.",
+        "blocking_rationale": "A refused command can close helper and report admission while rounds remain, or change how the next authorized review is counted.",
+        "blocks_readiness": true,
+        "category": "defect",
+        "expected": "Restore the blocker only when recovering an amendment applied at the persisted cap. A refused limit preserves the existing authorization and stop reason.",
+        "id": "R5-F1",
+        "location": {
+          "file": "agent_review/agent_review.py",
+          "line": 4197
+        },
+        "priority": "P2",
+        "requested_correction": "Identify the capped amendment being recovered and check the persisted budget before restoring its blocker. Preserve unrelated stops and report accurately whether recovery changed state.",
+        "requested_evidence": "With one of five rounds spent and an earlier amendment selected, refuse a proposed limit of one and check status, helper admission and PR notices. Also exercise a no-progress stop at the real cap, a refused resume and a subsequent authorized extension. Verify the counter reset.",
+        "title": "A refused round limit can change the enrollment\u2019s blocker",
+        "trigger": "A foreground enrollment has a selected amendment and the owner proposes a limit at or below the number of rounds already spent, or retries an unrelated stop at the real cap."
+      },
+      {
+        "acceptance_ids": [
+          "Part A.4",
+          "Part B.2",
+          "Protocol \u00a7\u00a77, 10"
+        ],
+        "actual": "`transition()` saves BLOCKED before `publish_status()` queues its notice. If the controller exits between those calls, replay sees the expected local status and skips publication. The latest public status can still say PAUSED for the earlier outage.",
+        "blocking_rationale": "The owner can recover the enrollment and still receive conflicting local and public accounts of the decision needed.",
+        "blocks_readiness": true,
+        "category": "defect",
+        "expected": "Once the restored blocker is durable, its public notice is either delivered or queued for replay.",
+        "id": "R5-F2",
+        "location": {
+          "file": "agent_review/agent_review.py",
+          "line": 4203
+        },
+        "priority": "P2",
+        "requested_correction": "Save the restored transition and `queue_status` together using the existing transaction, then settle the notice after the save.",
+        "requested_evidence": "Interrupt recovery immediately after the restored BLOCKED state becomes durable and before its notice is sent. Resume twice at the original limit and verify exactly one restored notice, the correct latest public status, closed admission and stable counters.",
+        "title": "An interruption can lose the restored BLOCKED notice",
+        "trigger": "The queued PR-body edit succeeds on recovery, then the controller exits while restoring the budget blocker."
+      },
+      {
+        "acceptance_ids": [
+          "Part A, Existing running jobs",
+          "Part A.3",
+          "Part B.5"
+        ],
+        "actual": "Even after reading new complete records, `follow` takes their time from the file\u2019s previously sampled `st_mtime`. An open event file can expose new bytes while that timestamp still has its old value. Conversely, a fresh blank line advances the event clock because the assignment also runs when every line was skipped. The regression test closes the writer and starts a new `--once` observation for each check.",
+        "blocking_rationale": "The live view can report silence after observing an event, or suppress a genuine stall after receiving only whitespace.",
+        "blocks_readiness": true,
+        "category": "defect",
+        "expected": "A continuing watcher restarts its silence interval when it observes a new complete event, including a filtered event. Empty lines do not count as activity.",
+        "id": "R4-F3",
+        "location": {
+          "file": "agent_review/agent_review.py",
+          "line": 5901
+        },
+        "priority": "P2",
+        "requested_correction": "Use the observation time for complete events read after attachment. Keep historical time estimates separate and advance the event clock only when a record was observed.",
+        "requested_evidence": "Keep one watcher running across polls. Append a filtered event to an aged stream while its sampled modification time stays old, then append a blank line during a quiet interval. Verify the stall timing and continued visibility of the last displayable action.",
+        "title": "A continuing watch still uses file modification time for newly observed events",
+        "trigger": "A watcher is already attached when the event stream grows."
+      },
+      {
+        "acceptance_ids": [
+          "Part A, Existing running jobs",
+          "Part A.3"
+        ],
+        "actual": "Every file\u2019s first read stores its action time as `None`. When no agent is running, all such actions tie in `max()`, so the developer stream or first reviewer attempt wins by insertion order. A file created during an ongoing watch also has its first action labeled \u201cbefore this watch started.\u201d",
+        "blocking_rationale": "At a stop or handoff, the status line can present an earlier developer action as the latest activity even after a reviewer returned a verdict.",
+        "blocks_readiness": true,
+        "category": "defect",
+        "expected": "The latest action follows the recorded invocation and attempt order. Activity first produced during a watch is identified as live.",
+        "id": "R5-F3",
+        "location": {
+          "file": "agent_review/agent_review.py",
+          "line": 5939
+        },
+        "priority": "P2",
+        "requested_correction": "Keep source ordering separate from uncertainty about an individual historical action\u2019s timestamp. Distinguish initial attachment from a new event file appearing on a later poll.",
+        "requested_evidence": "Attach after a headless developer and two reviewer attempts have ended. Verify that the status names the final attempt\u2019s action. Then keep a watch running across a new attempt and check the label on its first action.",
+        "title": "Watch can select an earlier action as the latest after a review",
+        "trigger": "An operator attaches between invocations or after a reviewer finishes, with displayable actions in multiple event files."
+      },
+      {
+        "acceptance_ids": [
+          "Part A.5"
+        ],
+        "actual": "The stop directs the operator to \u201clocal `status` notes.\u201d `Controller.status()` omits the saved notes and rechecks the transcript. After a transient failure clears, the historical detail is available in private `state.json`.",
+        "blocking_rationale": "The full diagnostic is preserved locally and the filename stays out of the public notice. Only the recovery pointer is inaccurate.",
+        "blocks_readiness": false,
+        "category": "optional_polish",
+        "expected": "The public diagnostic points the operator to a location that exposes the saved error.",
+        "id": "R5-F4",
+        "location": {
+          "file": "agent_review/agent_review.py",
+          "line": 3019
+        },
+        "priority": "P3",
+        "requested_correction": "Point the operator to the notes in private `state.json`, or expose the relevant admission diagnostic through local status.",
+        "requested_evidence": "After a transient read failure clears, verify that the location named in the stop still contains the diagnosis.",
+        "title": "The transcript diagnostic points to notes absent from `status`",
+        "trigger": "The operator follows the published recovery instruction after a reviewer-admission transcript error."
+      }
+    ],
+    "prior_finding_assessments": [
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R2-F4",
+        "rationale": "Removing `--log` eliminates the controller\u2019s destination-opening path, including for linked worktrees. The candidate test verifies parser refusal, console output, identity checking and byte-identical protected files."
+      },
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R4-F1",
+        "rationale": "The reported one-time PR-body outage now settles on ordinary resume. The passing fixture verifies the restored budget reason, public notice and replay counts. R5-F2 concerns a later interruption after the local reason has already been restored."
+      },
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R4-F2",
+        "rationale": "The candidate keeps the exception detail in private state and publishes the failure type and errno. The retry fixture verified one reviewer call, zero completed rounds and omission of the distinctive filename from PR comments."
+      },
+      {
+        "assessment": "fix_rejected",
+        "finding_id": "R4-F3",
+        "rationale": "Attachment now finds the visible command behind 20 filtered records. The test\u2019s three one-shot observations verify that case. During continuous following, newly read events still inherit the sampled file timestamp, and a blank append can reset the silence interval."
+      }
+    ],
+    "request_id": "devproc-claude-foreground-development-20261122110938-f02a-r05-38a2e0",
+    "round": 5,
+    "schema_version": "agent-review.review.v1",
+    "summary": {
+      "delivered_behavior": "Interactive enrollment selects foreground development and checks recorded session provenance. The review command returns the authenticated verdict and continuation. Reviewer and gate activity reach a private live log, and amendment delivery is bound to the session and report. The console observer reads existing headless event files.",
+      "pending_later_phase_work": [],
+      "remaining_owner_review": [
+        "This is the fifth and last authorized round for draft PR #7. The owner decides whether to extend the enrollment for corrections.",
+        "Final acceptance of the interactive workflow and the merge decision remain with the owner."
+      ],
+      "scope_reviewed": "The complete foreground-development mission for PR #7 at `167b8db`, with correction-round analysis focused on the four pending findings and their affected recovery, publication, status and watch paths.",
+      "unresolved_questions": []
+    }
+  },
+  "round": 5,
+  "validated_at": "2026-11-22T21:19:45Z",
+  "workflow_fingerprint": "591a9f2599ea196565b0fd1de90758c4c5276700eeb31dc173ea9bd6496ddb79"
+}
