@@ -534,3 +534,86 @@ The continuing-watch test runs a real watcher thread that attaches while the rep
 real CodexReviewer stream setup then fails on a directory at its stderr path, and the test's Codex executable is never
 started. Simulated: GitHub, Claude and Codex boundaries. Not established: CPython 3.12 on this host, real GitHub
 listing-lag frequency, live-model behavior (not affected by these changes).
+
+
+## 12. Round 10, the owner's extension to round 11, and the round-11 batch (sanitized command evidence)
+
+Round 10 on `32c7703` returned `changes_required`
+([review comment](https://github.com/howardreith/development-process/pull/7#issuecomment-7090668322)): R9-F1, R9-F2 and
+R9-F3 were verified; R10-F1 (a reused or verified publication could take its body from the recorded comment and its
+marker from another comment) and R10-F2 (the live log announced a reviewer before process creation) were new. The owner
+authorized one batch and round 11 and supplied a sixteen-case bundle. The session ran `resume --max-rounds 11` and ran
+the bundle unchanged against the reviewed candidate before editing:
+
+```text
+$ python -I run_regressions.py --repo <worktree at 32c7703d71a7ba0806f28fabd6a3adb2f6fb5258>
+Python: 3.14.7 (tags/v3.14.7:823f032, Aug  5 2026, 10:51:32) [MSC v.1944 64 bit (AMD64)]
+SHA-256 agent_review.py: 57e3d2b39c6a9e14322b04ccb81a94e2d171b434f4721c3f3e41e0a489d8741b
+SHA-256 test_agent_review.py: 1b60cee245acf95dc6f4d76a9c4a5662f29d66c7e34368ca479c9e89f5b0f523
+  test_delayed_notice_cannot_borrow_another_comments_marker (recovery=1) ... FAIL
+  test_delayed_notice_cannot_borrow_another_comments_marker (recovery=2) ... FAIL
+  test_handoff_recheck_rejects_the_same_conflict_in_verdict_and_receipt (kind='accepted verdict') ... FAIL
+  test_handoff_recheck_rejects_the_same_conflict_in_verdict_and_receipt (kind='handoff receipt') ... FAIL
+  test_verdict_publication_conflict_prevents_round_acceptance (boundary='accepted round') ... FAIL
+  test_verdict_publication_conflict_prevents_round_acceptance (boundary='review spending') ... FAIL
+  test_verdict_publication_conflict_prevents_round_acceptance (boundary='ready result') ... FAIL
+  test_foreground_setup_failure_has_no_running_claim_and_a_terminal_log_line (behavior='no false running claim') ... FAIL
+  test_foreground_setup_failure_has_no_running_claim_and_a_terminal_log_line (behavior='terminal failure visible on same feed') ... FAIL
+FAIL: test_delayed_notice_cannot_borrow_another_comments_marker (recovery=1)
+AssertionError: False is not true : recovery falsely settled using different comments for identity and marker
+FAIL: test_delayed_notice_cannot_borrow_another_comments_marker (recovery=2)
+AssertionError: False is not true : recovery falsely settled using different comments for identity and marker
+FAIL: test_handoff_recheck_rejects_the_same_conflict_in_verdict_and_receipt (kind='accepted verdict')
+AssertionError: True is not false : the handoff was claimed current despite a cross-comment integrity conflict
+FAIL: test_handoff_recheck_rejects_the_same_conflict_in_verdict_and_receipt (kind='handoff receipt')
+AssertionError: True is not false : the handoff was claimed current despite a cross-comment integrity conflict
+FAIL: test_verdict_publication_conflict_prevents_round_acceptance (boundary='accepted round')
+AssertionError: 'accepted' == 'accepted' : the genuine verdict was accepted before its conflicting publication was resolved
+FAIL: test_verdict_publication_conflict_prevents_round_acceptance (boundary='review spending')
+AssertionError: 0 != 1
+FAIL: test_verdict_publication_conflict_prevents_round_acceptance (boundary='ready result')
+AssertionError: {'B': 'b65647396ee8e1d892beeadbce0656d12ca741ee', 'B_at_acceptance': None, 'H': 'f5d2062c0520e9f6e807c920f4f4cdb826826300', 'M': 'b65647396ee8e1d892beeadbce0656d12ca741ee', 'amendment_
+FAIL: test_foreground_setup_failure_has_no_running_claim_and_a_terminal_log_line (behavior='no false running claim')
+AssertionError: 'is reviewing candidate' unexpectedly found in '[03:39:52Z] review round 1 attempt 1: Codex gpt-6.2-astra/max (read-only) is reviewing candidate 4f2f415b2c; its activity follows\n' : t
+FAIL: test_foreground_setup_failure_has_no_running_claim_and_a_terminal_log_line (behavior='terminal failure visible on same feed')
+AssertionError: [] is not true : the foreground live feed must identify this candidate and attempt's failed launch
+Ran 16 tests in 80.788s
+FAILED (failures=9)
+```
+
+This matches the bundle baseline (12 methods pass; 4 fail with 9 failing subtests; no errors). After the correction
+(`1dcbe1de81ec2e8842b4a898db7051d084d1db77`), the same unchanged bundle:
+
+```text
+Python: 3.14.7 (tags/v3.14.7:823f032, Aug  5 2026, 10:51:32) [MSC v.1944 64 bit (AMD64)]
+SHA-256 agent_review.py: 5ef29a7dd421abb9ab582c2728b2f1ff32bbe50a45b8cac621064511b8718a92
+SHA-256 test_agent_review.py: fb07a80e143c011d3aa607cd6fb8e2975bdd8054e3de4bc8d21c4530bc3ade70
+  test_verdict_publication_conflict_prevents_round_acceptance (boundary='review spending') ... ERROR
+ERROR: test_verdict_publication_conflict_prevents_round_acceptance (boundary='review spending')
+KeyError: 'final'
+Ran 16 tests in 56.341s
+FAILED (errors=1)
+```
+
+The remaining error is the supplied test's lookup `rounds_completed["final"]`: the corrected controller leaves the
+genuine verdict unaccepted and uncharged, and an uncharged checkpoint has no key (the controller's established
+representation; existing budget tests assert `{}` for "not charged"). The controller was not changed to add a zero key.
+The integrated copy (`ForegroundRoundElevenIdentityTests`) reads `rounds_completed.get("final", 0)`; its other
+assertions and every other supplied case are unchanged and pass.
+
+Where the same-comment invariant is enforced: `part_identity_problem(key, part, listing)`, called by
+`publication_problems` (status-notice reuse; the verdict before `finish_round` accepts and charges a round) and by
+`missing_publications` (`readiness`, used by `finalize` and by `handoff_superseded`, which `status --remote` and
+`resume` use).
+
+```text
+$ python -m unittest <round-7 to round-11 classes and PublicationTests>   -> Ran 34 tests ... OK
+$ python -m unittest discover -s agent_review -p "test_*.py"             -> Ran 328 tests ... OK (skipped=1)
+mutations: any single marker copy accepted -> recovery and verdict tests FAIL; the old inline comparison kept in
+           missing_publications (publication_problems still fixed) -> handoff test FAILS; no failure line for a
+           never-launched attempt -> setup-failure test ERRORS (no live.log is written at all)
+```
+
+Simulated: GitHub, Claude and Codex boundaries, including the external reviewer's process-start callback in the
+success control. The setup-failure case uses the real Codex stream opening with zero reviewer dispatch. Not
+established: CPython 3.12 on this host, real GitHub listing-lag frequency, live-model behavior.
