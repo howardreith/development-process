@@ -9482,5 +9482,300 @@ class ForegroundRoundTenTests(ForegroundFixture, unittest.TestCase):
             self.assertEqual({"final": 1}, self.state(env)["rounds_completed"])
 
 
+class ForegroundRoundElevenIdentityTests(ForegroundFixture, unittest.TestCase):
+    """R10-F1 (owner-supplied): the recorded comment id, expected actor, complete marker and normalized preserved body
+    must identify the same unique comment, at status-notice reuse, verdict acceptance and handoff revalidation."""
+
+    SINGLE = ForegroundRoundSevenTests.SINGLE
+    capped_handoff = ForegroundRoundSevenTests.capped_handoff
+    fail_body_edits = ForegroundRoundSevenTests.fail_body_edits
+    fail_blocked_posts = ForegroundRoundSevenTests.fail_blocked_posts
+    amend = ForegroundRoundSevenTests.amend
+    pending_blocker = ForegroundRoundNineIntegrityTests.pending_blocker
+    status_comments = staticmethod(ForegroundRoundNineIntegrityTests.status_comments)
+    recover = ForegroundRoundNineIntegrityTests.recover
+    assert_authority_unchanged = ForegroundRoundNineIntegrityTests.assert_authority_unchanged
+    is_intact_budget_notice = ForegroundRoundNineIntegrityTests.is_intact_budget_notice
+
+    # Preserve the existing positive control without inheriting its other tests.
+    test_crlf_only_intact_notice_is_still_reused = (
+        ForegroundRoundTenTests.test_a_crlf_only_delayed_notice_is_reused
+    )
+
+    def simulate_cross_comment_conflict(self, env, comment, marker, copied_body):
+        """External edit and external expected-actor post, with distinct IDs."""
+        original_body = comment["body"]
+        self.assertTrue(original_body.startswith(marker))
+        self.assertTrue(copied_body.startswith(marker))
+        self.assertNotEqual(ar.normalize_body(original_body), ar.normalize_body(copied_body))
+        comment["body"] = "\n" + original_body
+        self.assertEqual(ar.normalize_body(original_body), ar.normalize_body(comment["body"]))
+        self.assertFalse(comment["body"].startswith(marker))
+        env.gh.next_id += 1
+        rival = {"id": env.gh.next_id, "user": env.gh.poster, "body": copied_body,
+                 "url": f"https://example.test/c/{env.gh.next_id}"}
+        env.gh.comments_list.append(rival)
+        self.assertEqual(env.controller().cfg["expected_actor"], rival["user"])
+        self.assertNotEqual(comment["id"], rival["id"])
+        matches = [c for c in env.gh.comments_list
+                   if c["user"] == rival["user"] and c["body"].startswith(marker)]
+        self.assertEqual([rival["id"]], [c["id"] for c in matches])
+        return {"recorded_id": comment["id"], "recorded_body": comment["body"],
+                "rival_id": rival["id"], "rival_body": rival["body"]}
+
+    def test_delayed_notice_cannot_borrow_another_comments_marker(self):
+        env, key, marker, preserved, reason, counts, rounds, authorized = self.pending_blocker()
+        original_post, conflict = env.gh.post_comment, {}
+
+        def post_then_edit_and_copy(number, body_file):
+            response = original_post(number, body_file)
+            comment = next(c for c in env.gh.comments_list if c["id"] == response["id"])
+            if not conflict and comment["body"].startswith(marker):
+                self.assertEqual(preserved, comment["body"])
+                copied_body = preserved.replace(
+                    reason, "SIMULATED COMPETING COPY: a different reason.", 1
+                )
+                conflict.update(self.simulate_cross_comment_conflict(env, comment, marker, copied_body))
+            return response
+
+        env.gh.post_comment = post_then_edit_and_copy
+        self.observation = {"case": "capped recovery", "notice_key": key, "recoveries": []}
+        comments_after_recovery = None
+        for recovery in (1, 2):
+            outcome = self.recover(env)
+            state = self.state(env)
+            self.assertTrue(conflict, "the delayed notice must actually be posted, edited and copied")
+            recorded = next(c for c in env.gh.comments_list if c["id"] == conflict["recorded_id"])
+            rival = next(c for c in env.gh.comments_list if c["id"] == conflict["rival_id"])
+            self.assertEqual(conflict["recorded_body"], recorded["body"])
+            self.assertEqual(conflict["rival_body"], rival["body"])
+            latest = self.status_comments(env)[-1]
+            corrected = self.is_intact_budget_notice(env, latest, reason)
+            self.observation["recoveries"].append({
+                "recovery": recovery, "outcome": outcome, "status": state["status"],
+                "reason": state["status_reason"],
+                "restore_needed": state["capped_amendment"]["restore_needed"],
+                "recorded_id": recorded["id"], "rival_id": rival["id"],
+                "latest_id": latest["id"], "latest_body": latest["body"],
+                "corrected": corrected,
+            })
+            self.assert_authority_unchanged(env, counts, rounds, authorized)
+            with self.subTest(recovery=recovery):
+                if corrected:
+                    self.assertNotIn(latest["id"], (recorded["id"], rival["id"]))
+                    self.assertNotEqual(key, state["capped_amendment"]["notice_key"])
+                    self.assertEqual(("BLOCKED", reason), (state["status"], state["status_reason"]))
+                    self.assertFalse(state["capped_amendment"]["restore_needed"])
+                else:
+                    self.assertTrue(state["capped_amendment"]["restore_needed"],
+                                    "recovery falsely settled using different comments for identity and marker")
+                    self.assertRegex(state["status_reason"].lower(), r"duplicat|alter|integrity|conflict|mismatch")
+            if comments_after_recovery is None:
+                comments_after_recovery = len(env.gh.comments_list)
+            else:
+                self.assertEqual(comments_after_recovery, len(env.gh.comments_list),
+                                 "repeat recovery must not keep adding corrective notices")
+
+    def test_verdict_publication_conflict_prevents_round_acceptance(self):
+        env = self.fg_env()
+        candidate = env.commit("feature.txt", "v2\n", "feature v2")
+        env.push()
+        env.reviewer.script = [{"decision": "ready_for_owner_review"}]
+        conflict = {}
+
+        def after_verdict_post(comment):
+            # The model really returned ready_for_owner_review. The fault is
+            # solely in publishing that genuine result, not a forged local
+            # model response or candidate. GitHub acknowledges its real ID.
+            if not conflict and " key=r01-review " in comment["body"].splitlines()[0]:
+                body = comment["body"]
+                marker = body.splitlines()[0]
+                conflict.update(self.simulate_cross_comment_conflict(
+                    env, comment, marker,
+                    body + "\nSIMULATED COMPETING COPY: a different result is claimed here.\n"
+                ))
+
+        env.gh.on_post = after_verdict_post
+        code, outcome, stderr = self.review_cmd(env)
+        state = self.state(env)
+        self.assertTrue(conflict, "the actual verdict POST must be reached and then externally conflicted")
+        self.assertEqual((1, 0), (len(env.reviewer.calls), len(env.developer.calls)))
+        rnd = state["rounds"][-1]
+        self.assertEqual(candidate, rnd["H"])
+        publication = state["publications"]["r01-review"]
+        self.assertEqual(conflict["recorded_id"], publication["parts"][0]["comment_id"])
+        self.assertEqual(conflict["recorded_body"],
+                         next(c["body"] for c in env.gh.comments_list if c["id"] == conflict["recorded_id"]))
+        self.assertEqual(conflict["rival_body"],
+                         next(c["body"] for c in env.gh.comments_list if c["id"] == conflict["rival_id"]))
+        self.observation = {
+            "case": "verdict acceptance", "candidate": candidate, "conflict": conflict,
+            "command_exit": code, "command_outcome": outcome, "command_stderr": stderr,
+            "round_status": rnd["status"], "round_decision": rnd.get("decision"),
+            "rounds_completed": state["rounds_completed"], "ready_review": state.get("ready_review"),
+            "reviewer_calls": len(env.reviewer.calls), "developer_calls": len(env.developer.calls),
+        }
+        with self.subTest(boundary="accepted round"):
+            self.assertNotEqual("accepted", rnd["status"],
+                                "the genuine verdict was accepted before its conflicting publication was resolved")
+        with self.subTest(boundary="review spending"):
+            # an uncharged checkpoint has no key (the controller's established representation)
+            self.assertEqual(0, state["rounds_completed"].get("final", 0))
+        with self.subTest(boundary="ready result"):
+            self.assertIsNone(state.get("ready_review"))
+        self.assertIsNone(state.get("handoff"))
+
+    def test_handoff_recheck_rejects_the_same_conflict_in_verdict_and_receipt(self):
+        self.observation = {"case": "handoff recheck", "publications": []}
+        for kind in ("accepted verdict", "handoff receipt"):
+            with self.subTest(kind=kind):
+                env = self.capped_handoff()
+                initial = self.state(env)
+                before_calls = (len(env.reviewer.calls), len(env.developer.calls))
+                before_rounds = dict(initial["rounds_completed"])
+                before_limit = initial["limits"]["max_review_rounds_per_checkpoint"]
+                self.assertTrue(env.controller().status(remote=True)["handoff_current"])
+                key = "r01-review" if kind == "accepted verdict" else (
+                    "final-status-" + ar.short(initial["handoff"]["A"])
+                )
+                publication = initial["publications"][key]
+                self.assertEqual("posted", publication["state"])
+                self.assertEqual(1, len(publication["parts"]))
+                part = publication["parts"][0]
+                recorded = next(c for c in env.gh.comments_list if c["id"] == part["comment_id"])
+                body = env.controller().outbox_body(key, part)
+                self.assertEqual(body, recorded["body"])
+                conflict = self.simulate_cross_comment_conflict(
+                    env, recorded, part["marker"],
+                    body + "\nSIMULATED COMPETING COPY: a different result is claimed here.\n"
+                )
+
+                ctl = env.controller()
+                remote_status = ctl.status(remote=True)
+                helper_result = ctl.publication_problems(key, publication, env.gh.comments(1))
+                inventory_result = ctl.missing_publications(
+                    include_receipt="final-status-" + ar.short(initial["handoff"]["A"])
+                )
+                outcome = self.recover(env)
+                after = self.state(env)
+                self.observation["publications"].append({
+                    "kind": kind, "key": key, "conflict": conflict,
+                    "publication_problems": helper_result, "missing_publications": inventory_result,
+                    "remote_handoff_current": remote_status.get("handoff_current"),
+                    "resume": outcome, "status_after_resume": after["status"],
+                    "reason_after_resume": after["status_reason"],
+                    "handoff_preserved_after_resume": bool(after.get("handoff")),
+                    "accepted_local_review_unchanged": initial["rounds"] == after["rounds"],
+                })
+                self.assertEqual(before_calls, (len(env.reviewer.calls), len(env.developer.calls)))
+                self.assertEqual(before_rounds, after["rounds_completed"])
+                self.assertEqual(before_limit, after["limits"]["max_review_rounds_per_checkpoint"])
+                self.assertTrue(env.controller().helper_authority_problems())
+                self.assertFalse(remote_status.get("handoff_current"),
+                                 "the handoff was claimed current despite a cross-comment integrity conflict")
+                self.assertNotEqual("AWAITING_OWNER_REVIEW", after["status"],
+                                    "ordinary resume must not reaffirm the conflicted public handoff")
+
+
+class CallbackLiveReviewerR11(LiveReviewer):
+    """The external reviewer boundary, with a confirmed simulated start."""
+
+    def run(self, *args, **kwargs):
+        callback = kwargs.get("on_start")
+        if callback is None:
+            raise AssertionError("the controller must pass its process-start callback")
+        callback(424242)  # SIMULATED external reviewer PID, never a live model.
+        self.log_after_start = self.live_path.read_text(encoding="utf-8")
+        return super().run(*args, **kwargs)
+
+
+class ForegroundRoundElevenLiveLaunchTests(ForegroundFixture, unittest.TestCase):
+    """R10-F2 (owner-supplied): the foreground live log announces a reviewer only after the confirmed process start
+    and records a never-launched attempt's failure for its candidate and attempt."""
+
+    unlaunched_request = ForegroundRoundTenTests.unlaunched_request
+
+    def test_foreground_setup_failure_has_no_running_claim_and_a_terminal_log_line(self):
+        env = self.fg_env()
+        candidate = env.commit("feature.txt", "v2\n", "SIMULATED foreground feature v2")
+        env.push()
+        before = self.state(env)
+        rounds_before = dict(before["rounds_completed"])
+        limits_before = dict(before["limits"])
+        calls_before = (len(env.developer.calls), len(env.reviewer.calls))
+
+        # Existing real stream-setup fixture: stderr-1.txt is a directory;
+        # the Codex Popen boundary is intercepted only for that executable
+        # and asserted never dispatched. Real Git subprocesses remain real.
+        code, outcome, stderr = self.unlaunched_request(
+            env, None, lambda ctl: self.review_cmd(env, ctl=ctl), 1
+        )
+        self.assertEqual(ar.EXIT_BLOCKED, code, outcome)
+        self.assertEqual("BLOCKED", outcome["status"])
+        self.assertIn("reviewer launch setup for round 1 failed", outcome["reason"])
+        self.assertIn("no reviewer was launched", outcome["reason"])
+
+        state = self.state(env)
+        attempt = state["rounds"][-1]["attempts"][-1]
+        self.assertIs(False, attempt["launched"])
+        self.assertIn("ended", attempt)
+        self.assertNotIn("pid", attempt)
+        self.assertEqual(rounds_before, state["rounds_completed"])
+        self.assertEqual(limits_before, state["limits"])
+        self.assertEqual(calls_before, (len(env.developer.calls), len(env.reviewer.calls)))
+        self.assertTrue(env.controller().helper_authority_problems())
+
+        rows = []
+        ar.watch_enrollment(env.dir, rows.append, once=True)
+        status = next(row for row in rows if " | latest action:" in row)
+        self.assertIn("no agent running", status)
+        self.assertIn("not reviewed: no reviewer launched", status)
+        self.assertIn("reviewer launch setup for round 1 failed", status)
+
+        live = self.live_text(env)
+        self.observation = {
+            "candidate": candidate,
+            "command": {"exit_code": code, "status": outcome["status"], "reason": outcome["reason"]},
+            "attempt": attempt,
+            "live_log": live,
+            "watch_status": status,
+            "rounds_before": rounds_before,
+            "rounds_after": state["rounds_completed"],
+            "model_calls_before": calls_before,
+            "model_calls_after": (len(env.developer.calls), len(env.reviewer.calls)),
+            "zero_reviewer_process_dispatch_verified_by_fixture": True,
+        }
+
+        with self.subTest(behavior="no false running claim"):
+            self.assertNotIn("is reviewing candidate", live,
+                             "the reviewer never launched, so the live feed must not claim it is reviewing")
+        with self.subTest(behavior="terminal failure visible on same feed"):
+            failure_lines = [line for line in live.splitlines()
+                             if "review round 1 attempt 1" in line
+                             and candidate[:10] in line
+                             and any(word in line.lower() for word in ("failed", "not launched", "never launched"))]
+            self.assertTrue(failure_lines,
+                            "the foreground live feed must identify this candidate and attempt's failed launch")
+        self.assertNotIn(str(env.root), live, "private setup paths belong in the saved attempt, not the progress feed")
+
+    def test_confirmed_start_keeps_running_status_and_activity_visible_before_return(self):
+        env = self.fg_env()
+        env.reviewer = CallbackLiveReviewerR11(env.dir / "live.log")
+        env.reviewer.script = [{"decision": "ready_for_owner_review"}]
+        candidate = env.commit("feature.txt", "v2\n", "SIMULATED foreground feature v2")
+        env.push()
+        code, outcome, _ = self.review_cmd(env)
+        self.assertEqual((ar.EXIT_OK, "ready_for_owner_review"), (code, outcome["result"]))
+        self.assertIn("review round 1 attempt 1", env.reviewer.log_after_start)
+        self.assertIn("is reviewing candidate " + candidate[:10], env.reviewer.log_after_start)
+        self.assertEqual([True], env.reviewer.seen_while_running)
+        live = self.live_text(env)
+        self.assertIn("review round 1 attempt 1 ended: valid result, decision ready_for_owner_review", live)
+        self.assertNotIn("PRIVATE-THOUGHT", live)
+        state = self.state(env)
+        self.assertEqual({"final": 1}, state["rounds_completed"])
+        self.assertEqual((0, 1), (len(env.developer.calls), len(env.reviewer.calls)))
+
+
 if __name__ == "__main__":
     unittest.main()

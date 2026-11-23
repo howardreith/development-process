@@ -284,10 +284,23 @@ permission mode must be one of `default`, `acceptEdits`, `plan`, `auto` or
 approval; it does not show which allowances or denials the owner configured in
 their settings, which remain the owner's responsibility.
 
+**Publication integrity.** A published part is settled only when its recorded
+comment id, the expected actor, its complete marker and its preserved body (apart
+from line endings and trailing whitespace) all identify the same single comment:
+the marker must appear on no other comment by that actor. The same per-part check
+is used wherever the controller decides that a publication is on the PR: before a
+review verdict is accepted and charged, when a capped blocker's notice is reused,
+and when readiness and an owner-review handoff are verified (`finalize`, `status
+--remote`, `resume`). A withdrawn part that was never sent must stay absent.
+
 **Live output.** Reviewer activity (the commands Codex runs, their exit codes
 and its messages; never reasoning) and every line of gate output are appended,
 as they happen, to the enrollment's private live log, whose path `status` prints
 as `live_log` (`<state>/<enrollment>/live.log`). In an interactive terminal the same lines also go to stderr.
+A reviewer attempt is announced as reviewing only once its process start is
+confirmed; an attempt that never launched gets one line naming its round,
+attempt and candidate and the failing stage (the details stay in the private
+attempt record).
 Gate receipts, their logs and digests, reviewer event files and envelopes are
 unchanged and remain the only evidence; the live log is progress for people.
 Claude Code shows a tool's output only when the tool finishes, so in the
@@ -461,9 +474,7 @@ these hold: it was delivered and nothing is pending; every status comment the
 controller recorded as accepted appears in GitHub's chronological listing (one
 acknowledged but not yet listed leaves the order unresolved); the latest of
 them is that notice under its recorded id; and, on that same listing, it passes
-the controller's usual settlement check: by the expected actor, exactly one
-comment carrying its marker, and a body equal to the preserved outgoing message
-apart from line endings and trailing whitespace. Otherwise, for
+the controller's usual settlement check. Otherwise, for
 example when a later PAUSED notice is the public account, a listing lags or the
 notice was edited or its marker is duplicated, one new BLOCKED correction with its own durable identity is
 queued; the earlier comment is left as it is. A correction posted then is

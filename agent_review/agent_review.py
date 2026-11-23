@@ -3072,6 +3072,8 @@ class Controller:
             attempt.update(ended=now_iso(), ok=False, fatal=False, launched=False,
                            reasons=[f"not launched: {stage} failed ({detail})"])
             self.save()
+            self.live.line(f"review round {rnd['round']} attempt {n} for candidate {short(rnd['H'])}: not launched; "
+                           f"{stage} failed ({type(exc).__name__}); details are in the attempt record")
             if isinstance(exc, Stop):
                 raise exc
             raise Stop("BLOCKED", f"{stage} for round {rnd['round']} failed ({type(exc).__name__}); no reviewer was "
@@ -3090,13 +3092,15 @@ class Controller:
             except (Stop, CommandError, subprocess.TimeoutExpired, OSError) as exc:
                 not_launched(exc, "reviewer input preparation")
 
+            req = reviewer.requested
+
             def on_start(pid):
                 attempt["pid"] = pid  # the process-start record: from here on the attempt counts as launched
                 self.save()
+                self.live.line(f"review round {rnd['round']} attempt {n}: Codex {req.get('model')}/"
+                               f"{req.get('effort')} (read-only) is reviewing candidate {short(rnd['H'])}; its "
+                               "activity follows")
             events = rnd_dir / f"events-{n}.jsonl"
-            req = reviewer.requested
-            self.live.line(f"review round {rnd['round']} attempt {n}: Codex {req.get('model')}/{req.get('effort')} "
-                           f"(read-only) is reviewing candidate {short(rnd['H'])}; its activity follows")
             tail = EventTail(events, self.live, render_codex_event)
             tail.start()
             try:
@@ -4914,9 +4918,27 @@ class Controller:
         self.transition("done", "owner review handoff posted")
         return "AWAITING_OWNER_REVIEW"
 
+    def part_identity_problem(self, key, part, listing):
+        """None when the recorded comment id, the expected actor, the complete marker and the normalized preserved body
+        identify one and the same unique remote comment; otherwise why not. The marker must be unique among the
+        expected actor's comments and that sole match must be the recorded comment, so the body checked at the
+        recorded id and the marker found in the listing can never come from different comments."""
+        remote = next((c for c in listing if c.get("id") == part.get("comment_id")), None) if part.get("comment_id") \
+            else None
+        copies = [c for c in listing if c.get("user") == self.cfg["expected_actor"]
+                  and (c.get("body") or "").startswith(part["marker"])]
+        if not remote:
+            return "gone"
+        if remote.get("user") != self.cfg["expected_actor"]:
+            return "by another author"
+        if [c.get("id") for c in copies] != [remote["id"]]:
+            return "its marker does not identify the recorded comment alone (duplicated or carried by another comment)"
+        if normalize_body(remote.get("body")) != normalize_body(self.outbox_body(key, part)):
+            return "altered"
+        return None
+
     def publication_problems(self, key, pub, listing):
         """Why one publication is not settled on the PR: inventory, markers, author, body and uniqueness."""
-        comments = {c["id"]: c for c in listing}
         if pub["state"] != "posted":
             return "not sent"
         total = len(pub["parts"])
@@ -4925,12 +4947,9 @@ class Controller:
                             for i, m in enumerate(numbering)):
             return "incomplete part inventory"
         for part in pub["parts"]:
-            remote = comments.get(part["comment_id"])
-            copies = [c for c in listing if c.get("user") == self.cfg["expected_actor"]
-                      and (c.get("body") or "").startswith(part["marker"])]
-            if not remote or remote.get("user") != self.cfg["expected_actor"] or len(copies) != 1 or \
-                    normalize_body(remote.get("body")) != normalize_body(self.outbox_body(key, part)):
-                return f"part {part['marker'][-30:]} is gone, altered, by another author, or duplicated"
+            problem = self.part_identity_problem(key, part, listing)
+            if problem:
+                return f"part {part['marker'][-30:]} is {problem}"
         return None
 
     def missing_publications(self, include_receipt=None):
@@ -4965,10 +4984,8 @@ class Controller:
                         missing.append(key)
                         break
                     continue  # the delivered parts of a withdrawn request are verified exactly like a posted one
-                remote = comments.get(part["comment_id"])
-                if not remote or remote.get("user") != self.cfg["expected_actor"] or len(copies) != 1 or \
-                        normalize_body(remote.get("body")) != normalize_body(self.outbox_body(key, part)):
-                    missing.append(key)  # gone, altered, by another author, or duplicated
+                if self.part_identity_problem(key, part, listing):  # the same invariant as publication_problems
+                    missing.append(key)  # gone, altered, by another author, duplicated or carried by another comment
                     break
         return missing
 
