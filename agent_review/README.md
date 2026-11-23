@@ -331,10 +331,13 @@ invocation or attempt, are stamped with the time the watch observed them. Every
 complete record resets the silence clock, whether or not it is displayable;
 blank lines and a record still being written do not. With no agent running, the
 latest run is chosen by the controller's recorded launch and attempt times.
-Reviewer history comes from the most recent round with a recorded attempt,
+Reviewer history comes from the most recent round with a recorded execution,
 current or retained by a `resume` in `earlier_attempts`, read under its own
-round and attempt numbers; a replacement review request that has not yet opened
-an attempt is not an execution. Only the last round's current attempts can be
+round and attempt numbers. A replacement review request that has not yet opened
+an attempt is not an execution, and neither is an attempt recorded as
+`launched: false` (its reviewer process was never created); attempts without
+that field are executions. A path that is not a regular file is never opened as
+an event stream. Only the last round's current attempts can be
 the running reviewer, and a running attempt with no observed action is reported
 as such. When the records cannot order the runs, the latest action is shown as
 uncertain. `--once` prints one observation. `watch` never
@@ -449,12 +452,16 @@ That covers a publication failure during the amendment's own settlement, during
 an ordinary capped `resume`, or while the restored notice is delivered. A later
 ordinary `resume` sends the queued corrections, restores that blocker, records
 the transition and queues its notice in one transaction, then still refuses (no
-rounds, no launches). The blocker's existing notice is reused only when it was
-delivered and is still the latest status comment this enrollment authenticated
-on the PR (GitHub's chronological order, matched to the comment ids the
-controller recorded). If a later status, such as the PAUSED notice of the
-displacing stop, is the public account, one new BLOCKED correction with its own
-durable identity is queued instead. The same notice is never delivered twice,
+rounds, no launches). The blocker's existing notice is reused only when all of
+these hold: it was delivered and nothing is pending; every status comment the
+controller recorded as accepted appears in GitHub's chronological listing (one
+acknowledged but not yet listed leaves the order unresolved); the latest of
+them is that notice under its recorded id; and its visible body, with its
+complete marker, still equals the preserved outgoing message. Otherwise, for
+example when a later PAUSED notice is the public account, a listing lags or the
+notice was edited, one new BLOCKED correction with its own durable identity is
+queued; the earlier comment is left as it is. A correction posted then is
+necessarily later than every status GitHub has already accepted. The same notice is never delivered twice,
 and repeated recovery after success adds nothing. Pending publications are
 always replayed in the numeric order in which they were queued. A refusal at a
 genuine cap leaves any other stop reason, such as a no-progress stop,

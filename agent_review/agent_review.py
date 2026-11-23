@@ -2763,22 +2763,33 @@ class Controller:
         return self.queue(f"status-{len(self.state.get('transitions', []))}-{status.lower()}",
                           self.status_body(status, reason))["key"]
 
-    def latest_public_status_key(self):
-        """The key of this enrollment's latest status notice on the PR, in GitHub's chronological comment order.
-        A comment counts only when it is by the expected actor, carries this enrollment's marker for a status
-        publication, and its id is one this controller recorded for that publication (an authenticated delivery,
-        not a local flag or timestamp). None when no such comment is visible."""
-        prefix = f"<!-- agent-review:v1 enrollment={self.state['enrollment_id']} key="
-        pubs, latest = self.state.get("publications", {}), None
+    def status_notice_is_latest_and_intact(self, key):
+        """True only when the status publication `key` is, on the evidence GitHub gives, this enrollment's latest
+        public status and its comment is still what the controller sent. Read from GitHub's chronological comment
+        listing:
+        - every status comment the controller recorded as accepted (its id from the POST response or an
+          authenticated read) must appear in the listing; one that is acknowledged but not yet listed leaves the
+          public order unresolved, so its absence never proves that an older notice is still the latest;
+        - the latest listed status comment must be one of `key`'s recorded comment ids (expected actor);
+        - each of `key`'s parts must be visible under its recorded id with its complete marker and a body equal, after
+          normalization, to the preserved outbox body (outbox_body re-verifies the digest)."""
+        pubs = self.state.get("publications", {})
+        recorded = {part["comment_id"]: (k, part) for k, pub in pubs.items() if STATUS_KEY_RE.fullmatch(k)
+                    and pub.get("state") == "posted" for part in pub.get("parts", []) if part.get("comment_id")}
+        listed, latest = {}, None
         for comment in self.gh.comments(self.state["pr"]["number"]):
-            body = comment.get("body") or ""
-            if comment.get("user") != self.cfg["expected_actor"] or not body.startswith(prefix):
-                continue
-            key = body[len(prefix):].split(" ", 1)[0]
-            recorded = {part.get("comment_id") for part in (pubs.get(key) or {}).get("parts", [])}
-            if STATUS_KEY_RE.fullmatch(key) and comment.get("id") in recorded:
-                latest = key
-        return latest
+            if comment.get("id") in recorded and comment.get("user") == self.cfg["expected_actor"]:
+                listed[comment["id"]] = comment
+                latest = comment["id"]
+        if set(recorded) - set(listed) or latest is None or recorded[latest][0] != key:
+            return False
+        for part in pubs[key]["parts"]:
+            comment = listed.get(part.get("comment_id"))
+            body = (comment or {}).get("body") or ""
+            if not comment or not body.startswith(part["marker"] + "\n") or \
+                    normalize_body(body) != normalize_body(self.outbox_body(key, part)):
+                return False
+        return True
 
     def publish_status(self, status, reason):
         if not self.identity_ok:
@@ -4338,15 +4349,18 @@ class Controller:
             return False
         reason = marker["reason"]
         # Called after the caller settled pending publications (uncertain POSTs reconciled). The blocker's existing
-        # notice is reused only when it was delivered and is still the latest confirmed status on the PR (for
-        # example a restoration notice delivered after the stop that displaced it); otherwise a later status (such
-        # as that PAUSED notice) is the public account, and one new BLOCKED correction with its own durable identity
-        # is queued. Anything still pending is newer than what GitHub shows, so it never permits reuse.
+        # notice is reused only when it was delivered, nothing is pending, and status_notice_is_latest_and_intact
+        # establishes that it is the latest public status and unaltered (for example a restoration notice that
+        # really posted after the stop that displaced it). Otherwise (a later status such as that PAUSED notice is
+        # the public account, an accepted status is not yet listed so the order is unresolved, or the notice's
+        # visible body no longer matches what was sent) one new BLOCKED correction with its own durable identity is
+        # queued and the earlier comment is left as it is. A correction posted now is necessarily later than every
+        # status GitHub has already accepted, so it settles the public account even while a listing lags.
         pubs = self.state.get("publications", {})
         previous = pubs.get(marker.get("notice_key") or "")
         pending = any(p.get("state") == "pending" and not VERDICT_KEY_RE.match(k) for k, p in pubs.items())
         reuse = bool(previous) and previous.get("state") == "posted" and not pending and \
-            self.latest_public_status_key() == marker.get("notice_key")
+            self.status_notice_is_latest_and_intact(marker["notice_key"])
         with self.txn():
             self.state.update(status="BLOCKED", status_reason=reason)
             self.transition(self.state["phase"], f"BLOCKED: {reason} (restored after the capped amendment's "
@@ -5992,6 +6006,8 @@ def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes
             info = path.stat()
         except OSError:
             return
+        if not stat.S_ISREG(info.st_mode):
+            return  # an event stream is a regular file; anything else at its path is never opened
         size, mtime = info.st_size, dt.datetime.fromtimestamp(info.st_mtime, dt.timezone.utc)
         start = offsets.get(path)
         first = start is None
@@ -6045,10 +6061,13 @@ def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes
         # resume in `earlier_attempts` (a replacement request with no attempt yet is not an execution), read from
         # its own round directory under its own round and attempt numbers; only the last round's current attempts
         # can be the running reviewer
-        executed = next((r for r in reversed(rounds) if isinstance(r, dict) and
-                         (r.get("attempts") or r.get("earlier_attempts"))), {})
-        retained = {a.get("n"): a for a in (executed.get("earlier_attempts") or []) + (executed.get("attempts") or [])
-                    if isinstance(a, dict)}
+        # An attempt closed with launched=false (its reviewer process was never created) is not an execution; records
+        # without the field (ordinary and older attempts) are.
+        def executions(r):
+            return [a for a in (r.get("earlier_attempts") or []) + (r.get("attempts") or [])
+                    if isinstance(a, dict) and a.get("launched") is not False]
+        executed = next((r for r in reversed(rounds) if isinstance(r, dict) and executions(r)), {})
+        retained = {a.get("n"): a for a in executions(executed)}
         for attempt in retained.values():
             follow(folder / "rounds" / f"r{int(executed['round']):02d}" / f"events-{attempt.get('n')}.jsonl",
                    render_codex_event, ("reviewer", executed.get("round"), attempt.get("n")))
