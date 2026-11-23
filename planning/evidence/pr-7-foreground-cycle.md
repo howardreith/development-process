@@ -489,3 +489,48 @@ mutations: listing completeness removed -> visibility test FAILS; body compariso
 Executed: real temporary Git repositories, controller state and command paths. Simulated: GitHub, Claude and Codex
 boundaries (in the watch cases, only the test's Codex executable at process creation). Not established: CPython 3.12
 on this host, real GitHub listing-lag frequency, and live-model behavior (these changes do not touch those paths).
+
+
+## 11. Round 9 and the round-10 batch (sanitized command evidence)
+
+Round 9 on `ca06b99` returned `changes_required`
+([review comment](https://github.com/howardreith/development-process/pull/7#issuecomment-7090013384)): R8-F1, R8-F2 and
+R8-F3 were verified. New, within the repair scope: R9-F1 (the reuse decision used its own stricter body check, so a
+CRLF-only body was rejected, and it ignored a competing copy of the marker), R9-F2 (a continuing watch replayed an
+earlier round as live after a failed launch) and R9-F3 (the status line called an unlaunched request "last reviewed").
+Under the owner's completion window, the session corrected these and wrote `ForegroundRoundTenTests`. On a clean
+detached `ca06b99` checkout with only the new test file:
+
+```text
+FAIL: test_a_competing_copy_of_the_marker_forces_a_correction_or_an_integrity_stop (recovery=1)
+AssertionError: False is not true
+FAIL: test_a_competing_copy_of_the_marker_forces_a_correction_or_an_integrity_stop (recovery=2)
+AssertionError: False is not true
+FAIL: test_a_continuing_watch_keeps_an_earlier_round_historical_after_a_failed_launch
+AssertionError: '(earlier) Codex: REVIEWER-events-3' not found in ['Codex: REVIEWER-events-1', 'Codex: REVIEWER-events-2', 'Codex: REVIEWER-events-3', 'BLOCKED/review | no agent running (controller or the foreground sess
+FAIL: test_a_crlf_only_delayed_notice_is_reused (recovery=1)
+AssertionError: 'status-8-blocked' != 'status-10-blocked'
+FAIL: test_a_crlf_only_delayed_notice_is_reused (recovery=2)
+AssertionError: 'status-8-blocked' != 'status-10-blocked'
+FAIL: test_the_status_line_never_presents_an_unlaunched_request_as_reviewed (case='first request, never launched')
+AssertionError: '(no accepted review yet; requested 1e477a7a9069: not reviewed: no reviewer launched)' not found in 'BLOCKED/review | no agent running (controller or the foreground session) | candidate 1e477a7a9069 (last
+FAIL: test_the_status_line_never_presents_an_unlaunched_request_as_reviewed (case='an unlaunched request after an accepted review')
+AssertionError: '(last reviewed 98bc875b6217: changes_required; requested e8f01be77bff: not reviewed: no reviewer launched)' not found in 'BLOCKED/review | no agent running (controller or the foreground session) | candid
+Ran 4 tests in 16.278s
+FAILED (failures=7)
+```
+
+On `4dfac2d543dcb00cd9e1e8bc2529879e047c0853`:
+
+```text
+$ python -m unittest agent_review.test_agent_review.ForegroundRoundTenTests   -> Ran 4 tests ... OK
+$ python -I run_regressions.py --repo <worktree> (owner's round-8 bundle)      -> Ran 10 tests ... OK
+$ python -m unittest discover -s agent_review -p "test_*.py"                   -> Ran 322 tests ... OK (skipped=1)
+mutations: publication check skipped -> competing-copy test FAILS; history only at poll zero -> continuing-watch test
+           FAILS; "last reviewed" from the newest round -> status-line test FAILS
+```
+
+The continuing-watch test runs a real watcher thread that attaches while the replacement attempt is saved open; the
+real CodexReviewer stream setup then fails on a directory at its stderr path, and the test's Codex executable is never
+started. Simulated: GitHub, Claude and Codex boundaries. Not established: CPython 3.12 on this host, real GitHub
+listing-lag frequency, live-model behavior (not affected by these changes).
