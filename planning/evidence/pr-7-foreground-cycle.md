@@ -371,3 +371,121 @@ $ python -m unittest discover -s agent_review -p "test_*.py"                  ->
 mutations: mapping order instead of seq -> sequence test FAILS; reuse on the local record alone -> dual-failure test
            FAILS; history from the last round only -> watch-history test FAILS
 ```
+
+
+## 10. Round 8, the owner's completion window (limit 10), and the round-9 batch (sanitized command evidence)
+
+Round 8 on `d73f96a` returned `changes_required`
+([review comment](https://github.com/howardreith/development-process/pull/7#issuecomment-7088912402)): R5-F3, R7-F1 and
+R7-F2 were verified; R8-F1 (an acknowledged status missing from a lagging listing), R8-F2 (a reused notice's visible
+body not checked) and R8-F3 (watch counting an attempt recorded `launched: false`) were new. The owner authorized at most
+rounds 9 and 10 and supplied a ten-case acceptance bundle. The session ran `resume --max-rounds 10` (eight spent rounds,
+history and finding identities kept) and ran the bundle unchanged against the reviewed candidate before editing:
+
+```text
+$ python -I run_regressions.py --repo <worktree at d73f96a277b1194b4ec162a8328c5663e01665ee>
+Python: 3.14.7 (tags/v3.14.7:823f032, Aug  5 2026, 10:51:32) [MSC v.1944 64 bit (AMD64)]
+SHA-256 agent_review.py: 00d2fcc99e725ef1cb77e55bf0d12cbf1b22616af3e6ea00734e43ab20a27a9e
+SHA-256 test_agent_review.py: 62fec1451599c03201542ccbf7d9983aac5ea931a4f6a3e81a00740f4de2b779
+test_both_deferred_status_notices_recover_to_public_and_local_blocked ... ok
+test_reloaded_amendment_publishes_reopened_before_blocked ... ok
+test_replacement_request_preserves_latest_reviewer_action ... ok
+  test_acknowledged_paused_missing_from_listing_cannot_settle_stale_blocked (stage='listing still omits acknowledged PAUSED') ... FAIL
+  test_acknowledged_paused_missing_from_listing_cannot_settle_stale_blocked (stage='acknowledged comment visible', recovery=1) ... FAIL
+  test_acknowledged_paused_missing_from_listing_cannot_settle_stale_blocked (stage='acknowledged comment visible', recovery=2) ... FAIL
+  test_edited_visible_body_cannot_complete_recovery_by_id_and_marker_alone (recovery=1) ... FAIL
+  test_edited_visible_body_cannot_complete_recovery_by_id_and_marker_alone (recovery=2) ... FAIL
+test_intact_delayed_blocked_notice_can_be_reused_without_reposting ... ok
+  test_event_directory_fault_does_not_crash_watch_before_or_after_replacement (stage='initial closed unlaunched attempt') ... ERROR
+  test_event_directory_fault_does_not_crash_watch_before_or_after_replacement (stage='unlaunched history before empty replacement request') ... ERROR
+test_newer_unlaunched_round_does_not_hide_older_executed_reviewer_attempt ... FAIL
+test_open_attempt_without_events_still_has_current_reviewer_role ... ok
+  test_stderr_directory_fault_does_not_replace_latest_real_action_with_none (stage='initial closed unlaunched attempt') ... FAIL
+  test_stderr_directory_fault_does_not_replace_latest_real_action_with_none (stage='unlaunched history before empty replacement request') ... FAIL
+ERROR: test_event_directory_fault_does_not_crash_watch_before_or_after_replacement (stage='initial closed unlaunched attempt')
+PermissionError: [Errno 13] Permission denied: '<temp>\\state\\t-codex-feature-20261122203036-23b5\\rounds\\r01\\events-1.jsonl'
+ERROR: test_event_directory_fault_does_not_crash_watch_before_or_after_replacement (stage='unlaunched history before empty replacement request')
+PermissionError: [Errno 13] Permission denied: '<temp>\\state\\t-codex-feature-20261122203036-23b5\\rounds\\r01\\events-1.jsonl'
+FAIL: test_acknowledged_paused_missing_from_listing_cannot_settle_stale_blocked (stage='listing still omits acknowledged PAUSED')
+AssertionError: False is not true : an acknowledged-but-unlisted status must not silently finalize reuse of an older BLOCKED notice
+FAIL: test_acknowledged_paused_missing_from_listing_cannot_settle_stale_blocked (stage='acknowledged comment visible', recovery=1)
+AssertionError: 'Workflow — blocked' not found in "<!-- agent-review:v1 enrollment=t-codex-feature-20261122203024-bede key=status-7-paused part=1/1 sha256=bf583c1e81f804426ec6780d37402ed8cf4737a4f5696
+FAIL: test_acknowledged_paused_missing_from_listing_cannot_settle_stale_blocked (stage='acknowledged comment visible', recovery=2)
+AssertionError: 'Workflow — blocked' not found in "<!-- agent-review:v1 enrollment=t-codex-feature-20261122203024-bede key=status-7-paused part=1/1 sha256=bf583c1e81f804426ec6780d37402ed8cf4737a4f5696
+FAIL: test_edited_visible_body_cannot_complete_recovery_by_id_and_marker_alone (recovery=1)
+AssertionError: False is not true : the public reason was edited, but recovery was falsely marked complete
+FAIL: test_edited_visible_body_cannot_complete_recovery_by_id_and_marker_alone (recovery=2)
+AssertionError: False is not true : the public reason was edited, but recovery was falsely marked complete
+FAIL: test_newer_unlaunched_round_does_not_hide_older_executed_reviewer_attempt
+AssertionError: 'latest action: Codex: ACTUAL-REVIEWER-events-3 (before this watch started)' not found in 'BLOCKED/review | no agent running (controller or the foreground session) | candidate d601b2b3
+FAIL: test_stderr_directory_fault_does_not_replace_latest_real_action_with_none (stage='initial closed unlaunched attempt')
+AssertionError: 'latest action: Claude: ACTUAL-DEVELOPER-BEFORE-UNLAUNCHED-REVIEWER (before this watch started)' not found in 'BLOCKED/review | no agent running (controller or the foreground session) 
+FAIL: test_stderr_directory_fault_does_not_replace_latest_real_action_with_none (stage='unlaunched history before empty replacement request')
+AssertionError: 'latest action: Claude: ACTUAL-DEVELOPER-BEFORE-UNLAUNCHED-REVIEWER (before this watch started)' not found in 'PAUSED/review | no agent running (controller or the foreground session) |
+Ran 10 tests in 38.853s
+FAILED (failures=8, errors=2)
+```
+
+This matches the bundle's baseline (5 methods pass, 8 failures, 2 errors). On Windows the directory open raises
+`PermissionError` where the bundle's Linux run raised `IsADirectoryError`; in both erroring subtests the setup assertions
+(attempt saved with `launched: false`, no reviewer process dispatched, obstacle present) passed first. After the
+correction (`8c5f6fd39a2d85c16b6175001fe248435f1049f3`), the same unchanged bundle:
+
+```text
+SHA-256 agent_review.py: ec4f604bf3f0df41c46bd35c27787f8c2d3dbf18e511ff31155838f8b00a9e41
+SHA-256 test_agent_review.py: e7760d87b5c937b43a217dd6d99d19bad7db00fd3b1b45e48c31a96b64262ee8
+Ran 10 tests in 43.389s
+OK
+```
+
+The new cases are integrated as `ForegroundRoundNineVisibilityTests`, `ForegroundRoundNineIntegrityTests` and
+`WatchRoundNineUnlaunchedTests` (class bodies unchanged apart from module prefixes and names). On a clean detached
+`d73f96a` checkout with only the new test file:
+
+```text
+ERROR: test_event_directory_fault_does_not_crash_watch_before_or_after_replacement (stage='initial closed unlaunched attempt')
+PermissionError: [Errno 13] Permission denied: '<temp>\\state\\t-codex-feature-20261122205005-bc3d\\rounds\\r01\\events-1.jsonl'
+ERROR: test_event_directory_fault_does_not_crash_watch_before_or_after_replacement (stage='unlaunched history before empty replacement request')
+PermissionError: [Errno 13] Permission denied: '<temp>\\state\\t-codex-feature-20261122205005-bc3d\\rounds\\r01\\events-1.jsonl'
+FAIL: test_acknowledged_paused_missing_from_listing_cannot_settle_stale_blocked (stage='listing still omits acknowledged PAUSED')
+AssertionError: False is not true : an acknowledged-but-unlisted status must not silently finalize reuse of an older BLOCKED notice
+FAIL: test_acknowledged_paused_missing_from_listing_cannot_settle_stale_blocked (stage='acknowledged comment visible', recovery=1)
+AssertionError: 'Workflow — blocked' not found in "<!-- agent-review:v1 enrollment=t-codex-feature-20261122204944-7e60 key=status-7-paused part=1/1 sha256=0104f58df6695c79a3bd058d394fbbf2329b045f7efd8
+FAIL: test_acknowledged_paused_missing_from_listing_cannot_settle_stale_blocked (stage='acknowledged comment visible', recovery=2)
+AssertionError: 'Workflow — blocked' not found in "<!-- agent-review:v1 enrollment=t-codex-feature-20261122204944-7e60 key=status-7-paused part=1/1 sha256=0104f58df6695c79a3bd058d394fbbf2329b045f7efd8
+FAIL: test_edited_visible_body_cannot_complete_recovery_by_id_and_marker_alone (recovery=1)
+AssertionError: False is not true : the public reason was edited, but recovery was falsely marked complete
+FAIL: test_edited_visible_body_cannot_complete_recovery_by_id_and_marker_alone (recovery=2)
+AssertionError: False is not true : the public reason was edited, but recovery was falsely marked complete
+FAIL: test_newer_unlaunched_round_does_not_hide_older_executed_reviewer_attempt
+AssertionError: 'latest action: Codex: ACTUAL-REVIEWER-events-3 (before this watch started)' not found in 'BLOCKED/review | no agent running (controller or the foreground session) | candidate 0b1cdbbc
+FAIL: test_stderr_directory_fault_does_not_replace_latest_real_action_with_none (stage='initial closed unlaunched attempt')
+AssertionError: 'latest action: Claude: ACTUAL-DEVELOPER-BEFORE-UNLAUNCHED-REVIEWER (before this watch started)' not found in 'BLOCKED/review | no agent running (controller or the foreground session) 
+FAIL: test_stderr_directory_fault_does_not_replace_latest_real_action_with_none (stage='unlaunched history before empty replacement request')
+AssertionError: 'latest action: Claude: ACTUAL-DEVELOPER-BEFORE-UNLAUNCHED-REVIEWER (before this watch started)' not found in 'PAUSED/review | no agent running (controller or the foreground session) |
+Ran 7 tests in 39.067s
+FAILED (failures=8, errors=2)
+```
+
+Coverage of the owner's combinations on `8c5f6fd`:
+
+| Combination | Decision | Test |
+| --- | --- | --- |
+| Acknowledged publication, listing delayed | order unresolved: distinct BLOCKED correction, never reuse | `test_acknowledged_paused_missing_from_listing_cannot_settle_stale_blocked` |
+| Intact delayed BLOCKED that really posts last | reused, posted once | `test_intact_delayed_blocked_notice_can_be_reused_without_reposting` |
+| Edited visible body, full marker and id kept | distinct correction; edited comment untouched | `test_edited_visible_body_cannot_complete_recovery_by_id_and_marker_alone` |
+| Repeated resume after settlement | nothing added (restore_needed cleared in the restoration transaction) | second recovery in every publication case |
+| Never-launched attempt, before and after an empty replacement request | excluded; directory never opened | event-directory and stderr-directory cases |
+| Earlier history whose records omit `launched` | still an execution; newer unlaunched round skipped | `test_newer_unlaunched_round_does_not_hide_older_executed_reviewer_attempt` |
+| Open attempt with no events | current reviewer, "none observed yet in this attempt" | `test_open_attempt_without_events_still_has_current_reviewer_role` |
+
+```text
+$ python -m unittest <round-7, round-8 and round-9 classes>        -> Ran 20 tests ... OK
+$ python -m unittest discover -s agent_review -p "test_*.py"       -> Ran 318 tests ... OK (skipped=1)
+mutations: listing completeness removed -> visibility test FAILS; body comparison removed -> edited-body test FAILS;
+           launched=false counted -> all four watch cases FAIL
+```
+
+Executed: real temporary Git repositories, controller state and command paths. Simulated: GitHub, Claude and Codex
+boundaries (in the watch cases, only the test's Codex executable at process creation). Not established: CPython 3.12
+on this host, real GitHub listing-lag frequency, and live-model behavior (these changes do not touch those paths).
