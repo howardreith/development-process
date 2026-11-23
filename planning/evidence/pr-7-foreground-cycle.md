@@ -290,3 +290,84 @@ Ran 307 tests ... OK (skipped=1)
 mutations: no admission hook -> zero test FAILS; no shared displacement marking -> crash/replay test FAILS;
            no notice reuse -> failed-notice test FAILS; current attempts only -> retained-attempt watch test FAILS
 ```
+
+## 9. Round 7, the owner's extension to eight rounds, and the round-8 batch (sanitized command evidence)
+
+Round 7 on `f393ca6` returned `changes_required`
+([review comment](https://github.com/howardreith/development-process/pull/7#issuecomment-7087814050)): R5-F1 and R6-F1
+were verified; R5-F3 was rejected (a replacement review request hid retained attempts) and R7-F1 and R7-F2 were new.
+The enrollment stopped at 7/7 with a no-progress stop. The owner authorized one more round (limit 8, no round 9) and
+supplied three failing acceptance cases. The session ran `resume --max-rounds 8` (seven spent rounds and the three
+open findings kept; no-progress counters reset by the normal owner-resume path), read the bundle, and ran it unchanged
+against the reviewed candidate before editing:
+
+```text
+$ python -I run_regressions.py --repo <worktree at f393ca6b966aaafe5a740f0b5a43475ff0e2c06a>
+Python: 3.14.7
+SHA-256 agent_review.py: f1acb6bc9c10b63a3c847f6633532669f0b636c3feb9931c05de25e843738efe
+SHA-256 test_agent_review.py: 0cb21a19996b6429bcf3e1b619cc5c1a661dbc1953ac22d0f2e671fb1eb4415c
+FAIL: test_both_deferred_status_notices_recover_to_public_and_local_blocked (recovery=1)
+AssertionError: 'Workflow — blocked' not found in '### Workflow — paused — checkpoint final' : the last public status must agree with the recovered local BLOCKED state
+FAIL: test_both_deferred_status_notices_recover_to_public_and_local_blocked (recovery=2)
+AssertionError: 'Workflow — blocked' not found in '### Workflow — paused — checkpoint final' : the last public status must agree with the recovered local BLOCKED state
+FAIL: test_reloaded_amendment_publishes_reopened_before_blocked (recovery=1)
+AssertionError: Lists differ: ['### Workflow — reopened — checkpoint final', '### Workfl[28 chars]nal'] != ['### Workflow — blocked — checkpoint final', '### Workflo[28 chars]nal']
+FAIL: test_reloaded_amendment_publishes_reopened_before_blocked (recovery=2)
+AssertionError: Lists differ: ['### Workflow — reopened — checkpoint final', '### Workfl[28 chars]nal'] != ['### Workflow — blocked — checkpoint final', '### Workflo[28 chars]nal']
+FAIL: test_replacement_request_preserves_latest_reviewer_action
+AssertionError: 'latest action: Codex: RETAINED-REVIEWER-r01-events-3 (before this watch started)' not found in 'PAUSED/review | no agent running (controller or the foreground session) | candidate 6f1
+Ran 3 tests in 19.003s
+FAILED (failures=5)
+```
+
+The failures match the bundle's own 3.12.14 baseline. After the correction (`cf835127680aee7d3f4ebe34cd279c571524fcc2`), the same unchanged bundle:
+
+```text
+SHA-256 agent_review.py: 00d2fcc99e725ef1cb77e55bf0d12cbf1b22616af3e6ea00734e43ab20a27a9e
+SHA-256 test_agent_review.py: 62fec1451599c03201542ccbf7d9983aac5ea931a4f6a3e81a00740f4de2b779
+Ran 3 tests in 67.041s
+OK
+```
+
+The cases are integrated into `ForegroundRoundEightTests` (bodies unchanged apart from module prefixes) together with
+`test_the_dual_failure_recovery_leaves_this_public_chronology`. On a clean detached `f393ca6` checkout with only the new
+test file:
+
+```text
+FAIL: test_both_deferred_status_notices_recover_to_public_and_local_blocked (recovery=1)
+AssertionError: 'Workflow — blocked' not found in '### Workflow — paused — checkpoint final' : the last public status must agree with the recovered local BLOCKED state
+FAIL: test_both_deferred_status_notices_recover_to_public_and_local_blocked (recovery=2)
+AssertionError: 'Workflow — blocked' not found in '### Workflow — paused — checkpoint final' : the last public status must agree with the recovered local BLOCKED state
+FAIL: test_reloaded_amendment_publishes_reopened_before_blocked (recovery=1)
+AssertionError: Lists differ: ['### Workflow — reopened — checkpoint final', '### Workfl[28 chars]nal'] != ['### Workflow — blocked — checkpoint final', '### Workflo[28 chars]nal']
+FAIL: test_reloaded_amendment_publishes_reopened_before_blocked (recovery=2)
+AssertionError: Lists differ: ['### Workflow — reopened — checkpoint final', '### Workfl[28 chars]nal'] != ['### Workflow — blocked — checkpoint final', '### Workflo[28 chars]nal']
+FAIL: test_replacement_request_preserves_latest_reviewer_action
+AssertionError: 'latest action: Codex: RETAINED-REVIEWER-r01-events-3 (before this watch started)' not found in 'PAUSED/review | no agent running (controller or the foreground session) | candidate 12f
+FAIL: test_the_dual_failure_recovery_leaves_this_public_chronology (recovery=1)
+AssertionError: 'Workflow — blocked' not found in '### Workflow — paused — checkpoint final' : the last public status must agree with the recovered local BLOCKED state
+FAIL: test_the_dual_failure_recovery_leaves_this_public_chronology (recovery=2)
+AssertionError: 'Workflow — blocked' not found in '### Workflow — paused — checkpoint final' : the last public status must agree with the recovered local BLOCKED state
+FAIL: test_the_dual_failure_recovery_leaves_this_public_chronology
+AssertionError: Lists differ: ['reopened', 'blocked', 'paused', 'blocked', 'paused', 'blocked'] != ['reopened', 'blocked', 'paused', 'blocked', 'paused']
+Ran 4 tests in 21.218s
+FAILED (failures=8)
+```
+
+On `cf835127680aee7d3f4ebe34cd279c571524fcc2`, the actual status comments of the dual-failure case, in GitHub order (simulated GitHub):
+
+```text
+status-3-reopened  | ### Workflow — reopened — checkpoint final
+status-6-blocked   | ### Workflow — blocked — checkpoint final   (amendment at the cap)
+status-7-paused    | ### Workflow — paused — checkpoint final    (PR-body edit failed)
+status-8-blocked   | ### Workflow — blocked — checkpoint final   (restored blocker; delivery deferred, sent on recovery)
+status-9-paused    | ### Workflow — paused — checkpoint final    (its delivery failure; deferred, sent on recovery)
+status-10-blocked  | ### Workflow — blocked — checkpoint final   (one correction; the second recovery adds nothing)
+```
+
+```text
+$ python -m unittest ForegroundRoundEightTests ForegroundRoundSevenTests      -> Ran 13 tests ... OK
+$ python -m unittest discover -s agent_review -p "test_*.py"                  -> Ran 311 tests ... OK (skipped=1)
+mutations: mapping order instead of seq -> sequence test FAILS; reuse on the local record alone -> dual-failure test
+           FAILS; history from the last round only -> watch-history test FAILS
+```
