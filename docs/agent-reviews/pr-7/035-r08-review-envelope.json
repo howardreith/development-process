@@ -1,0 +1,206 @@
+{
+  "B": "a2a14d8e4b0e080bed34683ae2dc8eb123e4524b",
+  "H": "d73f96a277b1194b4ec162a8328c5663e01665ee",
+  "M": "a2a14d8e4b0e080bed34683ae2dc8eb123e4524b",
+  "amendment_revision": null,
+  "amendment_sha256": "none",
+  "checkpoint_id": "final",
+  "checkpoint_type": "final",
+  "fatal": false,
+  "guidance_revision": null,
+  "guidance_sha256": "none",
+  "invocation": {
+    "completed": true,
+    "duration_s": 563.8,
+    "errors": [],
+    "exit_code": 0,
+    "failed": false,
+    "observed": {
+      "approval_policy": "never",
+      "cli_version": "0.170.0",
+      "network": "restricted",
+      "observed_effort": "max",
+      "observed_model": "gpt-6.2-astra",
+      "plan_type": "pro",
+      "rollout_found": true,
+      "sandbox": "read-only",
+      "source": "Codex session rollout (CLI-recorded thread settings; not model-authored)",
+      "subagent_suspected": false,
+      "turn_efforts": [
+        "max"
+      ],
+      "turn_models": [
+        "gpt-6.2-astra"
+      ],
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 2824576,
+        "input_tokens": 3024083,
+        "output_tokens": 21385,
+        "reasoning_output_tokens": 13338,
+        "total_tokens": 3045468
+      }
+    },
+    "requested": {
+      "effort": "max",
+      "model": "gpt-6.2-astra",
+      "sandbox": "read-only"
+    },
+    "thread_id": "01a205ea-4879-7272-82e8-02561c65e706",
+    "timed_out": false
+  },
+  "mission": {
+    "id": "foreground-development-mission",
+    "sha256": "6767591f278db8c3b2021a138bb6528aadb6e373a052fbbd420485cb4c475122"
+  },
+  "ok": true,
+  "path": "~\\.agent-review\\state\\devproc-claude-foreground-development-20261122110938-f02a\\rounds\\r08\\envelope-2.json",
+  "pr": 7,
+  "project_sha256": "bfa331169cea8fba3787ed5e96ca38b201fd5e1dc5c32dc93204de79f638664d",
+  "protocol": "agent-review.v1",
+  "publication": "r08-review",
+  "published": [
+    {
+      "comment_id": 7088912402,
+      "of": 1,
+      "part": 1,
+      "url": "https://github.com/howardreith/development-process/pull/7#issuecomment-7088912402"
+    }
+  ],
+  "raw_result_if_rejected": null,
+  "reasons": [],
+  "repository": "howardreith/development-process",
+  "request_id": "devproc-claude-foreground-development-20261122110938-f02a-r08-a39c94",
+  "response_sha256": "83a9e7eabc916a2e878e8f14d1a18b2751c0e60a6ef712c641e03fc094a059fd",
+  "result": {
+    "candidate_commit": "d73f96a277b1194b4ec162a8328c5663e01665ee",
+    "checkpoint_id": "final",
+    "checkpoint_type": "final",
+    "decision": "changes_required",
+    "decision_rationale": "The required unit gate passed, and all three prior findings are verified for their reported cases. Two defects in the new status check can still leave the PR showing the wrong blocker. The watcher can also hide the last real agent action when reviewer setup fails before launch.\n\n## Continuation for Claude\n\nThe recorded limit is eight rounds. Further work requires an owner decision. If authorized, reconcile acknowledged status comment IDs and verify the selected notice against its preserved body before clearing restoration. Keep numeric queue replay and the existing case where a delayed BLOCKED notice actually posts last. In watch, exclude attempts explicitly recorded as never launched from historical event selection. Exercise these cases through the existing recovery and watch fixtures, then run the required unit gate on the pushed correction. Keep the enrollment pinned and preserve its accounting and publication safeguards.",
+    "evidence_assessment": {
+      "executed_verification": [
+        "The controller receipt binds the required unit gate to d73f96a277b1194b4ec162a8328c5663e01665ee. It records exit 0, an unchanged worktree and 311 tests run with one skip. The supplied log matches the receipt SHA-256.",
+        "The candidate log records passes for all four ForegroundRoundEightTests and all nine ForegroundRoundSevenTests, including repeated recovery, numeric publication order and retained reviewer history.",
+        "The gate separately exercised delayed comment listings, altered publication bodies and reviewer setup failures that durably record launched=false. Those tests establish the individual service and filesystem conditions used in the findings."
+      ],
+      "inspected": [
+        "The fixed request, mission, developer report, prior findings ledger, repository instructions, operating guide, protocol and complete feature diff.",
+        "The correction from f393ca6 through d73f96a, its production callers and regression fixtures. The final commit adds the evidence record to the correction at cf83512.",
+        "The candidate-bound gate receipt and log, the foreground transcript withholding notice, and planning/evidence/pr-7-foreground-cycle.md."
+      ],
+      "limitations": [
+        "This review used the read-only snapshot. The controller supplied the gate execution. The foreground tool transcript was withheld, so the standalone owner-bundle and mutation runs are documented excerpts.",
+        "The actual Claude-interface demonstrations are recorded at earlier identified commits with real Codex and simulated GitHub. The live-model smoke was the skipped test at this candidate."
+      ],
+      "required_gaps": [
+        "Correct public blocker recovery when a comment listing lags an acknowledged POST or the selected notice has been edited.",
+        "Accurate historical activity after an attempt is explicitly closed before reviewer launch."
+      ],
+      "source_inspection_only": [
+        "Traced the new status reuse decision from POST acknowledgment through listing, restoration and repeat resume. The supplied gate covers these operations individually but does not exercise the combinations in R8-F1 and R8-F2.",
+        "Traced the never-launched attempt record into the watcher's round selection and event-file read. The combined watch outcome in R8-F3 was assessed from source."
+      ]
+    },
+    "findings": [
+      {
+        "acceptance_ids": [
+          "Part A.4",
+          "Part B.2",
+          "Protocol \u00a7\u00a77, 10"
+        ],
+        "actual": "send() records the PAUSED comment ID directly from the successful POST. With every publication marked posted, a listing that still ends at the original BLOCKED notice satisfies the reuse check. Recovery clears restore_needed. When PAUSED appears in the listing, another capped resume leaves it as the last public status.",
+        "blocking_rationale": "The PR can keep directing the owner to resolve a recovered outage when the decision actually required is a budget extension.",
+        "blocks_readiness": true,
+        "category": "defect",
+        "expected": "Once delivery settles, the latest PR notice and local BLOCKED state give the same budget reason. Repeated recovery preserves that result.",
+        "id": "R8-F1",
+        "location": {
+          "file": "agent_review/agent_review.py",
+          "line": 4349
+        },
+        "priority": "P2",
+        "requested_correction": "Account for acknowledged status IDs missing from the listing before deciding which notice posted last. Keep restoration recoverable while order is uncertain, and preserve the existing notice when it is confirmed current.",
+        "requested_evidence": "Extend the one-time PR-body failure fixture. Acknowledge PAUSED, omit only that ID from the listing during restoration, then make it visible. Verify the final public reason, one comment per marker, stable counters and idempotence on another resume.",
+        "title": "A lagging comment listing can leave an acknowledged PAUSED notice last",
+        "trigger": "A foreground handoff is amended at its cap. The original BLOCKED notice posts, the PR-body edit fails once, and GitHub acknowledges the resulting PAUSED notice. The next resume reads the comments before that PAUSED notice appears in the listing."
+      },
+      {
+        "acceptance_ids": [
+          "Part A.4",
+          "Part B.2",
+          "Protocol \u00a77"
+        ],
+        "actual": "latest_public_status_key() checks the author, enrollment and key prefix, and recorded comment ID. It never compares the visible body with the preserved publication. An edited notice can therefore pass the reuse check and clear restore_needed.",
+        "blocking_rationale": "Recovery can report that the public budget blocker is restored even though its latest comment omits or contradicts the reason.",
+        "blocks_readiness": true,
+        "category": "defect",
+        "expected": "A notice reused as the current blocker still contains the authenticated budget reason. A damaged notice results in a correction or an explicit integrity stop.",
+        "id": "R8-F2",
+        "location": {
+          "file": "agent_review/agent_review.py",
+          "line": 2779
+        },
+        "priority": "P2",
+        "requested_correction": "Apply the existing marker and normalized outbox-body checks to the notice selected for reuse. Preserve the historical comment and surface or correct an integrity mismatch before declaring restoration complete.",
+        "requested_evidence": "In the fixture where a delayed BLOCKED notice posts last, retain its recorded ID and full marker but truncate its visible reason before the reuse check. Verify detection of the mismatch and continued idempotence for an intact notice.",
+        "title": "Recovery can reuse a BLOCKED comment whose public reason was edited",
+        "trigger": "The recorded BLOCKED notice is last in a complete PR listing, but its visible text changed after posting while its ID and hidden marker stayed intact."
+      },
+      {
+        "acceptance_ids": [
+          "Part A, Existing running jobs",
+          "Part A.3",
+          "Part B.5"
+        ],
+        "actual": "The watcher selects a round with any recorded attempt and compares the attempt's opening time with the developer launch. An attempt saved with launched=false can win that comparison and produce \u201cnone observed yet in the latest recorded run.\u201d In the existing stream-setup failure fixture its event path is a directory, so opening it can also terminate watch before the status line.",
+        "blocking_rationale": "At a supported recovery stop, the owner can lose both the latest observable agent action and the status explaining the stop.",
+        "blocks_readiness": true,
+        "category": "defect",
+        "expected": "Watch shows the preceding real agent action as historical alongside the current blocker. An attempt known to have failed before launch contributes no reviewer event source.",
+        "id": "R8-F3",
+        "location": {
+          "file": "agent_review/agent_review.py",
+          "line": 6048
+        },
+        "priority": "P2",
+        "requested_correction": "Exclude attempts explicitly closed with launched=false from historical round selection, time comparison and event-file reads. Preserve attribution for a genuinely open attempt with no events and compatibility with older records that omit the flag.",
+        "requested_evidence": "Combine the pre-launch failure and replacement-request fixtures. Give the developer a distinctive recorded action, confirm the reviewer never launched, and verify watch --once reports that action and the blocker. Check the existing stream-directory fault while it is still present.",
+        "title": "Watch treats a reviewer attempt that never launched as an execution",
+        "trigger": "A headless developer emits an action and reviewer input or stream preparation then fails. A replacement request with no attempts can cause watch to select that preceding, explicitly unlaunched attempt as its reviewer history."
+      }
+    ],
+    "prior_finding_assessments": [
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R5-F3",
+        "rationale": "With three executed reviewer attempts retained in round 1 and an empty replacement request in round 2, watch now reads round 1's third event file, labels its note as historical and reports it as latest. The exact regression passed at H. R8-F3 concerns a record that explicitly confirms no reviewer launched."
+      },
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R7-F1",
+        "rationale": "The dual-POST-failure fixture now delivers both deferred notices, observes the later PAUSED comment and posts one distinct BLOCKED correction. A second recovery adds nothing. The candidate gate confirms the public chronology. R8-F1 concerns a successful PAUSED POST missing from the subsequent listing."
+      },
+      {
+        "assessment": "fix_verified",
+        "finding_id": "R7-F2",
+        "rationale": "Replay orders eligible publications by persisted numeric sequence. The three-round capped-handoff test reloads state twice and verifies REOPENED before BLOCKED across the digit boundary, the corrected PR body, unique markers and stable counters."
+      }
+    ],
+    "request_id": "devproc-claude-foreground-development-20261122110938-f02a-r08-a39c94",
+    "round": 8,
+    "schema_version": "agent-review.review.v1",
+    "summary": {
+      "delivered_behavior": "Interactive enrollment selects foreground development, verifies session provenance and returns the accepted review to Claude. Reviewer and gate activity are visible during execution. Foreground amendments reach both roles and invalidate stale results. The recorded demonstrations cover the correction cycle and the terminal-tail fallback for buffered interface output.",
+      "pending_later_phase_work": [],
+      "remaining_owner_review": [
+        "Decide whether to authorize further work beyond the recorded eight-round limit for draft PR #7."
+      ],
+      "scope_reviewed": "The complete foreground mission from a2a14d8 through d73f96a, with correction-round scrutiny of publication replay, capped-amendment recovery and watch history.",
+      "unresolved_questions": []
+    }
+  },
+  "round": 8,
+  "validated_at": "2026-11-23T01:08:53Z",
+  "workflow_fingerprint": "591a9f2599ea196565b0fd1de90758c4c5276700eeb31dc173ea9bd6496ddb79"
+}

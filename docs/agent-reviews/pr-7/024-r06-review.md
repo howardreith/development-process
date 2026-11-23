@@ -1,0 +1,223 @@
+<!-- agent-review:v1 enrollment=devproc-claude-foreground-development-20261122110938-f02a key=r06-review part=1/1 sha256=09cc298c36e837cb1a0f2d6bbf572e7de4619e8344f1d3fd6f179d7c088fa867 -->
+### Codex GPT-6.2 Astra — review — round 6 — candidate `f0f6330b86`
+
+**Decision:** `changes_required` — The required unit gate passed. Three defects still affect what the owner can trust during recovery: an exhausted proposed limit can change the enrollment, a successful publication retry can leave a resolved outage as the current blocker, and `watch` can identify an older developer action as the latest activity.
+
+## Continuation for Claude
+
+Report this verdict and the reviewed commit to the owner in the foreground conversation. Round 6 is the last round covered by the recorded authorization.
+
+If the owner authorizes further work, validate an explicit round limit before resume changes state, including delivery markers and the limit passed to handoff reopening. Tie restoration of a capped amendment’s blocker to the actual publication stop on both initial delivery and replay. Include attempts retained in `earlier_attempts` when `watch` selects the latest completed run.
+
+Keep the existing handoff freshness checks, publication safeguards, model policy and round accounting. Exercise the command paths identified in the findings with the existing Git fixtures and simulated GitHub boundary, then run the required `unit` gate on the corrected candidate.
+
+#### Findings
+
+**R5-F1** · P2 · defect · blocks readiness — Resume can act on an exhausted proposed limit before validating it
+- Location: `agent_review/agent_review.py:4192`; acceptance: Part A.4, Part B.2, Protocol §10
+- Trigger: A foreground enrollment has rounds left and the owner supplies a limit at or below the spent count on a resume path that treats zero as absent or mutates state before the budget check.
+- Expected: With one of five rounds spent, an explicit limit at or below one is refused before it changes admission, publication authority or the saved limit.
+- Actual: `max_rounds or authorized` treats an explicit zero as an omitted option, so `resume --max-rounds 0` can reopen a paused enrollment. With `--max-rounds 1 --resend-undelivered`, the resend loop can clear and save `posting_since` before the command reports that nothing changed. For a moved handoff, `reopen(..., extend_to=1)` can persist 1 as the authorized limit and publish an exhausted-budget stop before the new limit check runs.
+- Why it blocks / does not: A proposal that allows no further review can reopen helper admission, change which publication may be retried, or replace the saved five-round authorization.
+- Requested correction: Distinguish an omitted limit from zero and validate an explicit proposal before applying resume side effects. Preserve handoff freshness handling and settlement at a genuinely exhausted saved budget.
+- Requested evidence: At 1/5, exercise zero from PAUSED/develop, one combined with an uncertain publication and `--resend-undelivered`, and one when a handoff has moved. Check the resulting limit, admission, delivery marker, notices and launch counts.
+
+**R6-F1** · P2 · defect · blocks readiness — A publication failure during replay can strand a capped amendment in PAUSED
+- Location: `agent_review/agent_review.py:4203`; acceptance: Part A.4, Part B.2, Protocol §§7, 10
+- Trigger: The controller exits after saving a capped amendment. The first ordinary resume encounters a temporary failure while publishing its queued corrections.
+- Expected: Once the queued publication succeeds, the enrollment and its latest public status identify the applied amendment and exhausted budget. Replaying the command preserves that result.
+- Actual: The ordinary capped `resume` calls `settle_publications()` outside the handler that sets `restore_needed`. If the PR-body edit fails there, `guarded` saves PAUSED while the marker stays false. The next resume can complete the edit and leave PAUSED in place. A failure sending the restored notice at line 4303 has the same consequence because the transaction has already cleared the flag.
+- Why it blocks / does not: After GitHub recovers, the saved status can still direct the owner to resolve an outage even though the decision actually needed is a budget extension.
+- Requested correction: Record the need for restoration together with the publication stop that displaces the capped blocker, including failures during ordinary replay and delivery of the restored notice. Preserve the transactional queueing verified for R5-F2.
+- Requested evidence: Combine the existing crash-after-amendment-save fixture with a one-time PR-body failure on the first ordinary resume. Recover twice at the original limit. Also fail delivery of the restored notice. Check the final local reason, latest public status, idempotent notices, closed admission and stable counters.
+
+**R5-F3** · P2 · defect · blocks readiness — Watch loses the latest reviewer action when resume retains prior attempts
+- Location: `agent_review/agent_review.py:5996`; acceptance: Part A, Existing running jobs, Part A.3, Part B.5
+- Trigger: An owner resumes a review with completed attempts, and the controller stops before opening a replacement attempt.
+- Expected: With no agent running, the watcher selects the latest recorded invocation or attempt, including completed attempts retained across an owner resume.
+- Actual: `_resume_updates` moves completed attempts into `earlier_attempts` and clears `attempts`. Both the event-file reader and the new run comparison use only `last['attempts']`. If candidate capture then pauses on a dirty worktree before a new attempt opens, `watch` can report the older developer action even though the later reviewer record and event file are available.
+- Why it blocks / does not: At a recovery stop, the owner can be shown the wrong role’s action as the latest observable activity.
+- Requested correction: Include retained attempts when reading historical event files and ordering completed runs. Continue to attribute live activity to its specific open attempt.
+- Requested evidence: Resume a headless fixture after a developer invocation and a failed reviewer attempt. Make candidate capture pause before the next attempt opens, then attach `watch --once` and verify that its status names the retained reviewer action.
+
+#### Prior finding assessments
+
+- **R4-F3** — `fix_verified` — One continuing watcher now timestamps new complete records when observed. The passing six-poll test holds the file timestamp old and distinguishes visible, filtered, blank and incomplete records.
+- **R5-F1** — `fix_rejected` — The ordinary positive 1/5 refusal and the 2/2 no-progress stop now pass their regressions. The proposed-versus-authorized distinction still fails for zero and on resume paths that change publication or handoff state before validating the proposal.
+- **R5-F2** — `fix_verified` — The restored BLOCKED transition and its notice are saved in one transaction. The candidate test interrupts immediately after that save and verifies exactly one restored notice across two replays. R6-F1 concerns a publication error that subsequently replaces the saved status.
+- **R5-F3** — `fix_rejected` — The candidate correctly orders ordinary completed attempts and labels a newly created stream as live. Its comparison still omits completed attempts retained by resume, which can produce the same incorrect latest-action report.
+- **R5-F4** — `fix_verified` — The diagnostic points to the enrollment’s private `state.json`. The passing admission-error fixture verifies that its saved notes contain the detailed filename and the public message omits it.
+
+#### Evidence assessment
+
+- **Inspected:** The enrolled mission, repository operating guide and protocol, full feature diff, round-5-to-round-6 correction, developer report, prior-findings ledger and candidate gate artifacts.; The foreground review and amendment paths, resume ordering, publication transactions, stop handling, attempt history, watch selection and their behavior tests.; The scoped foreground-cycle record covering PR #7, pre-exit reviewer and gate output, the demonstration amendments, and observation of PR #6’s headless run.
+- **Executed verification:** The controller receipt binds `python -m unittest discover -s agent_review -p test_*.py -v` to f0f6330b86587ae86b15dfdec0e1b9ede02e8d19. It records exit 0, an unchanged worktree and 871.5 seconds. The log reports 298 tests run with one live-model smoke test skipped. Its SHA-256 matches the receipt.; The candidate log records passes for all six new regressions, including the continuous watcher, the 1-of-5 refusal, the no-progress counter reset and interruption after the restored notice was queued.; Read-only Git and hash checks confirmed the candidate, merge base, enrolled mission digest and the three historical controller-source digests cited in the foreground demonstration record.
+- **Source inspection only:** The remaining failures follow from the ordering of `resume`, `reopen`, `settle_publications`, `guarded` and `watch_enrollment`. The supplied gate exercises neighboring cases separately.
+- **Required gaps:** A corrected candidate needs command-level evidence for explicit exhausted limits across resume paths, a publication outage during capped-amendment replay, and watch attachment after completed attempts move into `earlier_attempts`.
+- **Limitations:** The foreground transcript supplied for this round contains a withholding notice. The reported pre-fix failures and mutation runs have no independent command output in the supplied inputs.; The actual-interface demonstrations are recorded against earlier identified controller revisions, with real Codex and simulated GitHub in the isolated fixtures. I did not rerun those demonstrations or the unit suite in the read-only snapshot.
+
+#### Summary
+
+- **Delivered behavior:** Interactive enrollment selects foreground development. The session receives the accepted review and continuation, can observe gate and reviewer activity, and submits amendment-bound reports under checked session provenance. The requested PR #6 documentation correction is present.
+- **Scope reviewed:** Final checkpoint for draft PR #7 at f0f6330b86587ae86b15dfdec0e1b9ede02e8d19, against the enrolled foreground-development mission and all five pending findings.
+- **Pending later-phase work:** none
+- **Unresolved questions:** none
+- **Remaining owner review:** The recorded authorization ends at round 6. The owner decides the disposition of draft PR #7 and whether to authorize further enrolled work.
+
+#### Provenance (controller-recorded)
+
+| | Requested | Observed |
+|---|---|---|
+| Model | `gpt-6.2-astra` | `gpt-6.2-astra` (turns ['gpt-6.2-astra']) |
+| Reasoning effort | `max` | `max` (turns ['max']) |
+| Sandbox / approvals | read-only / never | `read-only` / `never` |
+
+Owner guidance bound to this review: none.
+
+Owner amendments bound to this review: none.
+
+Codex CLI `0.170.0`, thread `01a20561-8fdb-7130-b7b9-e233a29d59bc`, duration 566.2s, response sha256 `22d770d775c39d20c19248e15c1aeede343ce8703563c7521b2d33e14ec53f0e`, request `devproc-claude-foreground-development-20261122110938-f02a-r06-8812cd`. Observed values come from the Codex session rollout's recorded thread settings, not from the model's own statements; the serving backend's model identity is not separately exposed.
+
+<details><summary>Complete structured review (agent-review.review.v1)</summary>
+
+```json
+{
+  "candidate_commit": "f0f6330b86587ae86b15dfdec0e1b9ede02e8d19",
+  "checkpoint_id": "final",
+  "checkpoint_type": "final",
+  "decision": "changes_required",
+  "decision_rationale": "The required unit gate passed. Three defects still affect what the owner can trust during recovery: an exhausted proposed limit can change the enrollment, a successful publication retry can leave a resolved outage as the current blocker, and `watch` can identify an older developer action as the latest activity.\n\n## Continuation for Claude\n\nReport this verdict and the reviewed commit to the owner in the foreground conversation. Round 6 is the last round covered by the recorded authorization.\n\nIf the owner authorizes further work, validate an explicit round limit before resume changes state, including delivery markers and the limit passed to handoff reopening. Tie restoration of a capped amendment\u2019s blocker to the actual publication stop on both initial delivery and replay. Include attempts retained in `earlier_attempts` when `watch` selects the latest completed run.\n\nKeep the existing handoff freshness checks, publication safeguards, model policy and round accounting. Exercise the command paths identified in the findings with the existing Git fixtures and simulated GitHub boundary, then run the required `unit` gate on the corrected candidate.",
+  "evidence_assessment": {
+    "executed_verification": [
+      "The controller receipt binds `python -m unittest discover -s agent_review -p test_*.py -v` to f0f6330b86587ae86b15dfdec0e1b9ede02e8d19. It records exit 0, an unchanged worktree and 871.5 seconds. The log reports 298 tests run with one live-model smoke test skipped. Its SHA-256 matches the receipt.",
+      "The candidate log records passes for all six new regressions, including the continuous watcher, the 1-of-5 refusal, the no-progress counter reset and interruption after the restored notice was queued.",
+      "Read-only Git and hash checks confirmed the candidate, merge base, enrolled mission digest and the three historical controller-source digests cited in the foreground demonstration record."
+    ],
+    "inspected": [
+      "The enrolled mission, repository operating guide and protocol, full feature diff, round-5-to-round-6 correction, developer report, prior-findings ledger and candidate gate artifacts.",
+      "The foreground review and amendment paths, resume ordering, publication transactions, stop handling, attempt history, watch selection and their behavior tests.",
+      "The scoped foreground-cycle record covering PR #7, pre-exit reviewer and gate output, the demonstration amendments, and observation of PR #6\u2019s headless run."
+    ],
+    "limitations": [
+      "The foreground transcript supplied for this round contains a withholding notice. The reported pre-fix failures and mutation runs have no independent command output in the supplied inputs.",
+      "The actual-interface demonstrations are recorded against earlier identified controller revisions, with real Codex and simulated GitHub in the isolated fixtures. I did not rerun those demonstrations or the unit suite in the read-only snapshot."
+    ],
+    "required_gaps": [
+      "A corrected candidate needs command-level evidence for explicit exhausted limits across resume paths, a publication outage during capped-amendment replay, and watch attachment after completed attempts move into `earlier_attempts`."
+    ],
+    "source_inspection_only": [
+      "The remaining failures follow from the ordering of `resume`, `reopen`, `settle_publications`, `guarded` and `watch_enrollment`. The supplied gate exercises neighboring cases separately."
+    ]
+  },
+  "findings": [
+    {
+      "acceptance_ids": [
+        "Part A.4",
+        "Part B.2",
+        "Protocol \u00a710"
+      ],
+      "actual": "`max_rounds or authorized` treats an explicit zero as an omitted option, so `resume --max-rounds 0` can reopen a paused enrollment. With `--max-rounds 1 --resend-undelivered`, the resend loop can clear and save `posting_since` before the command reports that nothing changed. For a moved handoff, `reopen(..., extend_to=1)` can persist 1 as the authorized limit and publish an exhausted-budget stop before the new limit check runs.",
+      "blocking_rationale": "A proposal that allows no further review can reopen helper admission, change which publication may be retried, or replace the saved five-round authorization.",
+      "blocks_readiness": true,
+      "category": "defect",
+      "expected": "With one of five rounds spent, an explicit limit at or below one is refused before it changes admission, publication authority or the saved limit.",
+      "id": "R5-F1",
+      "location": {
+        "file": "agent_review/agent_review.py",
+        "line": 4192
+      },
+      "priority": "P2",
+      "requested_correction": "Distinguish an omitted limit from zero and validate an explicit proposal before applying resume side effects. Preserve handoff freshness handling and settlement at a genuinely exhausted saved budget.",
+      "requested_evidence": "At 1/5, exercise zero from PAUSED/develop, one combined with an uncertain publication and `--resend-undelivered`, and one when a handoff has moved. Check the resulting limit, admission, delivery marker, notices and launch counts.",
+      "title": "Resume can act on an exhausted proposed limit before validating it",
+      "trigger": "A foreground enrollment has rounds left and the owner supplies a limit at or below the spent count on a resume path that treats zero as absent or mutates state before the budget check."
+    },
+    {
+      "acceptance_ids": [
+        "Part A.4",
+        "Part B.2",
+        "Protocol \u00a7\u00a77, 10"
+      ],
+      "actual": "The ordinary capped `resume` calls `settle_publications()` outside the handler that sets `restore_needed`. If the PR-body edit fails there, `guarded` saves PAUSED while the marker stays false. The next resume can complete the edit and leave PAUSED in place. A failure sending the restored notice at line 4303 has the same consequence because the transaction has already cleared the flag.",
+      "blocking_rationale": "After GitHub recovers, the saved status can still direct the owner to resolve an outage even though the decision actually needed is a budget extension.",
+      "blocks_readiness": true,
+      "category": "defect",
+      "expected": "Once the queued publication succeeds, the enrollment and its latest public status identify the applied amendment and exhausted budget. Replaying the command preserves that result.",
+      "id": "R6-F1",
+      "location": {
+        "file": "agent_review/agent_review.py",
+        "line": 4203
+      },
+      "priority": "P2",
+      "requested_correction": "Record the need for restoration together with the publication stop that displaces the capped blocker, including failures during ordinary replay and delivery of the restored notice. Preserve the transactional queueing verified for R5-F2.",
+      "requested_evidence": "Combine the existing crash-after-amendment-save fixture with a one-time PR-body failure on the first ordinary resume. Recover twice at the original limit. Also fail delivery of the restored notice. Check the final local reason, latest public status, idempotent notices, closed admission and stable counters.",
+      "title": "A publication failure during replay can strand a capped amendment in PAUSED",
+      "trigger": "The controller exits after saving a capped amendment. The first ordinary resume encounters a temporary failure while publishing its queued corrections."
+    },
+    {
+      "acceptance_ids": [
+        "Part A, Existing running jobs",
+        "Part A.3",
+        "Part B.5"
+      ],
+      "actual": "`_resume_updates` moves completed attempts into `earlier_attempts` and clears `attempts`. Both the event-file reader and the new run comparison use only `last['attempts']`. If candidate capture then pauses on a dirty worktree before a new attempt opens, `watch` can report the older developer action even though the later reviewer record and event file are available.",
+      "blocking_rationale": "At a recovery stop, the owner can be shown the wrong role\u2019s action as the latest observable activity.",
+      "blocks_readiness": true,
+      "category": "defect",
+      "expected": "With no agent running, the watcher selects the latest recorded invocation or attempt, including completed attempts retained across an owner resume.",
+      "id": "R5-F3",
+      "location": {
+        "file": "agent_review/agent_review.py",
+        "line": 5996
+      },
+      "priority": "P2",
+      "requested_correction": "Include retained attempts when reading historical event files and ordering completed runs. Continue to attribute live activity to its specific open attempt.",
+      "requested_evidence": "Resume a headless fixture after a developer invocation and a failed reviewer attempt. Make candidate capture pause before the next attempt opens, then attach `watch --once` and verify that its status names the retained reviewer action.",
+      "title": "Watch loses the latest reviewer action when resume retains prior attempts",
+      "trigger": "An owner resumes a review with completed attempts, and the controller stops before opening a replacement attempt."
+    }
+  ],
+  "prior_finding_assessments": [
+    {
+      "assessment": "fix_verified",
+      "finding_id": "R4-F3",
+      "rationale": "One continuing watcher now timestamps new complete records when observed. The passing six-poll test holds the file timestamp old and distinguishes visible, filtered, blank and incomplete records."
+    },
+    {
+      "assessment": "fix_rejected",
+      "finding_id": "R5-F1",
+      "rationale": "The ordinary positive 1/5 refusal and the 2/2 no-progress stop now pass their regressions. The proposed-versus-authorized distinction still fails for zero and on resume paths that change publication or handoff state before validating the proposal."
+    },
+    {
+      "assessment": "fix_verified",
+      "finding_id": "R5-F2",
+      "rationale": "The restored BLOCKED transition and its notice are saved in one transaction. The candidate test interrupts immediately after that save and verifies exactly one restored notice across two replays. R6-F1 concerns a publication error that subsequently replaces the saved status."
+    },
+    {
+      "assessment": "fix_rejected",
+      "finding_id": "R5-F3",
+      "rationale": "The candidate correctly orders ordinary completed attempts and labels a newly created stream as live. Its comparison still omits completed attempts retained by resume, which can produce the same incorrect latest-action report."
+    },
+    {
+      "assessment": "fix_verified",
+      "finding_id": "R5-F4",
+      "rationale": "The diagnostic points to the enrollment\u2019s private `state.json`. The passing admission-error fixture verifies that its saved notes contain the detailed filename and the public message omits it."
+    }
+  ],
+  "request_id": "devproc-claude-foreground-development-20261122110938-f02a-r06-8812cd",
+  "round": 6,
+  "schema_version": "agent-review.review.v1",
+  "summary": {
+    "delivered_behavior": "Interactive enrollment selects foreground development. The session receives the accepted review and continuation, can observe gate and reviewer activity, and submits amendment-bound reports under checked session provenance. The requested PR #6 documentation correction is present.",
+    "pending_later_phase_work": [],
+    "remaining_owner_review": [
+      "The recorded authorization ends at round 6. The owner decides the disposition of draft PR #7 and whether to authorize further enrolled work."
+    ],
+    "scope_reviewed": "Final checkpoint for draft PR #7 at f0f6330b86587ae86b15dfdec0e1b9ede02e8d19, against the enrolled foreground-development mission and all five pending findings.",
+    "unresolved_questions": []
+  }
+}
+```
+</details>
+
+_Model-generated review by Codex using the requested model, posted by the agent-review controller through the owner's GitHub account. Not a human review or approval._
