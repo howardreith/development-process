@@ -20,6 +20,7 @@ import subprocess
 import sys
 import stat
 import tempfile
+import threading
 import time
 import uuid
 import unittest
@@ -9256,6 +9257,229 @@ class WatchRoundNineUnlaunchedTests(unittest.TestCase):
         self.assertEqual(ar.EXIT_BLOCKED, code, outcome)
         self.assertEqual(1, len(observed))
         self.assertEqual((1, 1), (len(env.developer.calls), len(env.reviewer.calls)))
+
+
+class ForegroundRoundTenTests(ForegroundFixture, unittest.TestCase):
+    """Round-10 corrections (PR #7): the status-notice reuse decision applies the controller's established publication
+    check (CRLF-only differences are intact; a competing copy of the marker is a conflict); a continuing watch keeps an
+    execution that had already finished at attachment historical when selection first reaches it later; the status
+    line names a last reviewed candidate only from an accepted review."""
+
+    SINGLE = ForegroundRoundSevenTests.SINGLE
+    capped_handoff = ForegroundRoundSevenTests.capped_handoff
+    fail_body_edits = ForegroundRoundSevenTests.fail_body_edits
+    fail_blocked_posts = ForegroundRoundSevenTests.fail_blocked_posts
+    amend = ForegroundRoundSevenTests.amend
+    pending_blocker = ForegroundRoundNineIntegrityTests.pending_blocker
+    status_comments = staticmethod(ForegroundRoundNineIntegrityTests.status_comments)
+    recover = ForegroundRoundNineIntegrityTests.recover
+    assert_authority_unchanged = ForegroundRoundNineIntegrityTests.assert_authority_unchanged
+    is_intact_budget_notice = ForegroundRoundNineIntegrityTests.is_intact_budget_notice
+
+    def test_a_crlf_only_delayed_notice_is_reused(self):
+        env, key, marker, preserved, reason, counts, rounds, authorized = self.pending_blocker()
+        original_post = env.gh.post_comment
+
+        def post_with_crlf(number, body_file):  # SIMULATED: GitHub returns this notice's body with CRLF line endings
+            response = original_post(number, body_file)
+            comment = next(c for c in env.gh.comments_list if c["id"] == response["id"])
+            if comment["body"].startswith(marker):
+                comment["body"] = comment["body"].replace("\n", "\r\n")
+            return response
+        env.gh.post_comment = post_with_crlf
+        comments_after_recovery = None
+        for recovery in (1, 2):
+            with self.subTest(recovery=recovery):
+                self.recover(env)
+                state = self.state(env)
+                latest = self.status_comments(env)[-1]
+                self.assertEqual(("BLOCKED", reason), (state["status"], state["status_reason"]))
+                self.assertFalse(state["capped_amendment"]["restore_needed"])
+                self.assertEqual(key, state["capped_amendment"]["notice_key"])  # reused, no correction queued
+                self.assertTrue(latest["body"].startswith(marker + "\r\n"))
+                self.assertEqual(ar.normalize_body(preserved), ar.normalize_body(latest["body"]))
+                self.assertEqual(1, sum(c["body"].startswith(marker) for c in env.gh.comments_list))
+                self.assertEqual([], [k for k, p in state["publications"].items() if p["state"] == "pending"])
+                if comments_after_recovery is None:
+                    comments_after_recovery = len(env.gh.comments_list)
+                self.assertEqual(comments_after_recovery, len(env.gh.comments_list))
+                self.assert_authority_unchanged(env, counts, rounds, authorized)
+
+    def test_a_competing_copy_of_the_marker_forces_a_correction_or_an_integrity_stop(self):
+        env, key, marker, preserved, reason, counts, rounds, authorized = self.pending_blocker()
+        original_post = env.gh.post_comment
+        competing = {}
+
+        def post_then_competing_copy(number, body_file):
+            response = original_post(number, body_file)
+            body = Path(body_file).read_text(encoding="utf-8")
+            if not competing and body.startswith(marker):
+                # SIMULATED: a later comment by the expected actor, under another id, repeats the complete marker
+                # with a different reason
+                env.gh.next_id += 1
+                competing.update(id=env.gh.next_id,
+                                 body=body.replace(reason, "SIMULATED COMPETING COPY: a different reason.", 1))
+                env.gh.comments_list.append({"id": competing["id"], "user": env.gh.poster, "body": competing["body"],
+                                             "url": f"https://example.test/c/{competing['id']}"})
+            return response
+        env.gh.post_comment = post_then_competing_copy
+        comments_after_recovery = None
+        for recovery in (1, 2):
+            with self.subTest(recovery=recovery):
+                self.recover(env)
+                state = self.state(env)
+                self.assertTrue(competing, "the delayed notice must be posted and then copied")
+                copy = next(c for c in env.gh.comments_list if c["id"] == competing["id"])
+                self.assertEqual(competing["body"], copy["body"])  # the controller never edits public history
+                latest = self.status_comments(env)[-1]
+                if self.is_intact_budget_notice(env, latest, reason) and latest["id"] != competing["id"]:
+                    self.assertFalse(latest["body"].startswith(marker))  # a distinct correction, not the copied one
+                    self.assertNotEqual(key, state["capped_amendment"]["notice_key"])
+                    self.assertEqual(("BLOCKED", reason), (state["status"], state["status_reason"]))
+                    self.assertFalse(state["capped_amendment"]["restore_needed"])
+                else:
+                    self.assertTrue(state["capped_amendment"]["restore_needed"])
+                    self.assertRegex(state["status_reason"].lower(), r"duplicat|altered|integrity")
+                if comments_after_recovery is None:
+                    comments_after_recovery = len(env.gh.comments_list)
+                self.assertEqual(comments_after_recovery, len(env.gh.comments_list))
+                self.assert_authority_unchanged(env, counts, rounds, authorized)
+
+    # ---- watch
+    def unlaunched_request(self, env, flow, invoke, round_number):
+        """A reviewer request whose first attempt is saved open and then closed launched=false at stream setup (real
+        CodexReviewer; a directory occupies its stderr path; the test's Codex executable is never started)."""
+        obstacle = env.dir / "rounds" / f"r{round_number:02d}" / f"stderr-1.txt"
+        obstacle.mkdir(parents=True)
+        ctl = env.controller()
+        executable = str(env.root / "never-started.exe")
+        ctl._reviewer = ar.CodexReviewer({**ctl.cfg["reviewer"], "executable": executable})
+        original_popen, dispatched = subprocess.Popen, []
+
+        def guarded_popen(argv, *args, **kwargs):
+            if isinstance(argv, (list, tuple)) and str(argv[0]) == executable:
+                dispatched.append(list(argv))
+                raise AssertionError("the reviewer stream failure must precede process creation")
+            return original_popen(argv, *args, **kwargs)
+        with mock.patch.object(subprocess, "Popen", side_effect=guarded_popen):
+            result = invoke(ctl)
+        self.assertEqual([], dispatched)
+        attempt = self.state(env)["rounds"][-1]["attempts"][-1]
+        self.assertIs(False, attempt["launched"])
+        self.assertTrue(obstacle.is_dir())
+        return result
+
+    def headless_history(self):
+        """Headless developer invocation, then three executed (failed) reviewer attempts that write events."""
+        env, flow = Env("headless"), OwnerFlowFixture()
+        self.addCleanup(env.cleanup)
+        target = git(env.work, "rev-parse", "HEAD")
+
+        def develop(fixture):
+            fixture.commit("phase1.txt", "p1\n", "SIMULATED developer phase 1")
+            fixture.push()
+            stream = fixture.dir / "developer" / "stream-001.jsonl"
+            stream.parent.mkdir(parents=True, exist_ok=True)
+            stream.write_text(json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "DEVELOPER-ACTION"}]}}) + "\n", encoding="utf-8")
+            time.sleep(1.1)  # the reviewer attempts start in a later recorded second
+            return report(fixture, "phase-1")
+        env.developer.script = [develop]
+        original_review = env.reviewer.run
+
+        def reviewer(prompt, workdir, schema, result_path, events_path, *args, **kwargs):
+            result = original_review(prompt, workdir, schema, result_path, events_path, *args, **kwargs)
+            with Path(events_path).open("a", encoding="utf-8") as stream:  # SIMULATED reviewer activity
+                stream.write(json.dumps({"type": "item.completed", "item": {
+                    "type": "agent_message", "text": "REVIEWER-" + Path(events_path).stem}}) + "\n")
+            return result
+        env.reviewer.run = reviewer
+        env.reviewer.script = [{"raw": "not JSON (SIMULATED model response)"}] * 3
+        code, outcome = flow.run_command(env.controller())
+        self.assertEqual(ar.EXIT_BLOCKED, code, outcome)
+        git(env.work, "push", "--quiet", "origin", f"{target}:refs/heads/master")  # the merge base changes at same H
+        return env, flow
+
+    def test_a_continuing_watch_keeps_an_earlier_round_historical_after_a_failed_launch(self):
+        env, flow = self.headless_history()
+        history = env.dir / "rounds" / "r01" / "events-3.jsonl"
+        history_bytes = history.read_bytes()
+        rows, problems, attached, release = [], [], threading.Event(), threading.Event()
+
+        def gated_sleep(_):
+            attached.set()
+            release.wait(30)
+
+        def watch():
+            try:
+                ar.watch_enrollment(env.dir, rows.append, interval=0, sleep=gated_sleep, max_polls=5)
+            except BaseException as exc:  # reported by the test thread
+                problems.append(exc)
+        thread = threading.Thread(target=watch, daemon=True)
+
+        def invoke(ctl):
+            original_run = ctl._reviewer.run
+
+            def run(*args, **kwargs):  # the replacement attempt is saved open: one watch attaches here
+                thread.start()
+                self.assertTrue(attached.wait(30), "the watch must complete its first poll")
+                return original_run(*args, **kwargs)
+            ctl._reviewer.run = run
+            return flow.resume(ctl, "owner retries against the advanced target")
+        code, outcome = self.unlaunched_request(env, flow, invoke, 2)
+        self.assertEqual(ar.EXIT_BLOCKED, code, outcome)
+        release.set()
+        thread.join(30)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual([], problems)
+        self.assertEqual(history_bytes, history.read_bytes())
+        attach = next(i for i, r in enumerate(rows) if " | latest action:" in r)
+        self.assertIn("reviewer Codex, round 2 attempt 1", rows[attach])  # attached while the attempt was open
+        later = rows[attach + 1:]
+        self.assertIn("(earlier) Codex: REVIEWER-events-3", later)
+        self.assertNotIn("Codex: REVIEWER-events-3", later)  # never replayed as live activity
+        status = [r for r in later if " | latest action:" in r][-1]
+        self.assertIn("no agent running", status)
+        self.assertIn("latest action: Codex: REVIEWER-events-3 (before this watch started)", status)
+        self.assertIn("blocker: " + ar.clean_text(self.state(env)["status_reason"], 300), status)
+        self.assertIn("reviewer launch setup for round 2 failed", status)
+
+    def test_the_status_line_never_presents_an_unlaunched_request_as_reviewed(self):
+        with self.subTest(case="first request, never launched"):
+            env, flow = Env("headless"), OwnerFlowFixture()
+            self.addCleanup(env.cleanup)
+
+            def develop(fixture):
+                fixture.commit("phase1.txt", "p1\n", "SIMULATED developer phase 1")
+                fixture.push()
+                return report(fixture, "phase-1")
+            env.developer.script = [develop]
+            code, outcome = self.unlaunched_request(env, flow, flow.run_command, 1)
+            self.assertEqual(ar.EXIT_BLOCKED, code, outcome)
+            h = self.state(env)["rounds"][-1]["H"][:12]
+            rows = []
+            ar.watch_enrollment(env.dir, rows.append, once=True)
+            status = next(r for r in rows if " | latest action:" in r)
+            self.assertIn(f"(no accepted review yet; requested {h}: not reviewed: no reviewer launched)", status)
+            self.assertNotIn("last reviewed", status)
+        with self.subTest(case="an unlaunched request after an accepted review"):
+            env = self.fg_env()
+            env.commit("feature.txt", "v2\n", "feature v2")
+            env.push()
+            env.reviewer.script = [{"decision": "changes_required", "findings": [finding("R1-F1")]}]
+            self.assertEqual("changes_required", self.review_cmd(env)[1]["result"])
+            first = self.state(env)["rounds"][-1]["H"][:12]
+            candidate = env.commit("feature.txt", "v3\n", "feature v3")
+            env.push()
+            code, out, _ = self.unlaunched_request(
+                env, None, lambda ctl: self.review_cmd(env, dispositions=[fixed("R1-F1", candidate)], ctl=ctl), 2)
+            self.assertEqual(ar.EXIT_BLOCKED, code, out)
+            rows = []
+            ar.watch_enrollment(env.dir, rows.append, once=True)
+            status = next(r for r in rows if " | latest action:" in r)
+            self.assertIn(f"(last reviewed {first}: changes_required; requested {candidate[:12]}: not reviewed: no "
+                          "reviewer launched)", status)
+            self.assertEqual({"final": 1}, self.state(env)["rounds_completed"])
 
 
 if __name__ == "__main__":

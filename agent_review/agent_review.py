@@ -2771,25 +2771,22 @@ class Controller:
           authenticated read) must appear in the listing; one that is acknowledged but not yet listed leaves the
           public order unresolved, so its absence never proves that an older notice is still the latest;
         - the latest listed status comment must be one of `key`'s recorded comment ids (expected actor);
-        - each of `key`'s parts must be visible under its recorded id with its complete marker and a body equal, after
-          normalization, to the preserved outbox body (outbox_body re-verifies the digest)."""
+        - on that same listing, `key` must pass publication_problems, the controller's established settlement check:
+          complete part inventory, each part under its recorded id by the expected actor, exactly one comment carrying
+          its marker (a competing copy under another id is a conflict), and a body equal after normalization (line
+          endings and trailing whitespace) to the preserved outbox body, whose digest outbox_body re-verifies."""
         pubs = self.state.get("publications", {})
         recorded = {part["comment_id"]: (k, part) for k, pub in pubs.items() if STATUS_KEY_RE.fullmatch(k)
                     and pub.get("state") == "posted" for part in pub.get("parts", []) if part.get("comment_id")}
-        listed, latest = {}, None
-        for comment in self.gh.comments(self.state["pr"]["number"]):
+        listing = self.gh.comments(self.state["pr"]["number"])
+        listed, latest = set(), None
+        for comment in listing:
             if comment.get("id") in recorded and comment.get("user") == self.cfg["expected_actor"]:
-                listed[comment["id"]] = comment
+                listed.add(comment["id"])
                 latest = comment["id"]
-        if set(recorded) - set(listed) or latest is None or recorded[latest][0] != key:
+        if set(recorded) - listed or latest is None or recorded[latest][0] != key:
             return False
-        for part in pubs[key]["parts"]:
-            comment = listed.get(part.get("comment_id"))
-            body = (comment or {}).get("body") or ""
-            if not comment or not body.startswith(part["marker"] + "\n") or \
-                    normalize_body(body) != normalize_body(self.outbox_body(key, part)):
-                return False
-        return True
+        return self.publication_problems(key, pubs[key], listing) is None
 
     def publish_status(self, status, reason):
         if not self.identity_ok:
@@ -6011,7 +6008,9 @@ def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes
         size, mtime = info.st_size, dt.datetime.fromtimestamp(info.st_mtime, dt.timezone.utc)
         start = offsets.get(path)
         first = start is None
-        historical = first and seen.get("polls", 0) == 0
+        # history: any file at attachment, or the stream of an execution already finished when this watch attached
+        # (first selected later, e.g. when selection falls back to an earlier round after a failed launch)
+        historical = first and (seen.get("polls", 0) == 0 or source in seen.get("finished_at_attach", ()))
         if not first and size <= start:
             return
         with open(path, "rb") as f:
@@ -6054,6 +6053,10 @@ def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes
             return
         dev, rounds = state.get("developer") or {}, state.get("rounds") or []
         launch, last = dev.get("launch") or {}, (rounds[-1] if rounds else {})
+        if not seen.get("polls"):  # what had already finished when this watch attached
+            seen["finished_at_attach"] = {("reviewer", r.get("round"), a.get("n")) for r in rounds if isinstance(r, dict)
+                                          for a in (r.get("earlier_attempts") or []) + (r.get("attempts") or [])
+                                          if isinstance(a, dict) and a.get("ended")}
         n = dev.get("invocations") or 0
         if n:
             follow(folder / "developer" / f"stream-{n:03d}.jsonl", render_claude_event, ("developer", n))
@@ -6126,12 +6129,22 @@ def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes
                          "helper is not running (interrupted)")
         blocker = (f" | blocker: {clean_text(state.get('status_reason'), 300)}"
                    if state.get("status") in ("BLOCKED", "PAUSED") else "")
-        key = (state.get("status"), state.get("phase"), role, head, last.get("H"), last.get("decision"), done,
-               gate_text, blocker, current[0] if current else None)
+        # the last reviewed candidate needs review evidence: the newest accepted round. A newer request is shown as a
+        # request with its actual state, never as the previous accepted review
+        reviewed = next((r for r in reversed(rounds) if isinstance(r, dict) and r.get("decision")
+                         and r.get("status") in ("accepted", "historical")), None)
+        review_text = (f"last reviewed {str(reviewed.get('H') or '-')[:12]}: {reviewed.get('decision')}" if reviewed
+                       else "no accepted review yet")
+        if last and last is not reviewed:
+            state_text = ("reviewing" if open_attempt else
+                          "not reviewed: no reviewer launched" if not executions(last) else "not accepted")
+            review_text += f"; requested {str(last.get('H') or '-')[:12]}: {state_text}"
+        key = (state.get("status"), state.get("phase"), role, head, review_text, done, gate_text, blocker,
+               current[0] if current else None)
         action_age = "" if not current else (f" ({ago(current[1])} ago)" if current[1] else
                                              " (before this watch started)")
         line = (f"{state.get('status')}/{state.get('phase')} | {role}" + (f" for {ago(since)}" if since else "")
-                + f" | candidate {head} (last reviewed {str(last.get('H') or '-')[:12]}: {last.get('decision') or '-'})"
+                + f" | candidate {head} ({review_text})"
                 + f" | {checkpoint or 'checkpoint ?'} rounds {done}/{limit}"
                 + f" | developer invocations {dev.get('invocations')}" + gate_text
                 + (" | latest action: uncertain (the recorded history does not order the developer and reviewer "

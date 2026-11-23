@@ -337,7 +337,11 @@ round and attempt numbers. A replacement review request that has not yet opened
 an attempt is not an execution, and neither is an attempt recorded as
 `launched: false` (its reviewer process was never created); attempts without
 that field are executions. A path that is not a regular file is never opened as
-an event stream. Only the last round's current attempts can be
+an event stream. The stream of a run that had already finished when `watch`
+attached stays history, even when it is first selected on a later poll (for
+example after a replacement attempt fails to launch). The status line names a
+"last reviewed" candidate only from an accepted review; a newer request is shown
+as requested, with its state (reviewing, not accepted, or no reviewer launched). Only the last round's current attempts can be
 the running reviewer, and a running attempt with no observed action is reported
 as such. When the records cannot order the runs, the latest action is shown as
 uncertain. `--once` prints one observation. `watch` never
@@ -456,10 +460,12 @@ rounds, no launches). The blocker's existing notice is reused only when all of
 these hold: it was delivered and nothing is pending; every status comment the
 controller recorded as accepted appears in GitHub's chronological listing (one
 acknowledged but not yet listed leaves the order unresolved); the latest of
-them is that notice under its recorded id; and its visible body, with its
-complete marker, still equals the preserved outgoing message. Otherwise, for
+them is that notice under its recorded id; and, on that same listing, it passes
+the controller's usual settlement check: by the expected actor, exactly one
+comment carrying its marker, and a body equal to the preserved outgoing message
+apart from line endings and trailing whitespace. Otherwise, for
 example when a later PAUSED notice is the public account, a listing lags or the
-notice was edited, one new BLOCKED correction with its own durable identity is
+notice was edited or its marker is duplicated, one new BLOCKED correction with its own durable identity is
 queued; the earlier comment is left as it is. A correction posted then is
 necessarily later than every status GitHub has already accepted. The same notice is never delivered twice,
 and repeated recovery after success adds nothing. Pending publications are
