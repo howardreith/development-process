@@ -330,10 +330,14 @@ started". Records observed afterwards, including a file created for a new
 invocation or attempt, are stamped with the time the watch observed them. Every
 complete record resets the silence clock, whether or not it is displayable;
 blank lines and a record still being written do not. With no agent running, the
-latest run is chosen by the controller's recorded launch and attempt times,
-including reviewer attempts that a `resume` retained in `earlier_attempts` (only
-current attempts can be the running reviewer); when the records cannot order
-the runs, the latest action is shown as uncertain. `--once` prints one observation. `watch` never
+latest run is chosen by the controller's recorded launch and attempt times.
+Reviewer history comes from the most recent round with a recorded attempt,
+current or retained by a `resume` in `earlier_attempts`, read under its own
+round and attempt numbers; a replacement review request that has not yet opened
+an attempt is not an execution. Only the last round's current attempts can be
+the running reviewer, and a running attempt with no observed action is reported
+as such. When the records cannot order the runs, the latest action is shown as
+uncertain. `--once` prints one observation. `watch` never
 opens a file for writing: to keep or tail the feed, redirect the console output
 to a file of your choosing outside the enrollment's records and worktree:
 
@@ -445,8 +449,14 @@ That covers a publication failure during the amendment's own settlement, during
 an ordinary capped `resume`, or while the restored notice is delivered. A later
 ordinary `resume` sends the queued corrections, restores that blocker, records
 the transition and queues its notice in one transaction, then still refuses (no
-rounds, no launches). A restoration notice that was still pending when the
-blocker was displaced keeps its identity and is never repeated. A refusal at a
+rounds, no launches). The blocker's existing notice is reused only when it was
+delivered and is still the latest status comment this enrollment authenticated
+on the PR (GitHub's chronological order, matched to the comment ids the
+controller recorded). If a later status, such as the PAUSED notice of the
+displacing stop, is the public account, one new BLOCKED correction with its own
+durable identity is queued instead. The same notice is never delivered twice,
+and repeated recovery after success adds nothing. Pending publications are
+always replayed in the numeric order in which they were queued. A refusal at a
 genuine cap leaves any other stop reason, such as a no-progress stop,
 untouched. An extension clears the record.
 

@@ -45,6 +45,7 @@ POLICY = {
     "reviewer": {"model": "gpt-6.2-astra", "effort": "max"},
 }
 STATUS_START, STATUS_END = "<!-- agent-review:status:start -->", "<!-- agent-review:status:end -->"
+STATUS_KEY_RE = re.compile(r"status-\d+-[a-z_]+")
 VERDICT_KEY_RE = re.compile(r"^(r\d+-review|final-status-[0-9a-f]{10})$")
 NEW_FINDING_ID = "R{round}-F"
 UNCERTAIN_SEND_WINDOW_S = 600
@@ -2757,8 +2758,27 @@ class Controller:
                 f"not a human review._\n")
 
     def queue_status(self, status, reason):
-        """Persist a status notice to be sent by settle_publications (durable; usable inside a transaction)."""
-        self.queue(f"status-{len(self.state.get('transitions', []))}-{status.lower()}", self.status_body(status, reason))
+        """Persist a status notice to be sent by settle_publications (durable; usable inside a transaction). Returns
+        its publication key."""
+        return self.queue(f"status-{len(self.state.get('transitions', []))}-{status.lower()}",
+                          self.status_body(status, reason))["key"]
+
+    def latest_public_status_key(self):
+        """The key of this enrollment's latest status notice on the PR, in GitHub's chronological comment order.
+        A comment counts only when it is by the expected actor, carries this enrollment's marker for a status
+        publication, and its id is one this controller recorded for that publication (an authenticated delivery,
+        not a local flag or timestamp). None when no such comment is visible."""
+        prefix = f"<!-- agent-review:v1 enrollment={self.state['enrollment_id']} key="
+        pubs, latest = self.state.get("publications", {}), None
+        for comment in self.gh.comments(self.state["pr"]["number"]):
+            body = comment.get("body") or ""
+            if comment.get("user") != self.cfg["expected_actor"] or not body.startswith(prefix):
+                continue
+            key = body[len(prefix):].split(" ", 1)[0]
+            recorded = {part.get("comment_id") for part in (pubs.get(key) or {}).get("parts", [])}
+            if STATUS_KEY_RE.fullmatch(key) and comment.get("id") in recorded:
+                latest = key
+        return latest
 
     def publish_status(self, status, reason):
         if not self.identity_ok:
@@ -4268,12 +4288,12 @@ class Controller:
                     blocked = self.budget_block_reason()
                     self.state.update(status="BLOCKED", status_reason=blocked)
                     self.transition(self.state["phase"], f"BLOCKED: {blocked}", save=False)
-                    self.queue_status("BLOCKED", blocked)  # durable; sent with the amendment's corrections
+                    notice = self.queue_status("BLOCKED", blocked)  # durable; sent with the amendment's corrections
                     # which amendment was applied at the persisted cap, for this checkpoint (see
                     # restore_capped_amendment_block); restore_needed is set only if an outage later replaces it
                     self.state["capped_amendment"] = {"revision": rec["revision"], "sha256": rec["sha256"],
                                                       "checkpoint": self.checkpoint["id"], "reason": blocked,
-                                                      "restore_needed": False}
+                                                      "restore_needed": False, "notice_key": notice}
                 else:
                     self.state.pop("capped_amendment", None)  # a later amendment not at the cap supersedes it
             self.stop_path.unlink(missing_ok=True)  # consumed only once the application is committed
@@ -4300,14 +4320,11 @@ class Controller:
         """Called by the command path just before it saves a stop that replaces the current status (for example a
         publication failure during the amendment's settlement, an ordinary capped resume, or delivery of the restored
         notice): when the status being replaced is exactly the applicable capped amendment's blocker, mark its recovery
-        as needed (in the same save as the stop) and remember whether that cycle's restoration notice had already
-        been delivered, so recovery neither loses nor repeats it."""
+        as needed, in the same save as the stop."""
         marker = self.capped_amendment_applies()
         if not marker or self.state.get("status") != "BLOCKED" or self.state.get("status_reason") != marker.get("reason"):
             return
-        notice = self.state.get("publications", {}).get(marker.get("notice_key") or "")
         marker["restore_needed"] = True
-        marker["notice_delivered_before_displacement"] = bool(notice and notice.get("state") == "posted")
 
     def restore_capped_amendment_block(self):
         """Restore the budget blocker of the amendment that durable state records as applied at the persisted cap AND
@@ -4320,19 +4337,24 @@ class Controller:
         if not marker or not marker.get("restore_needed"):
             return False
         reason = marker["reason"]
-        previous = self.state.get("publications", {}).get(marker.get("notice_key") or "")
-        # the restoration notice queued before the displacement (still pending, or delivered by the settlement that
-        # preceded this call) is the same-purpose notice: it keeps its durable identity instead of being repeated
-        reuse = bool(previous) and not marker.get("notice_delivered_before_displacement")
+        # Called after the caller settled pending publications (uncertain POSTs reconciled). The blocker's existing
+        # notice is reused only when it was delivered and is still the latest confirmed status on the PR (for
+        # example a restoration notice delivered after the stop that displaced it); otherwise a later status (such
+        # as that PAUSED notice) is the public account, and one new BLOCKED correction with its own durable identity
+        # is queued. Anything still pending is newer than what GitHub shows, so it never permits reuse.
+        pubs = self.state.get("publications", {})
+        previous = pubs.get(marker.get("notice_key") or "")
+        pending = any(p.get("state") == "pending" and not VERDICT_KEY_RE.match(k) for k, p in pubs.items())
+        reuse = bool(previous) and previous.get("state") == "posted" and not pending and \
+            self.latest_public_status_key() == marker.get("notice_key")
         with self.txn():
             self.state.update(status="BLOCKED", status_reason=reason)
             self.transition(self.state["phase"], f"BLOCKED: {reason} (restored after the capped amendment's "
                                                  "interrupted recovery)", save=False)
             if not reuse:
-                marker["notice_key"] = f"status-{len(self.state.get('transitions', []))}-blocked"
-                self.queue_status("BLOCKED", reason)
+                marker["notice_key"] = self.queue_status("BLOCKED", reason)
             marker["restore_needed"] = False
-            marker["notice_delivered_before_displacement"] = False
+            marker.pop("notice_delivered_before_displacement", None)
         self.settle_publications()
         return True
 
@@ -4944,7 +4966,9 @@ class Controller:
         and handoff receipts are excluded: finish_round/finalize re-check their prerequisites before sending them."""
         if getattr(self, "_txn_depth", 0):
             return  # deferred to the caller, after the transaction is persisted
-        for key, pub in list(self.state.get("publications", {}).items()):
+        # in the persisted numeric order the messages were queued (never the state file's key order, which is
+        # lexical after a reload: status-10 would precede status-7)
+        for key, pub in sorted(self.state.get("publications", {}).items(), key=lambda item: item[1].get("seq", 0)):
             if pub["state"] == "pending" and not VERDICT_KEY_RE.match(key):
                 self.send(key, pub)
         if self.state.get("public_ops") and not getattr(self, "_settling_ops", False):
@@ -6017,13 +6041,17 @@ def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes
         n = dev.get("invocations") or 0
         if n:
             follow(folder / "developer" / f"stream-{n:03d}.jsonl", render_claude_event, ("developer", n))
-        # completed attempts a resume retained in `earlier_attempts` plus the current ones (attempt numbers are
-        # monotonic and each has its own event file); only current attempts can be the running reviewer
-        retained = {a.get("n"): a for a in (last.get("earlier_attempts") or []) + (last.get("attempts") or [])
+        # the latest recorded reviewer execution: the most recent round with any attempt, current or retained by a
+        # resume in `earlier_attempts` (a replacement request with no attempt yet is not an execution), read from
+        # its own round directory under its own round and attempt numbers; only the last round's current attempts
+        # can be the running reviewer
+        executed = next((r for r in reversed(rounds) if isinstance(r, dict) and
+                         (r.get("attempts") or r.get("earlier_attempts"))), {})
+        retained = {a.get("n"): a for a in (executed.get("earlier_attempts") or []) + (executed.get("attempts") or [])
                     if isinstance(a, dict)}
         for attempt in retained.values():
-            follow(folder / "rounds" / f"r{int(last['round']):02d}" / f"events-{attempt.get('n')}.jsonl",
-                   render_codex_event, ("reviewer", last.get("round"), attempt.get("n")))
+            follow(folder / "rounds" / f"r{int(executed['round']):02d}" / f"events-{attempt.get('n')}.jsonl",
+                   render_codex_event, ("reviewer", executed.get("round"), attempt.get("n")))
         open_attempt = [a for a in last.get("attempts") or [] if not a.get("ended")]
         role, since, source = "no agent running (controller or the foreground session)", None, None
         if open_attempt:
@@ -6036,13 +6064,13 @@ def watch_enrollment(folder, emit=print, once=False, interval=2.0, stall_minutes
         latest, uncertain = source, False
         if not source:  # no agent running: the latest run by the controller's recorded execution order
             runs = ([(parse_iso(launch.get("at")), ("developer", launch.get("n")))] if launch.get("n") and n else [])
-            runs += [(parse_iso(a.get("started")), ("reviewer", last.get("round"), a.get("n")))
+            runs += [(parse_iso(a.get("started")), ("reviewer", executed.get("round"), a.get("n")))
                      for a in retained.values()]
             if runs and all(t for t, _ in runs):
                 newest = max(t for t, _ in runs)
                 tied = [key for t, key in runs if t == newest]
                 if len({key[0] for key in tied}) == 1:
-                    latest = max(tied, key=lambda key: key[-1] or 0)
+                    latest = max(tied, key=lambda key: tuple(part or 0 for part in key[1:]))  # (round,) attempt
                 else:
                     uncertain = True  # a developer run and a reviewer attempt recorded in the same second
             elif runs:
