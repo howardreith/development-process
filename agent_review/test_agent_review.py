@@ -4173,6 +4173,40 @@ class GitHubCommentTransportTests(unittest.TestCase):
         self.assertEqual([1, 2], [c["id"] for c in github.comments(114)])
         self.assertEqual(0, sum(1 for path, _ in requests if path == listing.format(114) + "?per_page=100&page=3"))
 
+    def test_bracketed_authorities_on_page_two_are_exact(self):
+        """Review 6 R5-F2, the exact public-reader cases, on page two of three-page listings through GitHub.comments. Refused with
+        CommandError (no partial listing), both on the BRACKETED-host branch: "https://[1::2::3]/rel" (an IP literal that is not an
+        IPv6address) and "https://bad[name]@[::1]/rel" (brackets in the user information before a valid IP literal). Valid: "[V1.a]"
+        and "[v1.a]" (an IPvFuture differing only in the case of its version flag) each return all three records and request page three
+        once. Controls: a valid IPv6 literal before next and a valid percent-encoded extension that is the page's only relation."""
+        listing = "/repos/owner/repo/issues/{}/comments"
+        cases = {200: 'rel="https://[1::2::3]/rel next"', 201: 'rel="https://bad[name]@[::1]/rel next"',
+                 202: 'rel="https://[V1.a]/rel next"', 203: 'rel="https://[v1.a]/rel next"',
+                 204: 'rel="https://[2001:db8::7]/rel next"', 205: 'rel="https://rels.example.test/p%41q"'}
+        routes = {}
+        for number, tail in cases.items():
+            path = listing.format(number)
+            routes[path + "?per_page=100"] = (lambda path: lambda p: (200, [("Link", f'<http://127.0.0.1:{p}{path}?per_page=100&page=2>; rel="next"')],
+                                                                     [self.record(1, "one")]))(path)
+            routes[path + "?per_page=100&page=2"] = (lambda path, tail: lambda p: (200, [("Link", f'<http://127.0.0.1:{p}{path}?per_page=100&page=3>; {tail}')],
+                                                                                   [self.record(2, "two")]))(path, tail)
+            routes[path + "?per_page=100&page=3"] = (200, [], [self.record(3, "three")])
+        port, requests = self.serve(routes)
+        github = self.github(port)
+        for number in (200, 201):
+            with self.subTest(refused=cases[number]):
+                self.assertIn("undecodable response: ValueError", self.failure(lambda: github.comments(number)))
+                self.assertEqual(0, sum(1 for path, _ in requests if path == listing.format(number) + "?per_page=100&page=3"))
+        for number in (202, 203, 204):
+            with self.subTest(accepted=cases[number]):
+                self.assertEqual([1, 2, 3], [c["id"] for c in github.comments(number)])
+                self.assertEqual(1, sum(1 for path, _ in requests if path == listing.format(number) + "?per_page=100&page=3"))
+        self.assertEqual([1, 2], [c["id"] for c in github.comments(205)])
+        self.assertEqual(0, sum(1 for path, _ in requests if path == listing.format(205) + "?per_page=100&page=3"))
+        # Both refused cases reach the bracketed-host branch (the host after the last "@" starts with "["), not the unbracketed one.
+        for authority in ("[1::2::3]", "bad[name]@[::1]"):
+            self.assertTrue(authority.rpartition("@")[2].startswith("["))
+
     def test_comment_records_require_the_author_key(self):
         """R1-F3: otherwise identical records with an omitted user and an explicitly null user: the omitted field fails the whole
         lookup and the whole listing (also on a later page); the explicit null remains readable."""
