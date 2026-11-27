@@ -12,6 +12,9 @@ docs/AGENT-REVIEW-WORKFLOW.md for architecture, permissions and recovery.
 from __future__ import annotations
 
 import argparse
+import types
+import urllib.error
+import urllib.request
 import contextlib
 import datetime as dt
 import hashlib
@@ -768,8 +771,36 @@ class GitHub:
     PR_FIELDS = ("number,url,state,isDraft,headRefName,headRefOid,baseRefName,author,reviewRequests,body,"
                  "isCrossRepository,headRepository,headRepositoryOwner")
 
-    def __init__(self, repo: str, gh: str = "gh"):
-        self.repo, self.gh = repo, resolve_exe(gh)
+    def __init__(self, repo: str, gh: str = "gh", api_base: str = None):
+        self.repo, self.gh, self.api_base = repo, resolve_exe(gh), api_base
+
+    # Comment bodies are read over the authenticated REST API directly, never through gh's printed output: gh rewrites
+    # control-character escapes in the responses it prints into caret notation before --jq or --allow-escape-sequences apply,
+    # and that also rewrites the six literal characters backslash-u0000 inside a stored body (observed with gh 2.99.0: the
+    # JSON text \\u0000 printed as \\^@), so an intact publication would read as altered. gh still supplies the credential.
+    def _rest(self, path):
+        """GET one REST resource and every following page: (decoded JSON pages). A failure raises CommandError like gh did;
+        an HTTP 404 on the first page returns None."""
+        token = run([self.gh, "auth", "token"], timeout=60).stdout.strip()
+        base = self.api_base or ("https://api.github.com" if os.environ.get("GH_HOST", "github.com") == "github.com"
+                                 else f"https://{os.environ['GH_HOST']}/api/v3")
+        url, pages = f"{base.rstrip('/')}/{path}", []
+        while url:
+            request = urllib.request.Request(url, headers={"Authorization": "Bearer " + token, "User-Agent": "agent-review",
+                                                           "Accept": "application/vnd.github+json"})
+            try:
+                with urllib.request.urlopen(request, timeout=180) as response:
+                    pages.append(json.loads(response.read().decode("utf-8")))
+                    link = response.headers.get("Link") or ""
+            except urllib.error.HTTPError as error:
+                if error.code == 404 and not pages:
+                    return None
+                raise CommandError(["gh", "api", path], types.SimpleNamespace(returncode=1, stdout="", stderr=f"HTTP {error.code}: {error.reason}"))
+            except (urllib.error.URLError, OSError) as error:
+                raise CommandError(["gh", "api", path], types.SimpleNamespace(returncode=1, stdout="", stderr=str(error)))
+            match = re.search(r'<([^>]+)>;\s*rel="next"', link)
+            url = match.group(1) if match else None
+        return pages
 
     def _json(self, *args):
         return json.loads(run([self.gh, *args], timeout=180).stdout or "null")
@@ -796,19 +827,19 @@ class GitHub:
         run([self.gh, "pr", "edit", str(number), "--repo", self.repo, "--body-file", str(body_file)], timeout=180)
 
     def comments(self, number):
-        return self._lines("api", "--paginate", f"repos/{self.repo}/issues/{number}/comments",
-                           "--jq", ".[] | {id: .id, user: .user.login, body: .body, url: .html_url} | @json")
+        pages = self._rest(f"repos/{self.repo}/issues/{number}/comments?per_page=100")
+        if pages is None:
+            raise CommandError(["gh", "api", "comments"], types.SimpleNamespace(returncode=1, stdout="", stderr="HTTP 404: Not Found"))
+        return [{"id": c["id"], "user": (c.get("user") or {}).get("login"), "body": c.get("body"), "url": c.get("html_url")}
+                for page in pages for c in page]
 
     def comment(self, comment_id):
         """Authoritative lookup of one comment: its record, or None only when GitHub answers 404 (deleted)."""
-        proc = run([self.gh, "api", f"repos/{self.repo}/issues/comments/{comment_id}"], check=False, timeout=180)
-        if proc.returncode == 0:
-            data = json.loads(proc.stdout or "{}")
-            return {"id": data["id"], "url": data["html_url"], "user": (data.get("user") or {}).get("login"),
-                    "body": data.get("body")}
-        if re.search(r"HTTP 404|Not Found", proc.stderr + proc.stdout):
+        pages = self._rest(f"repos/{self.repo}/issues/comments/{comment_id}")
+        if pages is None:
             return None
-        raise CommandError(["gh", "api", "comment"], proc)
+        data = pages[0]
+        return {"id": data["id"], "url": data["html_url"], "user": (data.get("user") or {}).get("login"), "body": data.get("body")}
 
     def post_comment(self, number, body_file) -> dict:
         try:

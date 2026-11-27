@@ -3809,6 +3809,55 @@ class DevProcRoundNineTests(CrashFixture, Base):
         self.assertEqual({"ci": "success", "lint": "success"}, {c["name"]: c["conclusion"] for c in checks})
 
 
+    def test_comment_bodies_are_read_exactly_despite_gh_output_sanitizing(self):
+        """A stored body holding the six literal characters backslash-u0000 and an actual U+0000 reads back exactly from the
+        single lookup and from the paginated listing (two pages). The REST responses come from a local server; the gh shim
+        supplies only the credential and, if asked for API output, prints what gh 2.99.0 printed for this body (the JSON text
+        of a literal backslash-u0000 in caret notation), so any read through gh output fails the comparison."""
+        import http.server, threading
+        body = '<!-- marker -->\nthe JSON string "stock-' + chr(92) + 'u0000created" and an actual "x' + chr(0) + 'y"\n'
+        record = {"id": 7, "html_url": "https://example.test/c/7", "user": {"login": "agent"}, "body": body}
+        other = {"id": 6, "html_url": "https://example.test/c/6", "user": {"login": "agent"}, "body": "earlier"}
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.headers.get("Authorization") != "Bearer test-token":
+                    self.send_response(401); self.end_headers(); return
+                if self.path.startswith("/repos/owner/repo/issues/comments/7"):
+                    payload, link = record, None
+                elif self.path.startswith("/repos/owner/repo/issues/comments/"):
+                    self.send_response(404); self.end_headers(); return
+                elif "page=2" in self.path:
+                    payload, link = [record], None
+                else:
+                    payload, link = [other], f'<http://127.0.0.1:{self.server.server_port}/repos/owner/repo/issues/5/comments?per_page=100&page=2>; rel="next"'
+                data = json.dumps(payload).encode("utf-8")
+                self.send_response(200); self.send_header("Content-Type", "application/json")
+                if link: self.send_header("Link", link)
+                self.end_headers(); self.wfile.write(data)
+            def log_message(self, *args): pass
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        shim_dir = Path(tempfile.mkdtemp(prefix="agent-review-gh-"))
+        self.addCleanup(shutil.rmtree, shim_dir, True)
+        script = shim_dir / "gh.py"
+        script.write_text("\n".join([
+            "import json, sys",
+            "args = sys.argv[1:]",
+            "if args[:2] == ['auth', 'token']:",
+            "    print('test-token'); sys.exit(0)",
+            f"text = json.dumps({json.dumps(record)!r})",
+            "B = chr(92)",
+            "sys.stdout.write(text.replace(B + B + 'u0000', B + B + '^@') + chr(10))  # gh 2.99.0's printed output",
+            ""]), encoding="utf-8")
+        shim = shim_dir / "gh.cmd"
+        shim.write_text(f'@"{sys.executable}" "{script}" %*\n', encoding="utf-8")
+        github = ar.GitHub("owner/repo", gh=str(shim), api_base=f"http://127.0.0.1:{server.server_port}")
+        self.assertEqual(body, github.comment(7)["body"])
+        self.assertEqual("agent", github.comment(7)["user"])
+        self.assertIsNone(github.comment(8))
+        self.assertEqual([("earlier", 6), (body, 7)], [(c["body"], c["id"]) for c in github.comments(5)])
+
 class FirstReleaseTests(Base):
     """Material findings fixed under the first-release scope (owner addendum 3)."""
 
