@@ -15,6 +15,7 @@ import argparse
 import contextlib
 import datetime as dt
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -780,68 +781,127 @@ class GitHub:
     # and that also rewrites the six literal characters backslash-u0000 inside a stored body (observed with gh 2.99.0: the
     # JSON text \\u0000 printed as \\^@), so an intact publication would read as altered. The response text is decoded by
     # json.loads alone, so every body string is exactly what GitHub stored. gh still supplies the credential, which is sent
-    # only to the API origin: a pagination link or redirect to any other scheme, host or port is refused without sending it,
-    # and no message carries it.
+    # only to the API origin (scheme, case-normalized host and effective port): a pagination link or redirect to any other
+    # origin is refused before anything is sent there. No diagnostic carries response text, reason phrases, header values
+    # other than validated numbers, or the credential helper's output.
+    def _host(self):
+        return os.environ.get("GH_HOST", "github.com").strip()
+
     def _api_base(self):
         if self.api_base:
             return self.api_base.rstrip("/")
-        host = os.environ.get("GH_HOST", "github.com")
+        host = self._host().lower()
         return "https://api.github.com" if host == "github.com" else f"https://{host}/api/v3"
 
     @staticmethod
     def _origin(url):
         parts = urllib.parse.urlsplit(url)
-        return parts.scheme.lower(), (parts.hostname or "").lower(), parts.port
+        scheme = parts.scheme.lower()
+        try:
+            port = parts.port
+        except ValueError:
+            return None
+        return scheme, (parts.hostname or "").lower(), port or {"https": 443, "http": 80}.get(scheme)
 
     @staticmethod
     def _failure(path, detail):
         return CommandError(["gh", "api", path], types.SimpleNamespace(returncode=1, stdout="", stderr=detail))
 
-    def _rest(self, path):
-        """GET one REST resource and every following page; returns the decoded JSON pages. HTTP 404 on the first page
-        returns None (the resource does not exist). Every other outcome that is not a complete answer raises CommandError:
-        authentication (401), rate limiting (403/429 with an exhausted limit or Retry-After), any other HTTP status, a
-        refused cross-origin link or redirect, a network failure or an undecodable response."""
+    @staticmethod
+    def _number(value):
+        value = (value or "").strip()
+        return value if re.fullmatch(r"[0-9]{1,12}", value) else "unknown"
+
+    @staticmethod
+    def _next_link(headers, base):
+        """The rel="next" target of every Link field (quoted or unquoted rel, any parameter order, several relations per entry),
+        resolved against the effective response URL; None when there is none. Several different next targets are refused."""
+        targets = set()
+        for field in headers.get_all("Link") or []:
+            for entry in re.findall(r'<([^>]*)>([^,<]*)', field):
+                target, params = entry
+                for param in params.split(";"):
+                    name, _, value = param.partition("=")
+                    if name.strip().lower() == "rel" and "next" in value.strip().strip('"').lower().split():
+                        targets.add(urllib.parse.urljoin(base, target.strip()))
+        if len(targets) > 1:
+            raise ValueError("several next links")
+        return targets.pop() if targets else None
+
+    def _rest(self, path, expect):
+        """GET one REST resource (expect "object") or every page of a listing (expect "list"); returns the decoded pages. HTTP 404
+        on the first request returns None (the resource does not exist). Every other outcome that is not a complete, well-formed
+        answer raises CommandError: a credential failure, 401, rate limiting (403 with an exhausted limit or Retry-After, and 429),
+        any other status (also a 2xx other than 200), a refused cross-origin, invalid or repeated next link or redirect, a network or
+        protocol failure (an interrupted body included), an undecodable body or a page of the wrong JSON shape."""
         base = self._api_base()
         origin = self._origin(base)
-        token = run([self.gh, "auth", "token", "--hostname", os.environ.get("GH_HOST", "github.com")], timeout=60).stdout.strip()
-        if not token:
-            raise self._failure(path, "authentication failed: gh auth token returned no credential")
+        auth = run([self.gh, "auth", "token", "--hostname", self._host()], timeout=60, check=False)
+        token = (auth.stdout or "").strip() if auth.returncode == 0 else ""
+        if not token or any(ch.isspace() for ch in token):
+            # the helper's output is never forwarded: it may hold the credential itself
+            raise self._failure(path, f"authentication failed: gh auth token exited {auth.returncode} without a usable credential")
 
         class SameOriginRedirects(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, req, fp, code, msg, headers, newurl):
                 if GitHub._origin(urllib.parse.urljoin(req.full_url, newurl)) != origin:
-                    raise urllib.error.HTTPError(req.full_url, code, "redirect to another origin refused", headers, fp)
+                    raise urllib.error.HTTPError(req.full_url, code, "redirect to another origin refused", None, fp)
                 return super().redirect_request(req, fp, code, msg, headers, newurl)
 
         opener = urllib.request.build_opener(SameOriginRedirects())
-        url, pages = f"{base}/{path}", []
+        url, pages, seen = f"{base}/{path}", [], set()
         while url:
-            if self._origin(url) != origin:
+            if origin is None or self._origin(url) != origin:
                 raise self._failure(path, "pagination link to another origin refused")
+            if url in seen:
+                raise self._failure(path, "pagination link repeated")
+            seen.add(url)
             request = urllib.request.Request(url, headers={"Authorization": "Bearer " + token, "User-Agent": "agent-review",
                                                            "Accept": "application/vnd.github+json"})
+            failure = None
             try:
                 with opener.open(request, timeout=180) as response:
-                    pages.append(json.loads(response.read().decode("utf-8")))
-                    link = response.headers.get("Link") or ""
+                    if response.status != 200:
+                        failure = f"HTTP {response.status}: unexpected status for a GET"
+                    else:
+                        page = json.loads(response.read().decode("utf-8"))
+                        if expect == "list" and not isinstance(page, list) or expect == "object" and not isinstance(page, dict):
+                            failure = "unexpected response shape"
+                        else:
+                            pages.append(page)
+                            url = self._next_link(response.headers, response.geturl()) if expect == "list" else None
             except urllib.error.HTTPError as error:
-                code, headers = error.code, error.headers or {}
+                code, headers = error.code, error.headers
                 error.close()
-                if code == 404 and not pages:
+                if code == 404 and not pages and not seen - {url}:
                     return None
-                if code == 401:
-                    raise self._failure(path, "HTTP 401: authentication failed (check gh auth status)")
-                if code == 429 or (code == 403 and (headers.get("X-RateLimit-Remaining") == "0" or headers.get("Retry-After"))):
-                    raise self._failure(path, f"HTTP {code}: rate limited (retry after {headers.get('Retry-After') or headers.get('X-RateLimit-Reset') or 'unknown'})")
-                raise self._failure(path, f"HTTP {code}: {error.reason}")
-            except (urllib.error.URLError, OSError) as error:
-                raise self._failure(path, f"request failed: {getattr(error, 'reason', error)}")
-            except ValueError as error:  # undecodable bytes or JSON
-                raise self._failure(path, f"undecodable response: {type(error).__name__}")
-            match = re.search(r'<([^>]+)>;\s*rel="next"', link)
-            url = urllib.parse.urljoin(url, match.group(1)) if match else None
+                if "another origin" in str(error.reason):
+                    failure = "redirect to another origin refused"
+                elif code == 401:
+                    failure = "HTTP 401: authentication failed (check gh auth status)"
+                elif code == 429 or code == 403 and headers is not None and (headers.get("X-RateLimit-Remaining") == "0" or headers.get("Retry-After")):
+                    retry = self._number(headers.get("Retry-After")) if headers is not None else "unknown"
+                    if retry == "unknown" and headers is not None:
+                        retry = self._number(headers.get("X-RateLimit-Reset"))
+                    failure = f"HTTP {code}: rate limited (retry after {retry})"
+                else:
+                    failure = f"HTTP {code}: {http.client.responses.get(code, 'unexpected status')}"
+            except (urllib.error.URLError, http.client.HTTPException, OSError) as error:
+                reason = getattr(error, "reason", error)
+                failure = f"request failed: {type(reason).__name__}"
+            except ValueError as error:  # undecodable bytes or JSON, or several next links
+                failure = f"undecodable response: {type(error).__name__}"
+            if failure:
+                raise self._failure(path, failure) from None
         return pages
+
+    @staticmethod
+    def _comment_record(data):
+        user = data.get("user")
+        if not (isinstance(data.get("id"), int) and not isinstance(data.get("id"), bool) and isinstance(data.get("body"), str) and
+                isinstance(data.get("html_url"), str) and (user is None or isinstance(user, dict) and isinstance(user.get("login"), str))):
+            return None
+        return {"id": data["id"], "user": (user or {}).get("login"), "body": data["body"], "url": data["html_url"]}
 
     def _json(self, *args):
         return json.loads(run([self.gh, *args], timeout=180).stdout or "null")
@@ -868,19 +928,23 @@ class GitHub:
         run([self.gh, "pr", "edit", str(number), "--repo", self.repo, "--body-file", str(body_file)], timeout=180)
 
     def comments(self, number):
-        pages = self._rest(f"repos/{self.repo}/issues/{number}/comments?per_page=100")
+        pages = self._rest(f"repos/{self.repo}/issues/{number}/comments?per_page=100", "list")
         if pages is None:  # the issue or pull request itself is missing: never an empty listing
             raise self._failure("comments", "HTTP 404: Not Found")
-        return [{"id": c["id"], "user": (c.get("user") or {}).get("login"), "body": c.get("body"), "url": c.get("html_url")}
-                for page in pages for c in page]
+        records = [self._comment_record(c) if isinstance(c, dict) else None for page in pages for c in page]
+        if any(r is None for r in records):
+            raise self._failure("comments", "unexpected comment record")
+        return records
 
     def comment(self, comment_id):
         """Authoritative lookup of one comment: its record, or None only when GitHub answers 404 (deleted)."""
-        pages = self._rest(f"repos/{self.repo}/issues/comments/{comment_id}")
+        pages = self._rest(f"repos/{self.repo}/issues/comments/{comment_id}", "object")
         if pages is None:
             return None
-        data = pages[0]
-        return {"id": data["id"], "url": data["html_url"], "user": (data.get("user") or {}).get("login"), "body": data.get("body")}
+        record = self._comment_record(pages[0])
+        if record is None:
+            raise self._failure("comment", "unexpected comment record")
+        return {"id": record["id"], "url": record["url"], "user": record["user"], "body": record["body"]}
 
     def post_comment(self, number, body_file) -> dict:
         try:
