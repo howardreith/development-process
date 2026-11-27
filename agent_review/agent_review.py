@@ -12,9 +12,6 @@ docs/AGENT-REVIEW-WORKFLOW.md for architecture, permissions and recovery.
 from __future__ import annotations
 
 import argparse
-import types
-import urllib.error
-import urllib.request
 import contextlib
 import datetime as dt
 import hashlib
@@ -29,6 +26,10 @@ import subprocess
 import sys
 import threading
 import time
+import types
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from pathlib import Path
 
@@ -777,29 +778,69 @@ class GitHub:
     # Comment bodies are read over the authenticated REST API directly, never through gh's printed output: gh rewrites
     # control-character escapes in the responses it prints into caret notation before --jq or --allow-escape-sequences apply,
     # and that also rewrites the six literal characters backslash-u0000 inside a stored body (observed with gh 2.99.0: the
-    # JSON text \\u0000 printed as \\^@), so an intact publication would read as altered. gh still supplies the credential.
+    # JSON text \\u0000 printed as \\^@), so an intact publication would read as altered. The response text is decoded by
+    # json.loads alone, so every body string is exactly what GitHub stored. gh still supplies the credential, which is sent
+    # only to the API origin: a pagination link or redirect to any other scheme, host or port is refused without sending it,
+    # and no message carries it.
+    def _api_base(self):
+        if self.api_base:
+            return self.api_base.rstrip("/")
+        host = os.environ.get("GH_HOST", "github.com")
+        return "https://api.github.com" if host == "github.com" else f"https://{host}/api/v3"
+
+    @staticmethod
+    def _origin(url):
+        parts = urllib.parse.urlsplit(url)
+        return parts.scheme.lower(), (parts.hostname or "").lower(), parts.port
+
+    @staticmethod
+    def _failure(path, detail):
+        return CommandError(["gh", "api", path], types.SimpleNamespace(returncode=1, stdout="", stderr=detail))
+
     def _rest(self, path):
-        """GET one REST resource and every following page: (decoded JSON pages). A failure raises CommandError like gh did;
-        an HTTP 404 on the first page returns None."""
-        token = run([self.gh, "auth", "token"], timeout=60).stdout.strip()
-        base = self.api_base or ("https://api.github.com" if os.environ.get("GH_HOST", "github.com") == "github.com"
-                                 else f"https://{os.environ['GH_HOST']}/api/v3")
-        url, pages = f"{base.rstrip('/')}/{path}", []
+        """GET one REST resource and every following page; returns the decoded JSON pages. HTTP 404 on the first page
+        returns None (the resource does not exist). Every other outcome that is not a complete answer raises CommandError:
+        authentication (401), rate limiting (403/429 with an exhausted limit or Retry-After), any other HTTP status, a
+        refused cross-origin link or redirect, a network failure or an undecodable response."""
+        base = self._api_base()
+        origin = self._origin(base)
+        token = run([self.gh, "auth", "token", "--hostname", os.environ.get("GH_HOST", "github.com")], timeout=60).stdout.strip()
+        if not token:
+            raise self._failure(path, "authentication failed: gh auth token returned no credential")
+
+        class SameOriginRedirects(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                if GitHub._origin(urllib.parse.urljoin(req.full_url, newurl)) != origin:
+                    raise urllib.error.HTTPError(req.full_url, code, "redirect to another origin refused", headers, fp)
+                return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+        opener = urllib.request.build_opener(SameOriginRedirects())
+        url, pages = f"{base}/{path}", []
         while url:
+            if self._origin(url) != origin:
+                raise self._failure(path, "pagination link to another origin refused")
             request = urllib.request.Request(url, headers={"Authorization": "Bearer " + token, "User-Agent": "agent-review",
                                                            "Accept": "application/vnd.github+json"})
             try:
-                with urllib.request.urlopen(request, timeout=180) as response:
+                with opener.open(request, timeout=180) as response:
                     pages.append(json.loads(response.read().decode("utf-8")))
                     link = response.headers.get("Link") or ""
             except urllib.error.HTTPError as error:
-                if error.code == 404 and not pages:
+                code, headers = error.code, error.headers or {}
+                error.close()
+                if code == 404 and not pages:
                     return None
-                raise CommandError(["gh", "api", path], types.SimpleNamespace(returncode=1, stdout="", stderr=f"HTTP {error.code}: {error.reason}"))
+                if code == 401:
+                    raise self._failure(path, "HTTP 401: authentication failed (check gh auth status)")
+                if code == 429 or (code == 403 and (headers.get("X-RateLimit-Remaining") == "0" or headers.get("Retry-After"))):
+                    raise self._failure(path, f"HTTP {code}: rate limited (retry after {headers.get('Retry-After') or headers.get('X-RateLimit-Reset') or 'unknown'})")
+                raise self._failure(path, f"HTTP {code}: {error.reason}")
             except (urllib.error.URLError, OSError) as error:
-                raise CommandError(["gh", "api", path], types.SimpleNamespace(returncode=1, stdout="", stderr=str(error)))
+                raise self._failure(path, f"request failed: {getattr(error, 'reason', error)}")
+            except ValueError as error:  # undecodable bytes or JSON
+                raise self._failure(path, f"undecodable response: {type(error).__name__}")
             match = re.search(r'<([^>]+)>;\s*rel="next"', link)
-            url = match.group(1) if match else None
+            url = urllib.parse.urljoin(url, match.group(1)) if match else None
         return pages
 
     def _json(self, *args):
@@ -828,8 +869,8 @@ class GitHub:
 
     def comments(self, number):
         pages = self._rest(f"repos/{self.repo}/issues/{number}/comments?per_page=100")
-        if pages is None:
-            raise CommandError(["gh", "api", "comments"], types.SimpleNamespace(returncode=1, stdout="", stderr="HTTP 404: Not Found"))
+        if pages is None:  # the issue or pull request itself is missing: never an empty listing
+            raise self._failure("comments", "HTTP 404: Not Found")
         return [{"id": c["id"], "user": (c.get("user") or {}).get("login"), "body": c.get("body"), "url": c.get("html_url")}
                 for page in pages for c in page]
 

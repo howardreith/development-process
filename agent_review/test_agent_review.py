@@ -3809,54 +3809,150 @@ class DevProcRoundNineTests(CrashFixture, Base):
         self.assertEqual({"ci": "success", "lint": "success"}, {c["name"]: c["conclusion"] for c in checks})
 
 
-    def test_comment_bodies_are_read_exactly_despite_gh_output_sanitizing(self):
-        """A stored body holding the six literal characters backslash-u0000 and an actual U+0000 reads back exactly from the
-        single lookup and from the paginated listing (two pages). The REST responses come from a local server; the gh shim
-        supplies only the credential and, if asked for API output, prints what gh 2.99.0 printed for this body (the JSON text
-        of a literal backslash-u0000 in caret notation), so any read through gh output fails the comparison."""
-        import http.server, threading
-        body = '<!-- marker -->\nthe JSON string "stock-' + chr(92) + 'u0000created" and an actual "x' + chr(0) + 'y"\n'
-        record = {"id": 7, "html_url": "https://example.test/c/7", "user": {"login": "agent"}, "body": body}
-        other = {"id": 6, "html_url": "https://example.test/c/6", "user": {"login": "agent"}, "body": "earlier"}
+class GitHubCommentTransportTests(unittest.TestCase):
+    """Comment bodies are read over the REST API exactly as stored (gh 2.99.0 rewrites literal backslash-u0000 in the
+    output it prints). GitHub is simulated by local HTTP servers (clearly labeled: canned REST responses); the gh shim
+    supplies only the credential and, if asked for API output, prints what gh 2.99.0 printed (caret notation), so any
+    read through gh's output fails the comparisons."""
+
+    TOKEN = "test-token-6f1c"
+
+    def serve(self, routes):
+        """A local server answering GET path -> (status, headers, payload); every request is recorded."""
+        import http.server
+        requests = []
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
-                if self.headers.get("Authorization") != "Bearer test-token":
-                    self.send_response(401); self.end_headers(); return
-                if self.path.startswith("/repos/owner/repo/issues/comments/7"):
-                    payload, link = record, None
-                elif self.path.startswith("/repos/owner/repo/issues/comments/"):
-                    self.send_response(404); self.end_headers(); return
-                elif "page=2" in self.path:
-                    payload, link = [record], None
+                requests.append((self.path, self.headers.get("Authorization")))
+                route = routes.get(self.path)
+                if route is None:
+                    status, headers, payload = 404, {}, {"message": "Not Found"}
+                elif self.headers.get("Authorization") != "Bearer " + GitHubCommentTransportTests.TOKEN:
+                    status, headers, payload = 401, {}, {"message": "Bad credentials"}
                 else:
-                    payload, link = [other], f'<http://127.0.0.1:{self.server.server_port}/repos/owner/repo/issues/5/comments?per_page=100&page=2>; rel="next"'
-                data = json.dumps(payload).encode("utf-8")
-                self.send_response(200); self.send_header("Content-Type", "application/json")
-                if link: self.send_header("Link", link)
-                self.end_headers(); self.wfile.write(data)
-            def log_message(self, *args): pass
+                    status, headers, payload = route(self.server.server_port) if callable(route) else route
+                data = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                for key, value in headers.items():
+                    self.send_header(key, value)
+                self.end_headers()
+                self.wfile.write(data)
+            def log_message(self, *args):
+                pass
         server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
+        return server.server_port, requests
+
+    def github(self, port, printed=None):
         shim_dir = Path(tempfile.mkdtemp(prefix="agent-review-gh-"))
         self.addCleanup(shutil.rmtree, shim_dir, True)
         script = shim_dir / "gh.py"
         script.write_text("\n".join([
             "import json, sys",
             "args = sys.argv[1:]",
+            f"open({str(shim_dir / 'calls.txt')!r}, 'a').write(' '.join(args) + chr(10))",
             "if args[:2] == ['auth', 'token']:",
-            "    print('test-token'); sys.exit(0)",
-            f"text = json.dumps({json.dumps(record)!r})",
+            f"    print({self.TOKEN!r}); sys.exit(0)",
+            f"text = json.dumps({json.dumps(printed)!r})",
             "B = chr(92)",
             "sys.stdout.write(text.replace(B + B + 'u0000', B + B + '^@') + chr(10))  # gh 2.99.0's printed output",
             ""]), encoding="utf-8")
         shim = shim_dir / "gh.cmd"
         shim.write_text(f'@"{sys.executable}" "{script}" %*\n', encoding="utf-8")
-        github = ar.GitHub("owner/repo", gh=str(shim), api_base=f"http://127.0.0.1:{server.server_port}")
-        self.assertEqual(body, github.comment(7)["body"])
-        self.assertEqual("agent", github.comment(7)["user"])
-        self.assertIsNone(github.comment(8))
-        self.assertEqual([("earlier", 6), (body, 7)], [(c["body"], c["id"]) for c in github.comments(5)])
+        self.calls = shim_dir / "calls.txt"
+        return ar.GitHub("owner/repo", gh=str(shim), api_base=f"http://127.0.0.1:{port}")
+
+    def failure(self, call):
+        with self.assertRaises(ar.CommandError) as caught:
+            call()
+        self.assertNotIn(self.TOKEN, str(caught.exception))
+        self.assertNotIn(self.TOKEN, caught.exception.stderr)
+        return str(caught.exception)
+
+    def test_comment_bodies_are_read_exactly_despite_gh_output_sanitizing(self):
+        """Literal escapes (backslash-u0000, backslash-n), actual control characters (U+0000, U+0001, U+001B, tab, CR) and
+        ordinary Unicode (accents, CJK, a non-BMP emoji, right-to-left text) read back exactly from the single lookup and from a
+        three-page listing, in order."""
+        B = chr(92)
+        literal = 'the JSON string "stock-' + B + 'u0000created", ' + B + 'n and ' + B + B + 'u0041'
+        control = 'actual "x' + chr(0) + 'y' + chr(1) + chr(27) + '[0m' + chr(9) + chr(13) + '"'
+        unicode = 'caf' + chr(0xE9) + ' ' + chr(0x6F22) + chr(0x5B57) + ' ' + chr(0x1F40E) + ' ' + chr(0x5E9) + chr(0x5DC) + chr(0x5D5) + chr(0x5DD)
+        body = '<!-- marker -->\n' + literal + '\n' + control + '\n' + unicode + '\n'
+        record = {"id": 7, "html_url": "https://example.test/c/7", "user": {"login": "agent"}, "body": body}
+        first = {"id": 5, "html_url": "https://example.test/c/5", "user": {"login": "agent"}, "body": unicode}
+        second = {"id": 6, "html_url": "https://example.test/c/6", "user": {"login": "other"}, "body": literal}
+        listing = "/repos/owner/repo/issues/5/comments"
+        port, requests = self.serve({
+            "/repos/owner/repo/issues/comments/7": (200, {}, record),
+            listing + "?per_page=100": lambda p: (200, {"Link": f'<http://127.0.0.1:{p}{listing}?per_page=100&page=2>; rel="next", '
+                                                                f'<http://127.0.0.1:{p}{listing}?per_page=100&page=3>; rel="last"'}, [first]),
+            listing + "?per_page=100&page=2": lambda p: (200, {"Link": f'<{listing}?per_page=100&page=3>; rel="next"'}, [second]),
+            listing + "?per_page=100&page=3": (200, {}, [record]),
+        })
+        github = self.github(port, printed=record)
+        found = github.comment(7)
+        self.assertEqual(body, found["body"])
+        self.assertEqual(ar.sha256_text(body), ar.sha256_text(found["body"]))
+        self.assertEqual({"id": 7, "url": "https://example.test/c/7", "user": "agent"}, {k: found[k] for k in ("id", "url", "user")})
+        self.assertEqual([(5, unicode, "agent"), (6, literal, "other"), (7, body, "agent")],
+                         [(c["id"], c["body"], c["user"]) for c in github.comments(5)])
+        self.assertEqual(3, sum(1 for path, _ in requests if path.startswith(listing)))
+        self.assertTrue(all(auth == "Bearer " + self.TOKEN for _, auth in requests))
+        calls = self.calls.read_text(encoding="utf-8").splitlines()
+        self.assertTrue(calls and all(c == "auth token --hostname github.com" for c in calls), calls)
+
+    def test_a_missing_comment_is_distinguished_from_request_failures(self):
+        """Only HTTP 404 on a single comment means deleted (None). Authentication, rate limiting, other statuses, a missing
+        listing, a failure on a later page, an undecodable response and a refused connection all raise, never None or a
+        partial listing, and no message carries the credential."""
+        listing = "/repos/owner/repo/issues/9/comments"
+        port, _ = self.serve({
+            "/repos/owner/repo/issues/comments/20": (401, {}, {"message": "Bad credentials"}),
+            "/repos/owner/repo/issues/comments/21": (403, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1798761600"}, {"message": "API rate limit exceeded"}),
+            "/repos/owner/repo/issues/comments/22": (429, {"Retry-After": "60"}, {"message": "secondary rate limit"}),
+            "/repos/owner/repo/issues/comments/23": (403, {}, {"message": "Resource not accessible"}),
+            "/repos/owner/repo/issues/comments/24": (500, {}, {"message": "Server Error"}),
+            "/repos/owner/repo/issues/comments/25": (200, {}, b"<html>not json</html>"),
+            listing + "?per_page=100": lambda p: (200, {"Link": f'<http://127.0.0.1:{p}{listing}?per_page=100&page=2>; rel="next"'},
+                                                  [{"id": 1, "html_url": "u", "user": {"login": "agent"}, "body": "page one"}]),
+            listing + "?per_page=100&page=2": (502, {}, {"message": "Bad Gateway"}),
+        })
+        github = self.github(port)
+        self.assertIsNone(github.comment(19))
+        self.assertIn("HTTP 401: authentication failed", self.failure(lambda: github.comment(20)))
+        self.assertIn("HTTP 403: rate limited (retry after 1798761600)", self.failure(lambda: github.comment(21)))
+        self.assertIn("HTTP 429: rate limited (retry after 60)", self.failure(lambda: github.comment(22)))
+        self.assertIn("HTTP 403: Forbidden", self.failure(lambda: github.comment(23)))
+        self.assertIn("HTTP 500", self.failure(lambda: github.comment(24)))
+        self.assertIn("undecodable response", self.failure(lambda: github.comment(25)))
+        self.assertIn("HTTP 404", self.failure(lambda: github.comments(8)))
+        self.assertIn("HTTP 502", self.failure(lambda: github.comments(9)))
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            closed = probe.getsockname()[1]
+        self.assertIn("request failed", self.failure(lambda: self.github(closed).comment(7)))
+
+    def test_the_credential_is_sent_only_to_the_api_origin(self):
+        """A pagination link or a redirect to another port (another origin) is refused without sending anything there; a
+        same-origin redirect is followed with the credential."""
+        other_port, other_requests = self.serve({"/stolen": (200, {}, [])})
+        listing = "/repos/owner/repo/issues/3/comments"
+        port, requests = self.serve({
+            listing + "?per_page=100": (200, {"Link": f'<http://127.0.0.1:{other_port}/stolen>; rel="next"'}, []),
+            "/repos/owner/repo/issues/comments/30": (302, {"Location": f"http://127.0.0.1:{other_port}/stolen"}, {}),
+            "/repos/owner/repo/issues/comments/31": (301, {"Location": "/repositories/1/issues/comments/31"}, {}),
+            "/repositories/1/issues/comments/31": (200, {}, {"id": 31, "html_url": "u", "user": {"login": "agent"}, "body": "moved"}),
+        })
+        github = self.github(port)
+        self.assertIn("pagination link to another origin refused", self.failure(lambda: github.comments(3)))
+        self.assertIn("redirect to another origin refused", self.failure(lambda: github.comment(30)))
+        self.assertEqual([], other_requests)
+        self.assertEqual("moved", github.comment(31)["body"])
+        self.assertIn(("/repositories/1/issues/comments/31", "Bearer " + self.TOKEN), requests)
+
 
 class FirstReleaseTests(Base):
     """Material findings fixed under the first-release scope (owner addendum 3)."""
