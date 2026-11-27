@@ -774,6 +774,7 @@ class GitHub:
                  "isCrossRepository,headRepository,headRepositoryOwner")
 
     CREDENTIAL_TIMEOUT = 60  # seconds for `gh auth token`
+    LINK_TOKEN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")  # RFC 9110 token characters
 
     def __init__(self, repo: str, gh: str = "gh", api_base: str = None):
         self.repo, self.gh, self.api_base = repo, resolve_exe(gh), api_base
@@ -879,10 +880,14 @@ class GitHub:
                         value = field[start:i]
                         if not value:  # an explicit "=" with nothing after it is malformed, never an empty value
                             raise ValueError("Link parameter without a value")
+                        if not GitHub.LINK_TOKEN.fullmatch(value):  # an unquoted value must be an HTTP token (RFC 9110 5.6.2)
+                            raise ValueError("Link parameter value is not a token")
                 elif not name:
                     continue  # an empty parameter (";;")
                 if not name:
                     raise ValueError("Link parameter without a name")
+                if not GitHub.LINK_TOKEN.fullmatch(name):
+                    raise ValueError("Link parameter name is not a token")
                 if name == "rel" and not value.split():  # a relation parameter must name at least one relation type
                     raise ValueError("Link relation without a type")
                 params.append((name, value))

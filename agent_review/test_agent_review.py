@@ -4096,7 +4096,7 @@ class GitHubCommentTransportTests(unittest.TestCase):
         rel=next returns all three IDs, each page fetched exactly once."""
         listing = "/repos/owner/repo/issues/{}/comments"
         routes = {}
-        for number, tail in ((80, "rel=next"), (81, "rel="), (82, 'rel=""'), (83, "rel= ;")):
+        for number, tail in ((80, "rel=next"), (81, "rel="), (82, 'rel=""'), (83, "rel= ;"), (84, "rel==next"), (85, "rel=ne<xt"), (86, "r@l=next")):
             path = listing.format(number)
             routes[path + "?per_page=100"] = (lambda path: lambda p: (200, [("Link", f'<http://127.0.0.1:{p}{path}?per_page=100&page=2>; rel="next"')],
                                                                      [self.record(1, "one")]))(path)
@@ -4107,11 +4107,12 @@ class GitHubCommentTransportTests(unittest.TestCase):
         github = self.github(port)
         self.assertEqual([1, 2, 3], [c["id"] for c in github.comments(80)])
         self.assertEqual(1, sum(1 for path, _ in requests if path == listing.format(80) + "?per_page=100&page=3"))
-        for number in (81, 82, 83):
+        for number in (81, 82, 83, 84, 85, 86):  # R4-F1: an unquoted value or a name that is not an HTTP token is malformed too
             self.assertIn("undecodable response: ValueError", self.failure(lambda: github.comments(number)))
         with self.assertRaises(ValueError):
             ar.GitHub._link_entries('<a>; rel=')
         self.assertEqual([("a", [("title", "")])], ar.GitHub._link_entries('<a>; title=""'))  # an explicit empty quoted title stays valid
+        self.assertEqual([("a", [("title", "a=b; c"), ("rel", "next")])], ar.GitHub._link_entries('<a>; title="a=b; c"; rel=next'))  # quoted "=" stays valid
 
     def test_comment_records_require_the_author_key(self):
         """R1-F3: otherwise identical records with an omitted user and an explicitly null user: the omitted field fails the whole
