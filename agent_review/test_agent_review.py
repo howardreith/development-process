@@ -4174,13 +4174,15 @@ class GitHubCommentTransportTests(unittest.TestCase):
         self.assertEqual(0, sum(1 for path, _ in requests if path == listing.format(114) + "?per_page=100&page=3"))
 
     def test_bracketed_authorities_on_page_two_are_exact(self):
-        """Review 6 R5-F2, the exact public-reader cases, on page two of three-page listings through GitHub.comments. Refused with
-        CommandError (no partial listing), both on the BRACKETED-host branch: "https://[1::2::3]/rel" (an IP literal that is not an
-        IPv6address) and "https://bad[name]@[::1]/rel" (brackets in the user information before a valid IP literal). Valid: "[V1.a]"
-        and "[v1.a]" (an IPvFuture differing only in the case of its version flag) each return all three records and request page three
-        once. Controls: a valid IPv6 literal before next and a valid percent-encoded extension that is the page's only relation."""
+        """Review 6 R5-F2 and review 7 (R5-F2, R7-F1), the exact public-reader cases, on page two of three-page listings through
+        GitHub.comments. Refused with CommandError (no partial listing, page three never requested), each as the SOLE relation on page two
+        and on the BRACKETED-host branch: "https://[1::2::3]/rel" (an IP literal that is not an IPv6address), "https://bad[name]@[::1]/rel"
+        (brackets in the user information before a valid IP literal) and "https://[::1%41]/rel" (a percent "scope" suffix, which
+        ipaddress.IPv6Address alone accepts). Valid: "[V1.a]" and "[v1.a]" with next (an IPvFuture differing only in the case of its
+        version flag) each return all three records and request page three once. Controls: a valid IPv6 literal before next and a valid
+        percent-encoded extension that is the page's only relation (a genuine last page)."""
         listing = "/repos/owner/repo/issues/{}/comments"
-        cases = {200: 'rel="https://[1::2::3]/rel next"', 201: 'rel="https://bad[name]@[::1]/rel next"',
+        cases = {200: 'rel="https://[1::2::3]/rel"', 201: 'rel="https://bad[name]@[::1]/rel"', 206: 'rel="https://[::1%41]/rel"',
                  202: 'rel="https://[V1.a]/rel next"', 203: 'rel="https://[v1.a]/rel next"',
                  204: 'rel="https://[2001:db8::7]/rel next"', 205: 'rel="https://rels.example.test/p%41q"'}
         routes = {}
@@ -4193,7 +4195,7 @@ class GitHubCommentTransportTests(unittest.TestCase):
             routes[path + "?per_page=100&page=3"] = (200, [], [self.record(3, "three")])
         port, requests = self.serve(routes)
         github = self.github(port)
-        for number in (200, 201):
+        for number in (200, 201, 206):
             with self.subTest(refused=cases[number]):
                 self.assertIn("undecodable response: ValueError", self.failure(lambda: github.comments(number)))
                 self.assertEqual(0, sum(1 for path, _ in requests if path == listing.format(number) + "?per_page=100&page=3"))
@@ -4204,7 +4206,7 @@ class GitHubCommentTransportTests(unittest.TestCase):
         self.assertEqual([1, 2], [c["id"] for c in github.comments(205)])
         self.assertEqual(0, sum(1 for path, _ in requests if path == listing.format(205) + "?per_page=100&page=3"))
         # Both refused cases reach the bracketed-host branch (the host after the last "@" starts with "["), not the unbracketed one.
-        for authority in ("[1::2::3]", "bad[name]@[::1]"):
+        for authority in ("[1::2::3]", "bad[name]@[::1]", "[::1%41]"):
             self.assertTrue(authority.rpartition("@")[2].startswith("["))
 
     def test_comment_records_require_the_author_key(self):

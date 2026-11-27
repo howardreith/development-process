@@ -810,8 +810,12 @@ class GitHub:
                 if not re.fullmatch(r"[vV][0-9A-Fa-f]+\.[A-Za-z0-9\-._~!$&'()*+,;=:]+", literal):
                     return False
             else:
+                # IPv6address structure. RFC 3986 has no zone identifier, but ipaddress.IPv6Address accepts a "%scope" suffix, so a "%"
+                # inside the literal is refused here (percent escapes elsewhere in the URI are validated separately and stay valid).
+                if "%" in literal:
+                    return False
                 try:
-                    ipaddress.IPv6Address(literal)   # IPv6address structure (zone identifiers are not part of RFC 3986)
+                    ipaddress.IPv6Address(literal)
                 except ValueError:
                     return False
         elif "[" in host or "]" in host:
