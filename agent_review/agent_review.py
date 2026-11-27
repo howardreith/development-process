@@ -773,6 +773,8 @@ class GitHub:
     PR_FIELDS = ("number,url,state,isDraft,headRefName,headRefOid,baseRefName,author,reviewRequests,body,"
                  "isCrossRepository,headRepository,headRepositoryOwner")
 
+    CREDENTIAL_TIMEOUT = 60  # seconds for `gh auth token`
+
     def __init__(self, repo: str, gh: str = "gh", api_base: str = None):
         self.repo, self.gh, self.api_base = repo, resolve_exe(gh), api_base
 
@@ -801,7 +803,9 @@ class GitHub:
             port = parts.port
         except ValueError:
             return None
-        return scheme, (parts.hostname or "").lower(), port or {"https": 443, "http": 80}.get(scheme)
+        if port is None:  # only an omitted port takes the scheme default; an explicit port (zero included) stays itself
+            port = {"https": 443, "http": 80}.get(scheme)
+        return scheme, (parts.hostname or "").lower(), port
 
     @staticmethod
     def _failure(path, detail):
@@ -813,17 +817,85 @@ class GitHub:
         return value if re.fullmatch(r"[0-9]{1,12}", value) else "unknown"
 
     @staticmethod
+    def _link_entries(field):
+        """The (target, [(name, value), ...]) entries of one Link field value (RFC 8288 section 3): a comma separates entries and a
+        semicolon parameters only outside the <URI> and outside a quoted-string, whose backslash escapes are decoded; parameter
+        names are lower-cased. A malformed field raises ValueError (the response is then undecodable), so a next relation is never
+        silently lost."""
+        entries, i, n = [], 0, len(field)
+
+        def blank(k):
+            while k < n and field[k] in " \t":
+                k += 1
+            return k
+        while True:
+            i = blank(i)
+            if i >= n:
+                return entries
+            if field[i] == ",":  # empty list elements are allowed
+                i += 1
+                continue
+            if field[i] != "<":
+                raise ValueError("Link entry without a target")
+            end = field.find(">", i + 1)
+            if end < 0:
+                raise ValueError("unterminated Link target")
+            target, params, i = field[i + 1:end], [], end + 1
+            while True:
+                i = blank(i)
+                if i >= n or field[i] == ",":
+                    break
+                if field[i] != ";":
+                    raise ValueError("unexpected character in a Link entry")
+                i = blank(i + 1)
+                start = i
+                while i < n and field[i] not in "=;,\" \t":
+                    i += 1
+                name, value = field[start:i].lower(), ""
+                i = blank(i)
+                if i < n and field[i] == "=":
+                    i = blank(i + 1)
+                    if i < n and field[i] == '"':
+                        chars, i = [], i + 1
+                        while True:
+                            if i >= n:
+                                raise ValueError("unterminated quoted string in a Link entry")
+                            if field[i] == "\\":
+                                if i + 1 >= n:
+                                    raise ValueError("unterminated quoted string in a Link entry")
+                                chars.append(field[i + 1])
+                                i += 2
+                            elif field[i] == '"':
+                                i += 1
+                                break
+                            else:
+                                chars.append(field[i])
+                                i += 1
+                        value = "".join(chars)
+                    else:
+                        start = i
+                        while i < n and field[i] not in ";,\" \t":
+                            i += 1
+                        value = field[start:i]
+                elif not name:
+                    continue  # an empty parameter (";;")
+                if not name:
+                    raise ValueError("Link parameter without a name")
+                params.append((name, value))
+            entries.append((target, params))
+
+    @staticmethod
     def _next_link(headers, base):
-        """The rel="next" target of every Link field (quoted or unquoted rel, any parameter order, several relations per entry),
-        resolved against the effective response URL; None when there is none. Several different next targets are refused."""
+        """The rel="next" target of every Link field (quoted or unquoted rel, any parameter order, several relations per entry,
+        delimiters inside quoted parameter values and inside the target respected), resolved against the effective response URL;
+        None when there is none. Only an entry's first rel parameter counts (RFC 8288 section 3.3). Several different next
+        targets, or a malformed Link field, are refused (ValueError)."""
         targets = set()
         for field in headers.get_all("Link") or []:
-            for entry in re.findall(r'<([^>]*)>([^,<]*)', field):
-                target, params = entry
-                for param in params.split(";"):
-                    name, _, value = param.partition("=")
-                    if name.strip().lower() == "rel" and "next" in value.strip().strip('"').lower().split():
-                        targets.add(urllib.parse.urljoin(base, target.strip()))
+            for target, params in GitHub._link_entries(field):
+                rel = next((value for name, value in params if name == "rel"), None)
+                if rel is not None and "next" in rel.lower().split():
+                    targets.add(urllib.parse.urljoin(base, target.strip()))
         if len(targets) > 1:
             raise ValueError("several next links")
         return targets.pop() if targets else None
@@ -836,7 +908,15 @@ class GitHub:
         protocol failure (an interrupted body included), an undecodable body or a page of the wrong JSON shape."""
         base = self._api_base()
         origin = self._origin(base)
-        auth = run([self.gh, "auth", "token", "--hostname", self._host()], timeout=60, check=False)
+        auth, problem = None, None
+        try:
+            auth = run([self.gh, "auth", "token", "--hostname", self._host()], timeout=self.CREDENTIAL_TIMEOUT, check=False)
+        except subprocess.TimeoutExpired:  # carries whatever the helper printed: discarded with it
+            problem = f"gh auth token timed out after {self.CREDENTIAL_TIMEOUT} s"
+        except (OSError, ValueError) as error:  # the helper could not be started
+            problem = f"gh auth token could not be started ({type(error).__name__})"
+        if problem:  # raised after the handler has ended, so the exception carries no chain to the helper's output
+            raise self._failure(path, "authentication failed: " + problem)
         token = (auth.stdout or "").strip() if auth.returncode == 0 else ""
         if not token or any(ch.isspace() for ch in token):
             # the helper's output is never forwarded: it may hold the credential itself
@@ -889,15 +969,19 @@ class GitHub:
             except (urllib.error.URLError, http.client.HTTPException, OSError) as error:
                 reason = getattr(error, "reason", error)
                 failure = f"request failed: {type(reason).__name__}"
-            except ValueError as error:  # undecodable bytes or JSON, or several next links
-                failure = f"undecodable response: {type(error).__name__}"
+            except (ValueError, RecursionError) as error:  # undecodable bytes or JSON (its nesting limit included), a malformed
+                failure = f"undecodable response: {type(error).__name__}"  # Link field or several next links
             if failure:
                 raise self._failure(path, failure) from None
         return pages
 
     @staticmethod
     def _comment_record(data):
-        user = data.get("user")
+        """The comment fields reconciliation uses, or None when a record lacks one. The user key is required (publication marker
+        matching filters on the author), and an explicit null user is a supported value (a deleted account)."""
+        if "user" not in data:
+            return None
+        user = data["user"]
         if not (isinstance(data.get("id"), int) and not isinstance(data.get("id"), bool) and isinstance(data.get("body"), str) and
                 isinstance(data.get("html_url"), str) and (user is None or isinstance(user, dict) and isinstance(user.get("login"), str))):
             return None
