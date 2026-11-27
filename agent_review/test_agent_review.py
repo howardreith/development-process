@@ -4152,7 +4152,9 @@ class GitHubCommentTransportTests(unittest.TestCase):
                  104: 'rel="https://rels.example.test/a<b next"', 105: 'rel="https://example.test/a[b] next"',
                  110: 'rel="prev next"', 111: 'rel="prev  next"', 112: 'rel="mailto: next"', 113: 'rel="https://[::1]:8443/rel next"',
                  114: 'rel="https://rels.example.test/p%41q"', 106: 'rel="https://example.test:80x/rel next"', 107: 'rel="https://a@b@example.test/rel next"',
-                 108: 'rel="https://[zz]/rel next"', 115: 'rel="https://user:pw@example.test:8443/r?q=1#f urn:example:rel next"'}
+                 108: 'rel="https://[zz]/rel next"', 115: 'rel="https://user:pw@example.test:8443/r?q=1#f urn:example:rel next"',
+                 109: 'rel="https://[1:2:3]/rel next"', 116: 'rel="https://[::1@example.test/rel next"', 117: 'rel="https://[V1.fe80::a+en1]/rel next"',
+                 118: 'rel="https://[v1.x]/rel next"', 119: 'rel="https://[::ffff:192.0.2.1]/rel next"', 120: 'rel="https://u[s]er@example.test/rel next"'}
         routes = {}
         for number, tail in cases.items():
             path = listing.format(number)
@@ -4163,9 +4165,9 @@ class GitHubCommentTransportTests(unittest.TestCase):
             routes[path + "?per_page=100&page=3"] = (200, [], [self.record(3, "three")])
         port, requests = self.serve(routes)
         github = self.github(port)
-        for number in (100, 101, 102, 103, 104, 105, 106, 107, 108):
+        for number in (100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 116, 120):
             self.assertIn("undecodable response: ValueError", self.failure(lambda: github.comments(number)))
-        for number in (110, 111, 112, 113, 115):
+        for number in (110, 111, 112, 113, 115, 117, 118, 119):
             self.assertEqual([1, 2, 3], [c["id"] for c in github.comments(number)])
             self.assertEqual(1, sum(1 for path, _ in requests if path == listing.format(number) + "?per_page=100&page=3"))
         self.assertEqual([1, 2], [c["id"] for c in github.comments(114)])

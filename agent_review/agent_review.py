@@ -16,6 +16,7 @@ import contextlib
 import datetime as dt
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
 import re
@@ -798,12 +799,22 @@ class GitHub:
             outside = rest
         if "[" in outside or "]" in outside or authority.count("@") > 1:
             return False
-        host = authority.rpartition("@")[2]   # userinfo may hold ":"; the host and port follow the last (only) "@"
+        userinfo, _, host = authority.rpartition("@")   # userinfo may hold ":"; the host and port follow the last (only) "@"
+        if "[" in userinfo or "]" in userinfo:
+            return False
         if host.startswith("["):
             literal, close, port = host[1:].partition("]")
-            if not close or "[" in literal or "]" in port or not re.fullmatch(r"[0-9A-Fa-f:.]+|v[0-9A-Fa-f]+\.[A-Za-z0-9\-._~!$&'()*+,;=:]+", literal):
+            if not close or "[" in literal or "]" in port:
                 return False
-        elif "[" in authority or "]" in authority:
+            if literal[:1] in ("v", "V"):   # IPvFuture: "v" (either case) 1*HEXDIG "." 1*( unreserved / sub-delims / ":" )
+                if not re.fullmatch(r"[vV][0-9A-Fa-f]+\.[A-Za-z0-9\-._~!$&'()*+,;=:]+", literal):
+                    return False
+            else:
+                try:
+                    ipaddress.IPv6Address(literal)   # IPv6address structure (zone identifiers are not part of RFC 3986)
+                except ValueError:
+                    return False
+        elif "[" in host or "]" in host:
             return False
         else:
             port = host[host.index(":"):] if ":" in host else ""
