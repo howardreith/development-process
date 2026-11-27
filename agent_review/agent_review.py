@@ -775,7 +775,51 @@ class GitHub:
 
     CREDENTIAL_TIMEOUT = 60  # seconds for `gh auth token`
     LINK_TOKEN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")  # RFC 9110 token characters
-    REL_TYPE = re.compile(r"[A-Za-z][A-Za-z0-9.-]*|[A-Za-z][A-Za-z0-9+.-]*:[^\s\x00-\x1f\x7f]+")  # RFC 8288 reg-rel-type | ext-rel-type (URI)
+    REG_REL_TYPE = re.compile(r"[A-Za-z][A-Za-z0-9.-]*")  # RFC 8288 reg-rel-type (compared case-insensitively)
+    URI_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*")
+    URI_CHARS = re.compile(r"(?:[A-Za-z0-9\-._~!$&'()*+,;=:@/?#\[\]]|%[0-9A-Fa-f]{2})*")  # RFC 3986 characters and pct-encoded
+
+    @staticmethod
+    def _extension_relation(value):
+        """Whether value is a URI (RFC 3986 section 3) usable as an RFC 8288 ext-rel-type."""
+        scheme, colon, rest = value.partition(":")
+        if not colon or not GitHub.URI_SCHEME.fullmatch(scheme) or not GitHub.URI_CHARS.fullmatch(rest) or rest.count("#") > 1:
+            return False
+        authority = ""
+        if rest.startswith("//"):
+            end = len(rest)
+            for mark in "/?#":
+                at = rest.find(mark, 2)
+                if at >= 0:
+                    end = min(end, at)
+            authority = rest[2:end]
+            outside = rest[end:]
+        else:
+            outside = rest
+        if "[" in outside or "]" in outside or authority.count("@") > 1:
+            return False
+        host = authority.rpartition("@")[2]   # userinfo may hold ":"; the host and port follow the last (only) "@"
+        if host.startswith("["):
+            literal, close, port = host[1:].partition("]")
+            if not close or "[" in literal or "]" in port or not re.fullmatch(r"[0-9A-Fa-f:.]+|v[0-9A-Fa-f]+\.[A-Za-z0-9\-._~!$&'()*+,;=:]+", literal):
+                return False
+        elif "[" in authority or "]" in authority:
+            return False
+        else:
+            port = host[host.index(":"):] if ":" in host else ""
+        if port and not re.fullmatch(r":[0-9]*", port):
+            return False
+        return True
+
+    @staticmethod
+    def _relation_types(rel):
+        """The relation types of a decoded rel value (see _next_link), or None when the value is outside that syntax."""
+        if not rel or rel.startswith(" ") or rel.endswith(" "):
+            return None
+        types = [t for t in rel.split(" ") if t]
+        if not types or not all(GitHub.REG_REL_TYPE.fullmatch(t) or GitHub._extension_relation(t) for t in types):
+            return None
+        return types
 
     def __init__(self, repo: str, gh: str = "gh", api_base: str = None):
         self.repo, self.gh, self.api_base = repo, resolve_exe(gh), api_base
@@ -901,8 +945,11 @@ class GitHub:
         None when there is none. Only an entry's first rel parameter counts (RFC 8288 section 3.3).
 
         Accepted relation syntax (RFC 8288 section 3.3), applied to the DECODED rel value whether it was quoted or not: one or more
-        relation types separated by whitespace, each either a registered type (a letter, then letters, digits, "." or "-",
-        compared case-insensitively) or an extension type (an absolute URI: scheme ":" and no whitespace). Unknown registered-shape
+        relation types separated by runs of the ASCII space only (no leading or trailing space; any other character, a tab, vertical tab
+        or no-break space included, is part of a type and must satisfy its syntax), each either a registered type (a letter, then
+        letters, digits, "." or "-", compared case-insensitively) or an extension type: a URI (RFC 3986: a scheme, ":", then only URI
+        characters, every "%" followed by two hex digits, square brackets only around an IP literal at the start of an authority, at most
+        one "#"; an empty hierarchical part such as "mailto:" is valid). Unknown registered-shape
         and extension relations are valid and simply are not "next". Refused (ValueError, so the reader reports an undecodable
         response and returns no listing): an entry without a rel parameter, a relation type outside that syntax (rel="=next"),
         several different next targets, and any malformed Link field."""
@@ -912,8 +959,8 @@ class GitHub:
                 rel = next((value for name, value in params if name == "rel"), None)
                 if rel is None:
                     raise ValueError("Link entry without a relation")
-                types = rel.split()
-                if not types or not all(GitHub.REL_TYPE.fullmatch(t) for t in types):
+                types = GitHub._relation_types(rel)
+                if types is None:
                     raise ValueError("Link relation outside the relation-type syntax")
                 if "next" in (t.lower() for t in types):
                     targets.add(urllib.parse.urljoin(base, target.strip()))

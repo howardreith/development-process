@@ -4141,6 +4141,36 @@ class GitHubCommentTransportTests(unittest.TestCase):
         for number in (94, 95, 96):
             self.assertIn("undecodable response: ValueError", self.failure(lambda: github.comments(number)))
 
+    def test_link_relation_lists_and_extension_relations_are_exact(self):
+        """R5-F1 and R5-F2 through the public paginated reader, on page two of three-page listings. Refused with CommandError (no
+        listing): a vertical tab or a no-break space between "ne" and "xt", a leading space, an extension relation with an invalid percent
+        escape, one with a raw "<", and square brackets outside an IP literal. Valid controls: "prev next" and "prev  next" (space runs),
+        "mailto: next" (an empty hierarchical part), an IP-literal extension before next, and a valid percent-encoded extension that is
+        the page's only relation (a genuine last page: two IDs, page three never requested)."""
+        listing = "/repos/owner/repo/issues/{}/comments"
+        cases = {100: 'rel="ne' + chr(11) + 'xt"', 101: 'rel="ne' + chr(0xA0) + 'xt"', 102: 'rel=" next"', 103: 'rel="https://rels.example.test/p%ZZq next"',
+                 104: 'rel="https://rels.example.test/a<b next"', 105: 'rel="https://example.test/a[b] next"',
+                 110: 'rel="prev next"', 111: 'rel="prev  next"', 112: 'rel="mailto: next"', 113: 'rel="https://[::1]:8443/rel next"',
+                 114: 'rel="https://rels.example.test/p%41q"', 106: 'rel="https://example.test:80x/rel next"', 107: 'rel="https://a@b@example.test/rel next"',
+                 108: 'rel="https://[zz]/rel next"', 115: 'rel="https://user:pw@example.test:8443/r?q=1#f urn:example:rel next"'}
+        routes = {}
+        for number, tail in cases.items():
+            path = listing.format(number)
+            routes[path + "?per_page=100"] = (lambda path: lambda p: (200, [("Link", f'<http://127.0.0.1:{p}{path}?per_page=100&page=2>; rel="next"')],
+                                                                     [self.record(1, "one")]))(path)
+            routes[path + "?per_page=100&page=2"] = (lambda path, tail: lambda p: (200, [("Link", f'<http://127.0.0.1:{p}{path}?per_page=100&page=3>; {tail}')],
+                                                                                   [self.record(2, "two")]))(path, tail)
+            routes[path + "?per_page=100&page=3"] = (200, [], [self.record(3, "three")])
+        port, requests = self.serve(routes)
+        github = self.github(port)
+        for number in (100, 101, 102, 103, 104, 105, 106, 107, 108):
+            self.assertIn("undecodable response: ValueError", self.failure(lambda: github.comments(number)))
+        for number in (110, 111, 112, 113, 115):
+            self.assertEqual([1, 2, 3], [c["id"] for c in github.comments(number)])
+            self.assertEqual(1, sum(1 for path, _ in requests if path == listing.format(number) + "?per_page=100&page=3"))
+        self.assertEqual([1, 2], [c["id"] for c in github.comments(114)])
+        self.assertEqual(0, sum(1 for path, _ in requests if path == listing.format(114) + "?per_page=100&page=3"))
+
     def test_comment_records_require_the_author_key(self):
         """R1-F3: otherwise identical records with an omitted user and an explicitly null user: the omitted field fails the whole
         lookup and the whole listing (also on a later page); the explicit null remains readable."""
