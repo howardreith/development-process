@@ -15,6 +15,8 @@ import argparse
 import contextlib
 import datetime as dt
 import hashlib
+import http.client
+import ipaddress
 import json
 import os
 import re
@@ -26,6 +28,10 @@ import subprocess
 import sys
 import threading
 import time
+import types
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from pathlib import Path
 
@@ -768,8 +774,301 @@ class GitHub:
     PR_FIELDS = ("number,url,state,isDraft,headRefName,headRefOid,baseRefName,author,reviewRequests,body,"
                  "isCrossRepository,headRepository,headRepositoryOwner")
 
-    def __init__(self, repo: str, gh: str = "gh"):
-        self.repo, self.gh = repo, resolve_exe(gh)
+    CREDENTIAL_TIMEOUT = 60  # seconds for `gh auth token`
+    LINK_TOKEN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")  # RFC 9110 token characters
+    REG_REL_TYPE = re.compile(r"[A-Za-z][A-Za-z0-9.-]*")  # RFC 8288 reg-rel-type (compared case-insensitively)
+    URI_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*")
+    URI_CHARS = re.compile(r"(?:[A-Za-z0-9\-._~!$&'()*+,;=:@/?#\[\]]|%[0-9A-Fa-f]{2})*")  # RFC 3986 characters and pct-encoded
+
+    @staticmethod
+    def _extension_relation(value):
+        """Whether value is a URI (RFC 3986 section 3) usable as an RFC 8288 ext-rel-type."""
+        scheme, colon, rest = value.partition(":")
+        if not colon or not GitHub.URI_SCHEME.fullmatch(scheme) or not GitHub.URI_CHARS.fullmatch(rest) or rest.count("#") > 1:
+            return False
+        authority = ""
+        if rest.startswith("//"):
+            end = len(rest)
+            for mark in "/?#":
+                at = rest.find(mark, 2)
+                if at >= 0:
+                    end = min(end, at)
+            authority = rest[2:end]
+            outside = rest[end:]
+        else:
+            outside = rest
+        if "[" in outside or "]" in outside or authority.count("@") > 1:
+            return False
+        userinfo, _, host = authority.rpartition("@")   # userinfo may hold ":"; the host and port follow the last (only) "@"
+        if "[" in userinfo or "]" in userinfo:
+            return False
+        if host.startswith("["):
+            literal, close, port = host[1:].partition("]")
+            if not close or "[" in literal or "]" in port:
+                return False
+            if literal[:1] in ("v", "V"):   # IPvFuture: "v" (either case) 1*HEXDIG "." 1*( unreserved / sub-delims / ":" )
+                if not re.fullmatch(r"[vV][0-9A-Fa-f]+\.[A-Za-z0-9\-._~!$&'()*+,;=:]+", literal):
+                    return False
+            else:
+                # IPv6address structure. RFC 3986 has no zone identifier, but ipaddress.IPv6Address accepts a "%scope" suffix, so a "%"
+                # inside the literal is refused here (percent escapes elsewhere in the URI are validated separately and stay valid).
+                if "%" in literal:
+                    return False
+                try:
+                    ipaddress.IPv6Address(literal)
+                except ValueError:
+                    return False
+        elif "[" in host or "]" in host:
+            return False
+        else:
+            port = host[host.index(":"):] if ":" in host else ""
+        if port and not re.fullmatch(r":[0-9]*", port):
+            return False
+        return True
+
+    @staticmethod
+    def _relation_types(rel):
+        """The relation types of a decoded rel value (see _next_link), or None when the value is outside that syntax."""
+        if not rel or rel.startswith(" ") or rel.endswith(" "):
+            return None
+        types = [t for t in rel.split(" ") if t]
+        if not types or not all(GitHub.REG_REL_TYPE.fullmatch(t) or GitHub._extension_relation(t) for t in types):
+            return None
+        return types
+
+    def __init__(self, repo: str, gh: str = "gh", api_base: str = None):
+        self.repo, self.gh, self.api_base = repo, resolve_exe(gh), api_base
+
+    # Comment bodies are read over the authenticated REST API directly, never through gh's printed output: gh rewrites
+    # control-character escapes in the responses it prints into caret notation before --jq or --allow-escape-sequences apply,
+    # and that also rewrites the six literal characters backslash-u0000 inside a stored body (observed with gh 2.99.0: the
+    # JSON text \\u0000 printed as \\^@), so an intact publication would read as altered. The response text is decoded by
+    # json.loads alone, so every body string is exactly what GitHub stored. gh still supplies the credential, which is sent
+    # only to the API origin (scheme, case-normalized host and effective port): a pagination link or redirect to any other
+    # origin is refused before anything is sent there. No diagnostic carries response text, reason phrases, header values
+    # other than validated numbers, or the credential helper's output.
+    def _host(self):
+        return os.environ.get("GH_HOST", "github.com").strip()
+
+    def _api_base(self):
+        if self.api_base:
+            return self.api_base.rstrip("/")
+        host = self._host().lower()
+        return "https://api.github.com" if host == "github.com" else f"https://{host}/api/v3"
+
+    @staticmethod
+    def _origin(url):
+        parts = urllib.parse.urlsplit(url)
+        scheme = parts.scheme.lower()
+        try:
+            port = parts.port
+        except ValueError:
+            return None
+        if port is None:  # only an omitted port takes the scheme default; an explicit port (zero included) stays itself
+            port = {"https": 443, "http": 80}.get(scheme)
+        return scheme, (parts.hostname or "").lower(), port
+
+    @staticmethod
+    def _failure(path, detail):
+        return CommandError(["gh", "api", path], types.SimpleNamespace(returncode=1, stdout="", stderr=detail))
+
+    @staticmethod
+    def _number(value):
+        value = (value or "").strip()
+        return value if re.fullmatch(r"[0-9]{1,12}", value) else "unknown"
+
+    @staticmethod
+    def _link_entries(field):
+        """The (target, [(name, value), ...]) entries of one Link field value (RFC 8288 section 3): a comma separates entries and a
+        semicolon parameters only outside the <URI> and outside a quoted-string, whose backslash escapes are decoded; parameter
+        names are lower-cased. A malformed field raises ValueError (the response is then undecodable), so a next relation is never
+        silently lost; that includes an explicit "=" with no value and a rel parameter naming no relation type."""
+        entries, i, n = [], 0, len(field)
+
+        def blank(k):
+            while k < n and field[k] in " \t":
+                k += 1
+            return k
+        while True:
+            i = blank(i)
+            if i >= n:
+                return entries
+            if field[i] == ",":  # empty list elements are allowed
+                i += 1
+                continue
+            if field[i] != "<":
+                raise ValueError("Link entry without a target")
+            end = field.find(">", i + 1)
+            if end < 0:
+                raise ValueError("unterminated Link target")
+            target, params, i = field[i + 1:end], [], end + 1
+            while True:
+                i = blank(i)
+                if i >= n or field[i] == ",":
+                    break
+                if field[i] != ";":
+                    raise ValueError("unexpected character in a Link entry")
+                i = blank(i + 1)
+                start = i
+                while i < n and field[i] not in "=;,\" \t":
+                    i += 1
+                name, value = field[start:i].lower(), ""
+                i = blank(i)
+                if i < n and field[i] == "=":
+                    i = blank(i + 1)
+                    if i < n and field[i] == '"':
+                        chars, i = [], i + 1
+                        while True:
+                            if i >= n:
+                                raise ValueError("unterminated quoted string in a Link entry")
+                            if field[i] == "\\":
+                                if i + 1 >= n:
+                                    raise ValueError("unterminated quoted string in a Link entry")
+                                chars.append(field[i + 1])
+                                i += 2
+                            elif field[i] == '"':
+                                i += 1
+                                break
+                            else:
+                                chars.append(field[i])
+                                i += 1
+                        value = "".join(chars)
+                    else:
+                        start = i
+                        while i < n and field[i] not in ";,\" \t":
+                            i += 1
+                        value = field[start:i]
+                        if not value:  # an explicit "=" with nothing after it is malformed, never an empty value
+                            raise ValueError("Link parameter without a value")
+                        if not GitHub.LINK_TOKEN.fullmatch(value):  # an unquoted value must be an HTTP token (RFC 9110 5.6.2)
+                            raise ValueError("Link parameter value is not a token")
+                elif not name:
+                    continue  # an empty parameter (";;")
+                if not name:
+                    raise ValueError("Link parameter without a name")
+                if not GitHub.LINK_TOKEN.fullmatch(name):
+                    raise ValueError("Link parameter name is not a token")
+                if name == "rel" and not value.split():  # a relation parameter must name at least one relation type
+                    raise ValueError("Link relation without a type")
+                params.append((name, value))
+            entries.append((target, params))
+
+    @staticmethod
+    def _next_link(headers, base):
+        """The rel="next" target of every Link field (quoted or unquoted rel, any parameter order, several relations per entry,
+        delimiters inside quoted parameter values and inside the target respected), resolved against the effective response URL;
+        None when there is none. Only an entry's first rel parameter counts (RFC 8288 section 3.3).
+
+        Accepted relation syntax (RFC 8288 section 3.3), applied to the DECODED rel value whether it was quoted or not: one or more
+        relation types separated by runs of the ASCII space only (no leading or trailing space; any other character, a tab, vertical tab
+        or no-break space included, is part of a type and must satisfy its syntax), each either a registered type (a letter, then
+        letters, digits, "." or "-", compared case-insensitively) or an extension type: a URI (RFC 3986: a scheme, ":", then only URI
+        characters, every "%" followed by two hex digits, square brackets only around an IP literal at the start of an authority, at most
+        one "#"; an empty hierarchical part such as "mailto:" is valid). Unknown registered-shape
+        and extension relations are valid and simply are not "next". Refused (ValueError, so the reader reports an undecodable
+        response and returns no listing): an entry without a rel parameter, a relation type outside that syntax (rel="=next"),
+        several different next targets, and any malformed Link field."""
+        targets = set()
+        for field in headers.get_all("Link") or []:
+            for target, params in GitHub._link_entries(field):
+                rel = next((value for name, value in params if name == "rel"), None)
+                if rel is None:
+                    raise ValueError("Link entry without a relation")
+                types = GitHub._relation_types(rel)
+                if types is None:
+                    raise ValueError("Link relation outside the relation-type syntax")
+                if "next" in (t.lower() for t in types):
+                    targets.add(urllib.parse.urljoin(base, target.strip()))
+        if len(targets) > 1:
+            raise ValueError("several next links")
+        return targets.pop() if targets else None
+
+    def _rest(self, path, expect):
+        """GET one REST resource (expect "object") or every page of a listing (expect "list"); returns the decoded pages. HTTP 404
+        on the first request returns None (the resource does not exist). Every other outcome that is not a complete, well-formed
+        answer raises CommandError: a credential failure, 401, rate limiting (403 with an exhausted limit or Retry-After, and 429),
+        any other status (also a 2xx other than 200), a refused cross-origin, invalid or repeated next link or redirect, a network or
+        protocol failure (an interrupted body included), an undecodable body or a page of the wrong JSON shape."""
+        base = self._api_base()
+        origin = self._origin(base)
+        auth, problem = None, None
+        try:
+            auth = run([self.gh, "auth", "token", "--hostname", self._host()], timeout=self.CREDENTIAL_TIMEOUT, check=False)
+        except subprocess.TimeoutExpired:  # carries whatever the helper printed: discarded with it
+            problem = f"gh auth token timed out after {self.CREDENTIAL_TIMEOUT} s"
+        except (OSError, ValueError) as error:  # the helper could not be started
+            problem = f"gh auth token could not be started ({type(error).__name__})"
+        if problem:  # raised after the handler has ended, so the exception carries no chain to the helper's output
+            raise self._failure(path, "authentication failed: " + problem)
+        token = (auth.stdout or "").strip() if auth.returncode == 0 else ""
+        if not token or any(ch.isspace() for ch in token):
+            # the helper's output is never forwarded: it may hold the credential itself
+            raise self._failure(path, f"authentication failed: gh auth token exited {auth.returncode} without a usable credential")
+
+        class SameOriginRedirects(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                if GitHub._origin(urllib.parse.urljoin(req.full_url, newurl)) != origin:
+                    raise urllib.error.HTTPError(req.full_url, code, "redirect to another origin refused", None, fp)
+                return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+        opener = urllib.request.build_opener(SameOriginRedirects())
+        url, pages, seen = f"{base}/{path}", [], set()
+        while url:
+            if origin is None or self._origin(url) != origin:
+                raise self._failure(path, "pagination link to another origin refused")
+            if url in seen:
+                raise self._failure(path, "pagination link repeated")
+            seen.add(url)
+            request = urllib.request.Request(url, headers={"Authorization": "Bearer " + token, "User-Agent": "agent-review",
+                                                           "Accept": "application/vnd.github+json"})
+            failure = None
+            try:
+                with opener.open(request, timeout=180) as response:
+                    if response.status != 200:
+                        failure = f"HTTP {response.status}: unexpected status for a GET"
+                    else:
+                        page = json.loads(response.read().decode("utf-8"))
+                        if expect == "list" and not isinstance(page, list) or expect == "object" and not isinstance(page, dict):
+                            failure = "unexpected response shape"
+                        else:
+                            pages.append(page)
+                            url = self._next_link(response.headers, response.geturl()) if expect == "list" else None
+            except urllib.error.HTTPError as error:
+                code, headers = error.code, error.headers
+                error.close()
+                if code == 404 and not pages and not seen - {url}:
+                    return None
+                if "another origin" in str(error.reason):
+                    failure = "redirect to another origin refused"
+                elif code == 401:
+                    failure = "HTTP 401: authentication failed (check gh auth status)"
+                elif code == 429 or code == 403 and headers is not None and (headers.get("X-RateLimit-Remaining") == "0" or headers.get("Retry-After")):
+                    retry = self._number(headers.get("Retry-After")) if headers is not None else "unknown"
+                    if retry == "unknown" and headers is not None:
+                        retry = self._number(headers.get("X-RateLimit-Reset"))
+                    failure = f"HTTP {code}: rate limited (retry after {retry})"
+                else:
+                    failure = f"HTTP {code}: {http.client.responses.get(code, 'unexpected status')}"
+            except (urllib.error.URLError, http.client.HTTPException, OSError) as error:
+                reason = getattr(error, "reason", error)
+                failure = f"request failed: {type(reason).__name__}"
+            except (ValueError, RecursionError) as error:  # undecodable bytes or JSON (its nesting limit included), a malformed
+                failure = f"undecodable response: {type(error).__name__}"  # Link field or several next links
+            if failure:
+                raise self._failure(path, failure) from None
+        return pages
+
+    @staticmethod
+    def _comment_record(data):
+        """The comment fields reconciliation uses, or None when a record lacks one. The user key is required (publication marker
+        matching filters on the author), and an explicit null user is a supported value (a deleted account)."""
+        if "user" not in data:
+            return None
+        user = data["user"]
+        if not (isinstance(data.get("id"), int) and not isinstance(data.get("id"), bool) and isinstance(data.get("body"), str) and
+                isinstance(data.get("html_url"), str) and (user is None or isinstance(user, dict) and isinstance(user.get("login"), str))):
+            return None
+        return {"id": data["id"], "user": (user or {}).get("login"), "body": data["body"], "url": data["html_url"]}
 
     def _json(self, *args):
         return json.loads(run([self.gh, *args], timeout=180).stdout or "null")
@@ -796,19 +1095,23 @@ class GitHub:
         run([self.gh, "pr", "edit", str(number), "--repo", self.repo, "--body-file", str(body_file)], timeout=180)
 
     def comments(self, number):
-        return self._lines("api", "--paginate", f"repos/{self.repo}/issues/{number}/comments",
-                           "--jq", ".[] | {id: .id, user: .user.login, body: .body, url: .html_url} | @json")
+        pages = self._rest(f"repos/{self.repo}/issues/{number}/comments?per_page=100", "list")
+        if pages is None:  # the issue or pull request itself is missing: never an empty listing
+            raise self._failure("comments", "HTTP 404: Not Found")
+        records = [self._comment_record(c) if isinstance(c, dict) else None for page in pages for c in page]
+        if any(r is None for r in records):
+            raise self._failure("comments", "unexpected comment record")
+        return records
 
     def comment(self, comment_id):
         """Authoritative lookup of one comment: its record, or None only when GitHub answers 404 (deleted)."""
-        proc = run([self.gh, "api", f"repos/{self.repo}/issues/comments/{comment_id}"], check=False, timeout=180)
-        if proc.returncode == 0:
-            data = json.loads(proc.stdout or "{}")
-            return {"id": data["id"], "url": data["html_url"], "user": (data.get("user") or {}).get("login"),
-                    "body": data.get("body")}
-        if re.search(r"HTTP 404|Not Found", proc.stderr + proc.stdout):
+        pages = self._rest(f"repos/{self.repo}/issues/comments/{comment_id}", "object")
+        if pages is None:
             return None
-        raise CommandError(["gh", "api", "comment"], proc)
+        record = self._comment_record(pages[0])
+        if record is None:
+            raise self._failure("comment", "unexpected comment record")
+        return {"id": record["id"], "url": record["url"], "user": record["user"], "body": record["body"]}
 
     def post_comment(self, number, body_file) -> dict:
         try:
