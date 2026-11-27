@@ -821,7 +821,7 @@ class GitHub:
         """The (target, [(name, value), ...]) entries of one Link field value (RFC 8288 section 3): a comma separates entries and a
         semicolon parameters only outside the <URI> and outside a quoted-string, whose backslash escapes are decoded; parameter
         names are lower-cased. A malformed field raises ValueError (the response is then undecodable), so a next relation is never
-        silently lost."""
+        silently lost; that includes an explicit "=" with no value and a rel parameter naming no relation type."""
         entries, i, n = [], 0, len(field)
 
         def blank(k):
@@ -877,10 +877,14 @@ class GitHub:
                         while i < n and field[i] not in ";,\" \t":
                             i += 1
                         value = field[start:i]
+                        if not value:  # an explicit "=" with nothing after it is malformed, never an empty value
+                            raise ValueError("Link parameter without a value")
                 elif not name:
                     continue  # an empty parameter (";;")
                 if not name:
                     raise ValueError("Link parameter without a name")
+                if name == "rel" and not value.split():  # a relation parameter must name at least one relation type
+                    raise ValueError("Link relation without a type")
                 params.append((name, value))
             entries.append((target, params))
 

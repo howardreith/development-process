@@ -4090,6 +4090,29 @@ class GitHubCommentTransportTests(unittest.TestCase):
         entries = ar.GitHub._link_entries('<a,b>; title="x, \\"y\\"; z"; REL=next, <c>;rel="prev first"')
         self.assertEqual([("a,b", [("title", 'x, "y"; z'), ("rel", "next")]), ("c", [("rel", "prev first")])], entries)
 
+    def test_a_link_parameter_without_a_value_is_refused(self):
+        """R3-F1: page two of a three-page listing ends its Link field with an incomplete `rel=` (also `rel=""` and `rel= ;`):
+        GitHub.comments raises CommandError instead of returning the first two pages as complete. Control: the same listing with
+        rel=next returns all three IDs, each page fetched exactly once."""
+        listing = "/repos/owner/repo/issues/{}/comments"
+        routes = {}
+        for number, tail in ((80, "rel=next"), (81, "rel="), (82, 'rel=""'), (83, "rel= ;")):
+            path = listing.format(number)
+            routes[path + "?per_page=100"] = (lambda path: lambda p: (200, [("Link", f'<http://127.0.0.1:{p}{path}?per_page=100&page=2>; rel="next"')],
+                                                                     [self.record(1, "one")]))(path)
+            routes[path + "?per_page=100&page=2"] = (lambda path, tail: lambda p: (200, [("Link", f'<http://127.0.0.1:{p}{path}?per_page=100&page=3>; {tail}')],
+                                                                                   [self.record(2, "two")]))(path, tail)
+            routes[path + "?per_page=100&page=3"] = (200, [], [self.record(3, "three")])
+        port, requests = self.serve(routes)
+        github = self.github(port)
+        self.assertEqual([1, 2, 3], [c["id"] for c in github.comments(80)])
+        self.assertEqual(1, sum(1 for path, _ in requests if path == listing.format(80) + "?per_page=100&page=3"))
+        for number in (81, 82, 83):
+            self.assertIn("undecodable response: ValueError", self.failure(lambda: github.comments(number)))
+        with self.assertRaises(ValueError):
+            ar.GitHub._link_entries('<a>; rel=')
+        self.assertEqual([("a", [("title", "")])], ar.GitHub._link_entries('<a>; title=""'))  # an explicit empty quoted title stays valid
+
     def test_comment_records_require_the_author_key(self):
         """R1-F3: otherwise identical records with an omitted user and an explicitly null user: the omitted field fails the whole
         lookup and the whole listing (also on a later page); the explicit null remains readable."""
