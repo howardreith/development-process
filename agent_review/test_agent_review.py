@@ -4114,6 +4114,33 @@ class GitHubCommentTransportTests(unittest.TestCase):
         self.assertEqual([("a", [("title", "")])], ar.GitHub._link_entries('<a>; title=""'))  # an explicit empty quoted title stays valid
         self.assertEqual([("a", [("title", "a=b; c"), ("rel", "next")])], ar.GitHub._link_entries('<a>; title="a=b; c"; rel=next'))  # quoted "=" stays valid
 
+    def test_link_relations_follow_the_relation_type_syntax(self):
+        """Owner instruction 2026-11-27b section 5 (the R4-F1 failure family) through the public paginated reader, on page two of a
+        three-page listing. Positive controls: a quoted title containing "=" before rel="next", a relation list with an extension
+        relation, and an upper-case NEXT return all three IDs once. A page whose only relation is a valid unknown one is a genuine
+        last page. Refused with CommandError (no listing): a quoted malformed relation rel="=next", an entry with no rel parameter,
+        and a quoted relation holding a control character."""
+        listing = "/repos/owner/repo/issues/{}/comments"
+        cases = {90: 'title="a=b; c=d"; rel="next"', 91: 'rel="prev https://example.test/rel/extra next"', 92: 'rel=NEXT',
+                 93: 'rel="https://example.test/rel/other"', 94: 'rel="=next"', 95: 'title="next page"', 96: 'rel="ne\\u0001xt"'}
+        routes = {}
+        for number, tail in cases.items():
+            path = listing.format(number)
+            routes[path + "?per_page=100"] = (lambda path: lambda p: (200, [("Link", f'<http://127.0.0.1:{p}{path}?per_page=100&page=2>; rel="next"')],
+                                                                     [self.record(1, "one")]))(path)
+            routes[path + "?per_page=100&page=2"] = (lambda path, tail: lambda p: (200, [("Link", f'<http://127.0.0.1:{p}{path}?per_page=100&page=3>; {tail}')],
+                                                                                   [self.record(2, "two")]))(path, tail.replace("\\u0001", chr(1)))
+            routes[path + "?per_page=100&page=3"] = (200, [], [self.record(3, "three")])
+        port, requests = self.serve(routes)
+        github = self.github(port)
+        for number in (90, 91, 92):
+            self.assertEqual([1, 2, 3], [c["id"] for c in github.comments(number)])
+            self.assertEqual(1, sum(1 for path, _ in requests if path == listing.format(number) + "?per_page=100&page=3"))
+        self.assertEqual([1, 2], [c["id"] for c in github.comments(93)])
+        self.assertEqual(0, sum(1 for path, _ in requests if path == listing.format(93) + "?per_page=100&page=3"))
+        for number in (94, 95, 96):
+            self.assertIn("undecodable response: ValueError", self.failure(lambda: github.comments(number)))
+
     def test_comment_records_require_the_author_key(self):
         """R1-F3: otherwise identical records with an omitted user and an explicitly null user: the omitted field fails the whole
         lookup and the whole listing (also on a later page); the explicit null remains readable."""

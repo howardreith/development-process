@@ -775,6 +775,7 @@ class GitHub:
 
     CREDENTIAL_TIMEOUT = 60  # seconds for `gh auth token`
     LINK_TOKEN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")  # RFC 9110 token characters
+    REL_TYPE = re.compile(r"[A-Za-z][A-Za-z0-9.-]*|[A-Za-z][A-Za-z0-9+.-]*:[^\s\x00-\x1f\x7f]+")  # RFC 8288 reg-rel-type | ext-rel-type (URI)
 
     def __init__(self, repo: str, gh: str = "gh", api_base: str = None):
         self.repo, self.gh, self.api_base = repo, resolve_exe(gh), api_base
@@ -897,13 +898,24 @@ class GitHub:
     def _next_link(headers, base):
         """The rel="next" target of every Link field (quoted or unquoted rel, any parameter order, several relations per entry,
         delimiters inside quoted parameter values and inside the target respected), resolved against the effective response URL;
-        None when there is none. Only an entry's first rel parameter counts (RFC 8288 section 3.3). Several different next
-        targets, or a malformed Link field, are refused (ValueError)."""
+        None when there is none. Only an entry's first rel parameter counts (RFC 8288 section 3.3).
+
+        Accepted relation syntax (RFC 8288 section 3.3), applied to the DECODED rel value whether it was quoted or not: one or more
+        relation types separated by whitespace, each either a registered type (a letter, then letters, digits, "." or "-",
+        compared case-insensitively) or an extension type (an absolute URI: scheme ":" and no whitespace). Unknown registered-shape
+        and extension relations are valid and simply are not "next". Refused (ValueError, so the reader reports an undecodable
+        response and returns no listing): an entry without a rel parameter, a relation type outside that syntax (rel="=next"),
+        several different next targets, and any malformed Link field."""
         targets = set()
         for field in headers.get_all("Link") or []:
             for target, params in GitHub._link_entries(field):
                 rel = next((value for name, value in params if name == "rel"), None)
-                if rel is not None and "next" in rel.lower().split():
+                if rel is None:
+                    raise ValueError("Link entry without a relation")
+                types = rel.split()
+                if not types or not all(GitHub.REL_TYPE.fullmatch(t) for t in types):
+                    raise ValueError("Link relation outside the relation-type syntax")
+                if "next" in (t.lower() for t in types):
                     targets.add(urllib.parse.urljoin(base, target.strip()))
         if len(targets) > 1:
             raise ValueError("several next links")
