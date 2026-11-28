@@ -191,6 +191,14 @@ def claude_config_dir(developer_cfg) -> Path:
 
 
 PINNED_MARK = "machine_values_pinned"  # set by pin_machine_values on a role section whose machine values it pinned
+SELECTED_MARK = "executable_selected"  # ...and, beside it, when the pinned executable names a concrete installed file
+
+
+def pinned_role(section) -> dict:
+    """How a role section's machine values are used: literally when the load pinned them, and its executable by its
+    saved filename when the load selected a concrete file (an unresolved stem is still matched at launch)."""
+    literal = section.get(PINNED_MARK) is True
+    return {"literal": literal, "selected": literal and section.get(SELECTED_MARK) is True}
 
 
 def is_fully_qualified(path: str) -> bool:
@@ -246,12 +254,13 @@ def is_command_name(value: str) -> bool:
     return bool(value) and not any(sep in value for sep in ("/", "\\", ":"))
 
 
-def resolve_exe(name: str, literal: bool = False) -> str:
+def resolve_exe(name: str, literal: bool = False, selected: bool = False) -> str:
     """The executable to launch. `literal`: a role path the configuration load pinned, used as written; every
-    other value (the GitHub client's, a legacy enrollment's) is expanded as configured."""
+    other value (the GitHub client's, a legacy enrollment's) is expanded as configured. `selected`: the load chose
+    this concrete file, so it is launched by that filename, whatever PATHEXT lists now."""
     candidate = name if literal else expand(name)
     if is_fully_qualified(candidate):
-        return with_pathext(candidate)
+        return candidate if selected else with_pathext(candidate)
     if not is_command_name(candidate):  # an explicit relative path is checked as given, never searched for
         found = with_pathext(os.path.abspath(candidate))
         if not os.path.isfile(found):
@@ -303,11 +312,16 @@ def pin_executable(value: str, what: str) -> str:
     exe = expand_fully(value, what)
     if not exe.strip():
         raise UsageError(f"{what} '{value}' expands to a blank value")
-    if is_command_name(exe) or is_fully_qualified(exe):
+    if is_command_name(exe):
         return exe
-    anchored = os.path.abspath(exe)
-    matched = with_pathext(anchored)  # the installed file the matcher selects now, so PATHEXT order cannot change it
+    anchored = exe if is_fully_qualified(exe) else os.path.abspath(exe)
+    matched = with_pathext(anchored)  # the installed file the matcher selects now, so PATHEXT cannot change it later
     return matched if os.path.isfile(matched) else anchored  # an absent tool keeps the stem (completed at launch)
+
+
+def is_selected_executable(exe: str) -> bool:
+    """Whether a pinned executable names a concrete installed file the matcher selected (not a stem to complete)."""
+    return is_fully_qualified(exe) and os.path.isfile(exe) and (os.name != "nt" or has_executable_suffix(exe))
 
 
 def run(argv, cwd=None, input_text=None, env=None, timeout=300, check=True):
@@ -980,9 +994,10 @@ class CodexReviewer:
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        pinned = cfg.get(PINNED_MARK) is True
-        self.exe = resolve_exe(cfg.get("executable", "codex"), literal=pinned)
-        self.home = stable_dir(cfg.get("codex_home", "~/.codex"), "CODEX_HOME", "reviewer Codex home", literal=pinned)
+        role = pinned_role(cfg)
+        self.exe = resolve_exe(cfg.get("executable", "codex"), **role)
+        self.home = stable_dir(cfg.get("codex_home", "~/.codex"), "CODEX_HOME", "reviewer Codex home",
+                               literal=role["literal"])
 
     @property
     def requested(self):
@@ -1237,7 +1252,7 @@ class ClaudeDeveloper:
     @property
     def exe(self):
         if self._exe is None:
-            self._exe = resolve_exe(self.cfg.get("executable", "claude"), literal=self.cfg.get(PINNED_MARK) is True)
+            self._exe = resolve_exe(self.cfg.get("executable", "claude"), **pinned_role(self.cfg))
         return self._exe
 
     @property
@@ -5602,17 +5617,22 @@ def pin_machine_values(cfg):
             except UsageError:
                 pass
     for section in (dev, rev):
+        section.pop(SELECTED_MARK, None)  # only a load may claim it
         value, problem = machine_field(section, "executable", None, "executable")
         if value and not problem:
             try:
                 section["executable"] = pin_executable(value, "executable")
             except UsageError:
-                pass
+                continue
+            if is_selected_executable(section["executable"]):
+                section[SELECTED_MARK] = True
     unstable = " ".join(machine_value_problems(cfg))
     for name, section in (("developer", dev), ("reviewer", rev)):
         section.pop(PINNED_MARK, None)
         if f"{name}." not in unstable:
             section[PINNED_MARK] = True
+        else:
+            section.pop(SELECTED_MARK, None)
     return cfg
 
 
@@ -5676,7 +5696,7 @@ def machine_facts(cfg, identity):
         if problem:
             return {"configured": section.get("executable"), "path": None, "problem": problem}
         try:
-            path = resolve_exe(exe, literal=section.get(PINNED_MARK) is True)
+            path = resolve_exe(exe, **pinned_role(section))
         except UsageError as exc:
             return {"configured": exe, "path": None, "problem": str(exc)}
         if not Path(path).is_file():

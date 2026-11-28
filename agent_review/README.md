@@ -180,7 +180,8 @@ Loading a project expands its Claude config directory, Codex home and
 executables once (environment templates included, so `%TOOL%` naming a command
 is stored as that command, and an explicit relative or current-drive-rooted
 executable path is anchored to a full path with its drive, naming the installed
-file the matcher selects at that moment when one exists), so the values an
+file the matcher selects at that moment when one exists; such a selected file is
+later launched by that exact filename, whatever PATHEXT lists then), so the values an
 enrollment pins keep their meaning whatever environment or directory a later
 controller instance runs in. The load marks each role section it pinned, and
 the controller uses those values exactly as written; it never expands them

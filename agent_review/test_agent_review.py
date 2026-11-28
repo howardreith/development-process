@@ -1936,6 +1936,35 @@ class MachinePortabilityTests(unittest.TestCase):
             rev = ar.CodexReviewer(env.controller().cfg["reviewer"])
             self.assertEqual("codex-cli cmd", rev.version())  # the .bat now comes first in PATHEXT, unused
 
+    def test_a_selected_custom_suffix_executable_survives_a_pathext_change(self):
+        """R9-F1: codex.bin, selected at enrollment while .BIN was in PATHEXT, is still launched after .BIN is
+        removed; a codex.bin.cmd beside it is never used."""
+        env = self.env
+        launch, other = env.root / "launch-g", env.root / "launch-h"
+        native = launch / "tools" / "codex.bin"
+        native.parent.mkdir(parents=True)
+        shutil.copyfile(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "where.exe", native)
+        calls = env.root / "bin-cmd-calls.txt"
+        self.command_shim(launch / "tools", "codex.bin",
+                          ["import sys", f"open({str(calls)!r}, 'a').write('called' + chr(10))", "print('wrong')"])
+        other.mkdir()
+        env.controller().cancel("enroll again with a custom-suffix executable")
+        cfg = ar.read_json(self.project)
+        cfg["reviewer"]["executable"] = "tools\\codex.bin"
+        ar.atomic_write_json(self.project, cfg)
+        with contextlib.chdir(launch), mock.patch.dict(os.environ, {"PATHEXT": ".COM;.EXE;.BAT;.CMD;.BIN"}):
+            env.dir, state = ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
+        self.assertEqual(str(native), state["project"]["reviewer"]["executable"])
+        self.assertIs(True, state["project"]["reviewer"][ar.SELECTED_MARK])
+        with contextlib.chdir(other), mock.patch.dict(os.environ, {"PATHEXT": ".COM;.EXE;.BAT;.CMD"}):
+            rev = ar.CodexReviewer(env.controller().cfg["reviewer"])
+            self.assertEqual(str(native), rev.exe)
+            self.assertEqual(str(native), ar.machine_facts(env.controller().cfg, None)["reviewer_executable"]["path"])
+            ran = subprocess.run([rev.exe, "cmd"], capture_output=True, text=True)  # where.exe, renamed
+        self.assertEqual(0, ran.returncode)
+        self.assertIn("cmd.exe", ran.stdout.lower())  # the native file answered
+        self.assertFalse(calls.exists())  # the double-suffixed wrapper was never invoked
+
     def test_bare_commands_ignore_drive_less_path_entries(self):
         """R6-F2: a PATH entry without a drive follows the current drive and is skipped."""
         env = self.env
