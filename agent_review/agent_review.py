@@ -213,7 +213,7 @@ def is_command_name(value: str) -> bool:
 
 
 def resolve_exe(name: str) -> str:
-    candidate = expand(name)
+    candidate = name if os.path.isabs(name) else expand(name)  # an absolute (pinned) path is used as written
     if os.path.isabs(candidate):
         return candidate
     if not is_command_name(candidate):  # an explicit relative path is checked as given, never searched for
@@ -227,7 +227,7 @@ def resolve_exe(name: str) -> str:
     return found
 
 
-RESIDUAL_VAR_RE = re.compile(r"%[^%/\\\s]+%|\$\{?[A-Za-z_][A-Za-z0-9_]*")
+RESIDUAL_VAR_RE = re.compile(r"%[^%]+%|\$\{[^}]*\}|\$[A-Za-z0-9_-]+")  # every form os.path.expandvars accepts
 
 
 def expand_fully(value: str, what: str) -> str:
@@ -239,9 +239,9 @@ def expand_fully(value: str, what: str) -> str:
     return expanded
 
 
-def stable_dir(value: str, own_var: str, what: str) -> Path:
-    """A configured directory with one meaning whatever shell runs the controller: absolute after expanding the
-    user's home and environment, with nothing left unresolved, and never defined through the variable it is meant to
+def pin_dir(value: str, own_var: str, what: str) -> Path:
+    """The directory a configuration load pins: the value expanded once (the user's home and environment, absolute
+    values included) with nothing left unresolved, absolute, and never defined through the variable it is meant to
     set for the child."""
     if re.search(rf"%{own_var}%|\${{?{own_var}\b", value, re.I):
         raise UsageError(f"{what} '{value}' may not refer to the inherited {own_var}")
@@ -249,6 +249,27 @@ def stable_dir(value: str, own_var: str, what: str) -> Path:
     if not path.is_absolute():
         raise UsageError(f"{what} '{value}' does not expand to an absolute directory")
     return path
+
+
+def stable_dir(value: str, own_var: str, what: str) -> Path:
+    """The directory a launch uses: an absolute value exactly as written (loading stores pinned directories that
+    way, so a variable defined later never changes one), otherwise the value pinned now."""
+    if re.search(rf"%{own_var}%|\${{?{own_var}\b", value, re.I):
+        raise UsageError(f"{what} '{value}' may not refer to the inherited {own_var}")
+    if Path(value).is_absolute():
+        return Path(value)
+    return pin_dir(value, own_var, what)
+
+
+def pin_executable(value: str, what: str) -> str:
+    """The executable a configuration load pins: fully expanded and not blank; a command name stays a name (PATH
+    lookup at launch), and an explicit relative project path is anchored where the configuration is loaded."""
+    exe = expand_fully(value, what)
+    if not exe.strip():
+        raise UsageError(f"{what} '{value}' expands to a blank value")
+    if is_command_name(exe) or os.path.isabs(exe):
+        return exe
+    return os.path.abspath(shutil.which(exe) or exe)  # explicit paths keep their PATHEXT lookup
 
 
 def run(argv, cwd=None, input_text=None, env=None, timeout=300, check=True):
@@ -5517,11 +5538,11 @@ def validate_machine_value(key, value, label):
     if not isinstance(value, str) or not value.strip():
         raise UsageError(f"{label} must be a non-empty string")
     if key == "executable":
-        exe = expand_fully(value, label)
-        if not (is_command_name(exe) or os.path.isabs(exe)):
+        pin_executable(value, label)  # refuses unresolved variables and blank expansions
+        if not (is_command_name(expand(value)) or os.path.isabs(expand(value))):
             raise UsageError(f"{label} must be a command name or an absolute path")
     else:
-        stable_dir(value, {"config_dir": "CLAUDE_CONFIG_DIR", "codex_home": "CODEX_HOME"}[key], label)
+        pin_dir(value, {"config_dir": "CLAUDE_CONFIG_DIR", "codex_home": "CODEX_HOME"}[key], label)
 
 
 def pin_machine_values(cfg):
@@ -5531,18 +5552,20 @@ def pin_machine_values(cfg):
     (machine_value_problems)."""
     cfg = json.loads(json.dumps(cfg))
     dev, rev = cfg["developer"], cfg["reviewer"]
+    if dev.get("config_dir") == "":
+        del dev["config_dir"]  # the established project form of "Claude Code's standard directory"
     for section, key, var, default in ((dev, "config_dir", "CLAUDE_CONFIG_DIR", None),
                                        (rev, "codex_home", "CODEX_HOME", "~/.codex")):
         value = section.get(key, default)
         if value:
             try:
-                section[key] = str(stable_dir(value, var, key))
+                section[key] = str(pin_dir(value, var, key))
             except UsageError:
                 pass
     for section in (dev, rev):
         if section.get("executable"):
             try:
-                section["executable"] = expand_fully(section["executable"], "executable")
+                section["executable"] = pin_executable(section["executable"], "executable")
             except UsageError:
                 pass
     return cfg
@@ -5560,10 +5583,10 @@ def machine_value_problems(cfg):
             if not isinstance(value, str) or not value.strip():
                 raise UsageError(f"{section}.{key} must be a non-empty string")
             if key == "executable":
-                expand_fully(value, f"{section}.{key}")  # an explicit relative project path stays allowed
+                pin_executable(value, f"{section}.{key}")  # an explicit relative project path stays allowed
             else:
-                stable_dir(value, {"config_dir": "CLAUDE_CONFIG_DIR", "codex_home": "CODEX_HOME"}[key],
-                           f"{section}.{key}")
+                pin_dir(value, {"config_dir": "CLAUDE_CONFIG_DIR", "codex_home": "CODEX_HOME"}[key],
+                        f"{section}.{key}")
         except UsageError as exc:
             problems.append(str(exc))
     return problems
@@ -6123,12 +6146,12 @@ def check_project(cfg, repo, machine=None):
     git = Git(repo)
     try:
         top = git.toplevel()
-    except (CommandError, OSError) as exc:
+    except (CommandError, OSError, subprocess.SubprocessError) as exc:
         return [f"not a git repository: {exc}"], facts
     facts["repo_root"] = top
     try:
         url = git.remote_url()
-    except CommandError as exc:
+    except (CommandError, OSError, subprocess.SubprocessError) as exc:
         return [f"origin remote unavailable: {exc}"], facts
     facts["origin"] = url
     if url not in cfg["allowed_remote_urls"] or github_slug(url) != cfg["repository"]:
@@ -6144,7 +6167,8 @@ def check_project(cfg, repo, machine=None):
             problems.append(f"default branch is {facts['default_branch']}, config says {cfg['default_target_branch']}")
         if facts["permission"] not in ("ADMIN", "MAINTAIN", "WRITE"):
             problems.append(f"insufficient repository permission {facts['permission']}")
-    except (CommandError, UsageError, ValueError, KeyError, OSError) as exc:  # OSError: gh could not be started
+    except (CommandError, UsageError, ValueError, KeyError, OSError, subprocess.SubprocessError) as exc:
+        # OSError: gh could not be started; SubprocessError: a probe exceeded its deadline
         problems.append(f"GitHub check failed: {exc}")
     for item in cfg.get("push_command") or []:
         if item.lower().endswith((".ps1", ".py", ".sh")) and "{" not in item and not Path(expand(item)).is_file():
@@ -6200,9 +6224,10 @@ def init_project(args, root=HERE, github_factory=GitHub):
     machine_dev = machine.get("developer") or {}
     # explicit flags, then the nima rule, then this machine's profile; otherwise Claude Code on PATH with its
     # standard config directory, written explicitly so an inherited CLAUDE_CONFIG_DIR cannot redirect it
-    executable = getattr(args, "claude_executable", None) or machine_dev.get("executable") or "claude"
-    config_dir = args.claude_config_dir or ("%USERPROFILE%/.claude" if in_nima(top)
-                                            else machine_dev.get("config_dir") or "~/.claude")
+    flag_exe, flag_dir = getattr(args, "claude_executable", None), args.claude_config_dir  # "" is supplied, not omitted
+    executable = flag_exe if flag_exe is not None else machine_dev.get("executable") or "claude"
+    config_dir = flag_dir if flag_dir is not None else ("%USERPROFILE%/.claude" if in_nima(top)
+                                                        else machine_dev.get("config_dir") or "~/.claude")
     instructions = [p for p in ("AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md") if (Path(top) / p).exists()]
     shipped = read_json(root / "projects" / "kingmaker-gunslinger.json")
     cfg = {

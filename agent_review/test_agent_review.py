@@ -1562,15 +1562,18 @@ class MachinePortabilityTests(unittest.TestCase):
                                   push_command=None, claude_config_dir=None, claude_executable=None, force=True)
         path, _ = ar.init_project(args, root=env.wf, github_factory=FakeOnboardingGitHub)
         before = path.read_bytes()
-        for flags in ({"claude_config_dir": "%CLAUDE_CONFIG_DIR%"}, {"claude_config_dir": "relative/cfg"},
-                      {"claude_executable": "bin\\claude.exe"}, {"claude_executable": "   "},
-                      {"claude_executable": "%AR_TEST_UNSET_CMD%"}):
-            for key, value in flags.items():
-                setattr(args, key, value)
-            with self.assertRaises(ar.UsageError, msg=flags):
-                ar.init_project(args, root=env.wf, github_factory=FakeOnboardingGitHub)
-            self.assertEqual(before, path.read_bytes())
-            args.claude_config_dir = args.claude_executable = None
+        with mock.patch.dict(os.environ, {"AR_TEST_SPACES": "   "}):
+            os.environ.pop("AR_TEST_UNSET_CMD", None)
+            for flags in ({"claude_config_dir": "%CLAUDE_CONFIG_DIR%"}, {"claude_config_dir": "relative/cfg"},
+                          {"claude_executable": "bin\\claude.exe"}, {"claude_executable": "   "},
+                          {"claude_executable": "%AR_TEST_UNSET_CMD%"}, {"claude_executable": ""},
+                          {"claude_config_dir": ""}, {"claude_executable": "%AR_TEST_SPACES%"}):
+                for key, value in flags.items():
+                    setattr(args, key, value)
+                with self.assertRaises(ar.UsageError, msg=flags):
+                    ar.init_project(args, root=env.wf, github_factory=FakeOnboardingGitHub)
+                self.assertEqual(before, path.read_bytes())
+                args.claude_config_dir = args.claude_executable = None
 
     def test_unresolved_variables_are_refused_before_enrollment(self):
         """R1-F3: an absolute home or Claude directory containing an unset variable is never pinned."""
@@ -1649,6 +1652,84 @@ class MachinePortabilityTests(unittest.TestCase):
         self.assertIn("TimeoutExpired", out["error"])
         self.assertIn("developer_executable", out["machine"])
         self.assertEqual(out, ar.read_json(target))
+
+    def test_windows_variable_spellings_never_move_a_pinned_directory(self):
+        """R1-F3: `%Review Slot%` is refused before pinning; a stored absolute directory is used as written."""
+        env = self.env
+        slot = str(env.root / "%Review Slot%" / "codex")
+        with mock.patch.dict(os.environ):
+            os.environ.pop("Review Slot", None)
+            self.write_profile(reviewer={"codex_home": slot})
+            with self.assertRaises(ar.UsageError):
+                ar.load_project(self.project, env.wf)
+            self.write_profile(developer={"config_dir": str(env.root / "${Review Slot}" / "claude")})
+            with self.assertRaises(ar.UsageError):
+                ar.load_project(self.project, env.wf)
+            with self.assertRaises(ar.UsageError):
+                __import__("test_live_smoke").smoke_machine_config(
+                    ar.read_json(HERE / "projects" / "kingmaker-gunslinger.json"))
+            ar.machine_profile_path().unlink()
+            env.controller().cancel("enroll again with an unresolvable home")
+            states = sorted((env.root / "state").iterdir())
+            cfg = ar.read_json(self.project)
+            cfg["reviewer"]["codex_home"] = slot
+            ar.atomic_write_json(self.project, cfg)
+            with self.assertRaises(ar.UsageError) as refused:
+                ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
+            self.assertIn("nothing was created", str(refused.exception))
+            self.assertEqual(states, sorted((env.root / "state").iterdir()))
+        with mock.patch.dict(os.environ, {"Review Slot": str(env.root / "elsewhere")}):  # defined later
+            rev = ar.CodexReviewer({"executable": sys.executable, "codex_home": slot, "model": "m", "effort": "high"})
+            self.assertEqual(Path(slot), rev.home)
+            self.assertEqual(slot, rev.env()["CODEX_HOME"])
+            self.assertEqual(Path(slot), ar.claude_config_dir({"config_dir": slot}))
+
+    def test_relative_role_executables_are_anchored_at_enrollment(self):
+        """R4-F1: a fresh controller in another directory still selects the original file."""
+        env = self.env
+        first_dir, second_dir = env.root / "launch-a", env.root / "launch-b"
+        original = self.command_shim(first_dir / "tools", "claude-rel", ["print('original')"])
+        self.command_shim(second_dir / "tools", "claude-rel", ["print('other')"])
+        env.controller().cancel("enroll again with a relative executable")
+        cfg = ar.read_json(self.project)
+        cfg["developer"]["executable"] = "tools\\claude-rel"
+        ar.atomic_write_json(self.project, cfg)
+        with contextlib.chdir(first_dir):
+            env.dir, state = ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
+        same = os.path.normcase  # PATHEXT may add the extension in another case
+        self.assertEqual(same(str(original)), same(state["project"]["developer"]["executable"]))  # anchored
+        with contextlib.chdir(second_dir):
+            ctl = env.controller()
+            self.assertEqual(same(str(original)), same(ar.ClaudeDeveloper(ctl.cfg["developer"], None, None).exe))
+
+    def test_a_legacy_empty_claude_directory_means_the_standard_one(self):
+        """R4-F2: an empty project config_dir enrolls and selects ~/.claude; an empty profile value is refused."""
+        env = self.env
+        env.controller().cancel("enroll again with an empty config_dir")
+        cfg = ar.read_json(self.project)
+        cfg["developer"]["config_dir"] = ""
+        ar.atomic_write_json(self.project, cfg)
+        with mock.patch.dict(os.environ):
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            env.dir, state = ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
+            self.assertNotIn("config_dir", state["project"]["developer"])
+            self.assertEqual(Path.home() / ".claude", ar.claude_config_dir(env.controller().cfg["developer"]))
+        self.write_profile(developer={"config_dir": ""})
+        with self.assertRaises(ar.UsageError):
+            ar.load_project(self.project, env.wf)
+
+    def test_a_timed_out_repository_probe_keeps_the_check_project_report(self):
+        """R4-F3: simulated TimeoutExpired at the GitHub boundary."""
+        self.check_fixture()
+        self.write_profile(reviewer={"codex_home": self.review_home})
+        with mock.patch.object(ar.GitHub, "viewer", side_effect=subprocess.TimeoutExpired(["gh", "api", "user"], 180)):
+            code, out = self.run_cli("check-project", "--project", "check-fixture", "--repo", str(self.env.work))
+        self.assertEqual(ar.EXIT_BLOCKED, code)
+        self.assertTrue(any("GitHub check failed" in p and "timed out" in p for p in out["problems"]), out["problems"])
+        self.assertEqual(str(ar.machine_profile_path()), out["machine_profile"]["path"])
+        self.assertIn("developer_executable", out)
+        self.assertEqual(self.review_home, out["codex_home"]["path"])
+        self.assertIn("path", out["claude_config_dir"])
 
     def test_nima_rule_matches_path_components(self):
         """R1-F6: a descendant of C:\\Dev\\nima, not a similarly named sibling."""

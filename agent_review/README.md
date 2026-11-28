@@ -178,12 +178,22 @@ profile and sets it per project.
 
 Loading a project expands its Claude config directory, Codex home and
 executables once (environment templates included, so `%TOOL%` naming a command
-is stored as that command), so the values an enrollment pins keep their meaning
-whatever environment a later controller instance inherits. A value that would
-still contain an unresolved variable after expansion (`C:/x/%UNSET%/codex`), a
-blank value, or a relative or self-referencing directory is refused by the
-profile loader and by `enroll` and `activate --refresh-project` before anything
-changes; `check-project` reports it under `machine_problems`. An enrollment pins that effective configuration and the
+is stored as that command, and an explicit relative executable path is anchored
+to an absolute one), so the values an enrollment pins keep their meaning
+whatever environment or directory a later controller instance runs in. An
+absolute directory or executable is then used exactly as written; it is never
+expanded again. A project's empty `developer.config_dir` keeps its established
+meaning: Claude Code's standard directory.
+
+A value that would still contain an unresolved variable after expansion
+(`C:/x/%UNSET%/codex`, `%Review Slot%`, `${NAME}`), a blank value, or a
+relative or self-referencing directory is refused:
+
+- in `machine.json`, by the profile loader, so every command that loads a
+  project (including `check-project`) stops with that refusal;
+- in a project config, at `enroll` and `activate --refresh-project` before
+  anything changes; `check-project` still loads such a project and lists the
+  value under `machine_problems`. An enrollment pins that effective configuration and the
 profile identity it was loaded under. If the profile changes later, `status` (and the next `review`
 result) reports `machine_profile.changed: true`, and the enrollment keeps using
 its pinned values. Adopting the new profile is an owner decision between runs:
