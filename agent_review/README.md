@@ -162,20 +162,36 @@ in an optional **machine profile**, `~/.agent-review/machine.json` (under
 }
 ```
 
-Every key is optional. When the file exists, its values replace those keys in
-every project config the controller loads, shipped or user-local; nothing else
-can be set there (models, effort, permissions, gates and limits are refused).
-An enrollment pins the effective configuration, so a later profile change
-reaches it only through `activate`, like any other project change. Without a
-profile nothing changes. A machine whose projects need different Claude config
-directories (for example a work account for one repository) leaves
-`developer.config_dir` out of the profile and sets it per project.
+`schema_version` is required; each of the three settings is optional, so the
+smallest useful profile is `{"schema_version": "agent-review.machine.v1",
+"reviewer": {"codex_home": "~/.codex"}}`. When the file exists, its values
+replace those keys in every project config the controller loads, shipped or
+user-local. Nothing else can be set there: models, effort, permissions, gates,
+limits, unknown keys, duplicate JSON members and a file that resolves outside
+the agent home (through a link) are refused. `executable` is a command name or
+an absolute path; `config_dir` and `codex_home` must expand (`~`,
+`%USERPROFILE%`) to absolute directories and may not refer to the variable they
+set (`%CLAUDE_CONFIG_DIR%`, `%CODEX_HOME%`). Without a profile nothing changes.
+A machine whose projects need different Claude config directories (for example
+a work account for one repository) leaves `developer.config_dir` out of the
+profile and sets it per project.
 
-Every Codex process the controller starts runs with `CODEX_HOME` set to the
-configured `reviewer.codex_home`, whatever `CODEX_HOME` the shell inherits, so
-the reviewer writes the rollout the controller verifies. Give reviews a
-dedicated Codex home and sign it in once. From Claude Code's `!` prefix (a bash
-shell):
+An enrollment pins the effective configuration and the profile identity it was
+loaded under. If the profile changes later, `status` (and the next `review`
+result) reports `machine_profile.changed: true`, and the enrollment keeps using
+its pinned values. Adopting the new profile is an owner decision between runs:
+
+```powershell
+python C:/Dev/agent-review/agent_review.py activate --enrollment <id> --refresh-project <project>
+```
+
+Bare executable names (`claude`, `codex`, `gh`) are looked up only in PATH's
+absolute directories, never in the current directory, so a file in a worktree
+cannot stand in for them. Every Codex process the controller starts runs with
+`CODEX_HOME` set to the configured `reviewer.codex_home`, whatever `CODEX_HOME`
+the shell inherits, so the reviewer writes the rollout the controller verifies.
+Give reviews a dedicated Codex home and sign it in once. From Claude Code's `!`
+prefix (a bash shell):
 
 ```bash
 CODEX_HOME="$HOME/.codex" codex login
@@ -185,7 +201,7 @@ Then, from a reviewed checkout (see the install section below):
 
 ```powershell
 python agent_review/agent_review.py install --dest C:/Dev/agent-review
-python C:/Dev/agent-review/agent_review.py check-project --project <name> --repo C:/Dev/<repo>   # reports the effective executable, Claude config dir, Codex home and profile
+python C:/Dev/agent-review/agent_review.py check-project --project <name> --repo C:/Dev/<repo>   # reports the resolved executables, Claude config dir, Codex home and applied profile
 python C:/Dev/agent-review/agent_review.py preflight --project <name>                          # one real Opus and one real Astra call
 ```
 
@@ -206,8 +222,9 @@ python $ar preflight --project <name>
 Shipped configs belong in `projects/` here (reviewed); `init-project` writes
 user-local ones to `~/.agent-review/projects/`. It takes the Claude Code
 executable and config directory from its flags, otherwise from the machine
-profile, otherwise `claude` on PATH with Claude Code's standard config
-directory (a repository under `C:\Dev\nima` keeps `~/.claude`). A project with
+profile, otherwise `claude` on PATH with `config_dir` `~/.claude`, written
+explicitly so an inherited `CLAUDE_CONFIG_DIR` cannot redirect it (a repository
+in or below `C:\Dev\nima` keeps `%USERPROFILE%/.claude`). A project with
 `"enrollment_allowed": false` can be checked but never enrolled.
 
 Required gates: a project's `required_gates` (by default every declared gate)

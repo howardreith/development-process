@@ -1238,21 +1238,24 @@ class MachinePortabilityTests(unittest.TestCase):
     def write_profile(self, **sections):
         ar.atomic_write_json(ar.machine_profile_path(), {"schema_version": ar.MACHINE_SCHEMA, **sections})
 
+    def command_shim(self, folder, name, script_lines):
+        """A simulated CLI (the external boundary): `name`.cmd running a small Python script."""
+        folder.mkdir(parents=True, exist_ok=True)
+        script = folder / f"{name}.py"
+        script.write_text("\n".join(script_lines + [""]), encoding="utf-8")
+        shim = folder / f"{name}.cmd"
+        shim.write_text(f'@"{sys.executable}" "{script}" %*\n', encoding="utf-8")
+        return shim
+
     def test_reviewer_processes_run_in_the_configured_codex_home(self):
         env = self.env
-        shim_dir = env.root / "codex-shim"
-        shim_dir.mkdir()
-        calls = shim_dir / "calls.jsonl"
-        script = shim_dir / "codex.py"
-        script.write_text("\n".join([  # simulated Codex CLI: records the home each process was started in
+        calls = env.root / "codex-calls.jsonl"
+        shim = self.command_shim(env.root / "codex-shim", "codex", [  # records the home each process started in
             "import json, os, sys",
             "if 'exec' in sys.argv:",
             "    sys.stdin.read()",
             f"open({str(calls)!r}, 'a').write(json.dumps([os.environ.get('CODEX_HOME'), sys.argv[1:3]]) + chr(10))",
-            "print('codex-cli simulated' if '--version' in sys.argv else 'Logged in (simulated)')",
-            ""]), encoding="utf-8")
-        shim = shim_dir / "codex.cmd"
-        shim.write_text(f'@"{sys.executable}" "{script}" %*\n', encoding="utf-8")
+            "print('codex-cli simulated' if '--version' in sys.argv else 'Logged in (simulated)')"])
         rev = ar.CodexReviewer({"executable": str(shim), "codex_home": self.review_home, "model": "m",
                                 "effort": "high"})
         work = env.root / "review-work"
@@ -1266,19 +1269,62 @@ class MachinePortabilityTests(unittest.TestCase):
         self.assertEqual([["--version"], ["login", "status"], ["-a", "never"]], [args for _, args in seen])
         self.assertEqual([self.review_home] * 3, [home for home, _ in seen])
 
+    def test_configured_directories_never_follow_the_calling_shell(self):
+        """R1-F3: a home defined through the variable it sets, or a relative one, is refused; home forms work."""
+        env = self.env
+        for value in ("%CODEX_HOME%", "%codex_home%/reviews", "$CODEX_HOME", "${CODEX_HOME}/x"):
+            for inherited in (env.root / "home-a", env.root / "home-b"):
+                with mock.patch.dict(os.environ, {"CODEX_HOME": str(inherited)}), \
+                        self.assertRaises(ar.UsageError, msg=value):
+                    ar.CodexReviewer({"executable": sys.executable, "codex_home": value, "model": "m", "effort": "high"})
+        for cwd in (env.work, env.root):
+            with contextlib.chdir(cwd):
+                with self.assertRaises(ar.UsageError):
+                    ar.CodexReviewer({"executable": sys.executable, "codex_home": "relative/home", "model": "m",
+                                      "effort": "high"})
+                with self.assertRaises(ar.UsageError):
+                    ar.claude_config_dir({"config_dir": "relative-claude"})
+                with self.assertRaises(ar.UsageError):
+                    ar.claude_config_dir({"config_dir": "%CLAUDE_CONFIG_DIR%"})
+        for value in ("~/.codex", "%USERPROFILE%/.codex"):
+            home = ar.CodexReviewer({"executable": sys.executable, "codex_home": value, "model": "m",
+                                     "effort": "high"}).home
+            self.assertEqual(Path.home() / ".codex", home)
+        for bad in ({"reviewer": {"codex_home": "%CODEX_HOME%"}}, {"reviewer": {"codex_home": "rel/home"}},
+                    {"developer": {"config_dir": "${CLAUDE_CONFIG_DIR}"}}, {"developer": {"executable": "bin/claude"}}):
+            self.write_profile(**bad)
+            with self.assertRaises(ar.UsageError, msg=bad):
+                ar.load_project(self.project, env.wf)
+
+    def test_bare_commands_resolve_from_path_never_the_working_directory(self):
+        """R1-F2: a same-named file in the worktree is not selected; the PATH directory's is."""
+        env = self.env
+        planted = self.command_shim(env.work, "claude-sim", ["print('worktree')"])
+        on_path = self.command_shim(env.root / "path-bin", "claude-sim", ["print('path')"])
+        with contextlib.chdir(env.work), mock.patch.dict(os.environ, {"PATH": str(env.root / "path-bin")}):
+            self.assertTrue(planted.is_file())
+            self.assertEqual(str(on_path), ar.resolve_exe("claude-sim"))
+            self.assertEqual(str(on_path), ar.ClaudeDeveloper({"executable": "claude-sim", "model": "opus",
+                                                               "effort": "high"}, None, None).exe)
+        with contextlib.chdir(env.work), mock.patch.dict(os.environ, {"PATH": str(env.root / "empty")}):
+            with self.assertRaises(ar.UsageError):
+                ar.resolve_exe("claude-sim")  # present only in the working directory
+            with self.assertRaises(ar.UsageError):
+                ar.resolve_exe(".\\claude-sim.cmd")  # relative paths are neither commands nor absolute
+
     def test_machine_profile_replaces_only_machine_facts(self):
         before = ar.load_project(self.project, self.env.wf)
         self.assertNotEqual("claude", before["developer"]["executable"])
         self.write_profile(developer={"executable": "claude", "config_dir": "%USERPROFILE%/.claude"},
                            reviewer={"codex_home": self.review_home})
-        after = ar.load_project(self.project, self.env.wf)
+        after, identity = ar.load_project_effective(self.project, self.env.wf)
         self.assertEqual(("claude", "%USERPROFILE%/.claude", self.review_home),
                          (after["developer"]["executable"], after["developer"]["config_dir"],
                           after["reviewer"]["codex_home"]))
-        self.assertEqual(Path(self.review_home), ar.CodexReviewer(after["reviewer"]).home)
-        facts = ar.machine_facts(after)
-        self.assertEqual((str(ar.machine_profile_path()), self.review_home, str(Path(ar.expand("%USERPROFILE%/.claude")))),
-                         (facts["machine_profile"], facts["codex_home"], facts["claude_config_dir"]))
+        self.assertEqual(str(ar.machine_profile_path()), identity["path"])
+        # R1-F9: the effective home is checked through a fixture executable, not a host Codex installation
+        self.assertEqual(Path(self.review_home),
+                         ar.CodexReviewer({**after["reviewer"], "executable": sys.executable}).home)
         for section, keys in ar.MACHINE_KEYS.items():
             for key in keys:
                 before[section].pop(key, None)
@@ -1303,25 +1349,93 @@ class MachinePortabilityTests(unittest.TestCase):
         with self.assertRaises(ar.UsageError):
             ar.load_project(self.project, self.env.wf)
 
-    def test_profile_changes_reach_an_enrollment_only_through_activation(self):
+    def test_duplicate_members_cannot_hide_a_disallowed_setting(self):
+        """R1-F5."""
+        ar.machine_profile_path().parent.mkdir(parents=True, exist_ok=True)
+        ar.machine_profile_path().write_text(
+            '{"schema_version": "agent-review.machine.v1", "developer": {"model": "sonnet"}, '
+            '"developer": {"executable": "claude"}}', encoding="utf-8")
+        with self.assertRaises(ar.UsageError) as refused:
+            ar.load_project(self.project, self.env.wf)
+        self.assertIn("machine profile", str(refused.exception))
+        self.assertIn("duplicate", str(refused.exception))
+
+    def test_profile_resolving_outside_the_agent_home_is_refused(self):
+        """R1-F4."""
         env = self.env
-        ctl = env.controller()
-        pinned = json.loads(json.dumps(ctl.cfg))
+        target = env.work / "machine.json"
+        target.write_text(json.dumps({"schema_version": ar.MACHINE_SCHEMA, "developer": {"executable": "claude"}}),
+                          encoding="utf-8")
+        ar.machine_profile_path().parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.symlink(target, ar.machine_profile_path())
+        except OSError as exc:  # creating file symlinks needs Developer Mode or the privilege on Windows
+            self.skipTest(f"symbolic links unavailable: {exc}")
+        with self.assertRaises(ar.UsageError) as refused:
+            ar.load_project(self.project, env.wf)
+        self.assertIn("outside the trusted", str(refused.exception))
+        ar.machine_profile_path().unlink()
+        self.write_profile(developer={"executable": "claude"})  # an ordinary owner-local profile loads
+        self.assertEqual("claude", ar.load_project(self.project, env.wf)["developer"]["executable"])
+
+    def test_an_enrollment_reports_a_changed_profile_and_adopts_it_only_on_refresh(self):
+        """R1-F1."""
+        env = self.env
+        env.controller().cancel("enroll again under a machine profile")
         self.write_profile(reviewer={"codex_home": self.review_home})
-        self.assertEqual(pinned, env.controller().cfg)  # the running enrollment keeps its pinned configuration
+        env.dir, state = ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
+        self.assertEqual(self.review_home, state["project"]["reviewer"]["codex_home"])
+        pinned = state["machine_profile"]
+        self.assertFalse(env.controller().status()["machine_profile"]["changed"])
+        moved = str(env.root / "moved-home")
+        self.write_profile(reviewer={"codex_home": moved})
+        ctl = env.controller()
+        drift = ctl.status()["machine_profile"]
+        self.assertTrue(drift["changed"])
+        self.assertEqual(pinned, drift["pinned"])
+        self.assertIn("--refresh-project", drift["note"])
+        self.assertEqual(self.review_home, ctl.cfg["reviewer"]["codex_home"])  # the pin is still in use
+        env.reviewer.script = [{"decision": "checkpoint_passed"}]
+        ctl.accept_report(report(env, "phase-1"))
+        ctl.transition("review", "t")
+        ctl.review_round()
+        self.assertTrue(ctl.review_outcome()["machine_profile"]["changed"])  # the review result says so too
         ctl.activate(refresh_project=self.project)
         refreshed = env.controller()
-        self.assertEqual(self.review_home, refreshed.cfg["reviewer"]["codex_home"])
-        change = refreshed.state["project_history"][-1]
-        self.assertNotEqual(change["sha256"], change["by_sha256"])
+        self.assertEqual(moved, refreshed.cfg["reviewer"]["codex_home"])
+        self.assertFalse(refreshed.status()["machine_profile"]["changed"])
+        legacy = refreshed.state
+        del legacy["machine_profile"]  # state written before machine profiles: loads and reports, never compares
+        ar.atomic_write_json(refreshed.state_path, legacy)
+        self.assertIsNone(env.controller().status()["machine_profile"]["pinned"])
 
-    def test_enrollment_pins_the_effective_configuration(self):
+    def test_machine_diagnostics_describe_the_loaded_values(self):
+        """R1-F7."""
         env = self.env
-        env.controller().cancel("enroll again under the machine profile")
-        self.write_profile(developer={"executable": "claude"}, reviewer={"codex_home": self.review_home})
-        _, state = ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
-        self.assertEqual(("claude", self.review_home),
-                         (state["project"]["developer"]["executable"], state["project"]["reviewer"]["codex_home"]))
+        shim = self.command_shim(env.root / "diag-bin", "claude-diag", ["print('simulated')"])
+        self.write_profile(developer={"executable": "claude-diag"},
+                           reviewer={"codex_home": str(env.root / "absent-home")})
+        cfg, identity = ar.load_project_effective(self.project, env.wf)
+        cfg["reviewer"]["executable"] = str(env.root / "absent" / "codex.exe")
+        ar.machine_profile_path().unlink()  # presence changes between load and reporting
+        with mock.patch.dict(os.environ, {"PATH": str(env.root / "diag-bin")}):
+            facts = ar.machine_facts(cfg, identity)
+        self.assertEqual(identity, facts["machine_profile"])
+        self.assertEqual(str(shim), facts["developer_executable"]["path"])
+        self.assertIsNone(facts["reviewer_executable"]["path"])
+        self.assertIn("does not exist", facts["reviewer_executable"]["problem"])
+        self.assertEqual(str(env.root / "absent-home"), facts["codex_home"]["path"])
+        self.assertIsNone(ar.machine_facts(ar.load_project(self.project, env.wf), None)["machine_profile"])
+
+    def test_live_smoke_fixture_receives_the_owners_machine_facts(self):
+        """R1-F8: read before the fixture switches to its isolated agent home."""
+        import test_live_smoke
+        winget = str(self.env.root / "WinGet" / "Packages" / "Anthropic.ClaudeCode" / "claude.exe")
+        self.write_profile(developer={"executable": winget}, reviewer={"codex_home": self.review_home})
+        base = ar.read_json(HERE / "projects" / "kingmaker-gunslinger.json")
+        developer, reviewer = test_live_smoke.smoke_machine_config(base)
+        self.assertEqual((winget, self.review_home), (developer["executable"], reviewer["codex_home"]))
+        self.assertEqual(base["reviewer"]["model"], reviewer["model"])
 
     def test_developer_config_dir_follows_what_the_cli_uses(self):
         configured = str(self.env.root / "configured")
@@ -1337,9 +1451,11 @@ class MachinePortabilityTests(unittest.TestCase):
         git(env.work, "remote", "set-url", "origin", "https://github.com/owner/another-repo.git")
         args = argparse.Namespace(repo=str(env.work), name="another-repo", branch_prefix="claude/", allow=[],
                                   push_command=None, claude_config_dir=None, claude_executable=None, force=True)
-        _, cfg = ar.init_project(args, root=env.wf, github_factory=FakeOnboardingGitHub)
-        self.assertEqual("claude", cfg["developer"]["executable"])
-        self.assertNotIn("config_dir", cfg["developer"])  # Claude Code's own standard directory
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(env.root / "inherited-claude")}):
+            _, cfg = ar.init_project(args, root=env.wf, github_factory=FakeOnboardingGitHub)
+            self.assertEqual(("claude", "~/.claude"), (cfg["developer"]["executable"], cfg["developer"]["config_dir"]))
+            loaded = ar.load_project("another-repo", env.wf)  # R1-F6: the inherited directory does not redirect it
+            self.assertEqual(Path.home() / ".claude", ar.claude_config_dir(loaded["developer"]))
         self.assertEqual("~/.codex", cfg["reviewer"]["codex_home"])
         self.write_profile(developer={"executable": "D:/tools/claude.exe", "config_dir": "D:/claude-config"},
                            reviewer={"codex_home": self.review_home})
@@ -1351,6 +1467,15 @@ class MachinePortabilityTests(unittest.TestCase):
         args.claude_executable, args.claude_config_dir = "E:/claude.exe", "E:/cfg"
         _, cfg = ar.init_project(args, root=env.wf, github_factory=FakeOnboardingGitHub)
         self.assertEqual(("E:/claude.exe", "E:/cfg"), (cfg["developer"]["executable"], cfg["developer"]["config_dir"]))
+        self.assertEqual("D:/claude-config", ar.load_project("another-repo", env.wf)["developer"]["config_dir"])
+
+    def test_nima_rule_matches_path_components(self):
+        """R1-F6: a descendant of C:\\Dev\\nima, not a similarly named sibling."""
+        self.assertTrue(ar.in_nima("C:/Dev/nima"))
+        self.assertTrue(ar.in_nima("c:\\dev\\NIMA\\service\\repo"))
+        self.assertFalse(ar.in_nima("C:/Dev/nima-tools/repo"))
+        self.assertFalse(ar.in_nima("C:/Dev/nimaX"))
+        self.assertFalse(ar.in_nima("D:/Dev/nima/repo"))
 
 
 class RoundTwoRegressionTests(Base):
