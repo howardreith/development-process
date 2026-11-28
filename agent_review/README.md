@@ -145,18 +145,69 @@ handoff is re-checked after posting the receipt and after editing the PR body;
 `status --remote` re-runs the same checks (including the receipt) to tell
 whether a handoff is still current, and `resume` reopens a superseded one.
 
+## Setting up a new machine
+
+Project configs name machine facts: where Claude Code is installed
+(`developer.executable`), its config directory (`developer.config_dir`) and
+the reviewer's Codex home (`reviewer.codex_home`). The shipped configs record
+the original machine's values. On another machine, put that machine's values
+in an optional **machine profile**, `~/.agent-review/machine.json` (under
+`AGENT_REVIEW_HOME` when that is set):
+
+```json
+{
+  "schema_version": "agent-review.machine.v1",
+  "developer": {"executable": "claude", "config_dir": "%USERPROFILE%/.claude"},
+  "reviewer": {"codex_home": "~/.codex"}
+}
+```
+
+Every key is optional. When the file exists, its values replace those keys in
+every project config the controller loads, shipped or user-local; nothing else
+can be set there (models, effort, permissions, gates and limits are refused).
+An enrollment pins the effective configuration, so a later profile change
+reaches it only through `activate`, like any other project change. Without a
+profile nothing changes. A machine whose projects need different Claude config
+directories (for example a work account for one repository) leaves
+`developer.config_dir` out of the profile and sets it per project.
+
+Every Codex process the controller starts runs with `CODEX_HOME` set to the
+configured `reviewer.codex_home`, whatever `CODEX_HOME` the shell inherits, so
+the reviewer writes the rollout the controller verifies. Give reviews a
+dedicated Codex home and sign it in once. From Claude Code's `!` prefix (a bash
+shell):
+
+```bash
+CODEX_HOME="$HOME/.codex" codex login
+```
+
+Then, from a reviewed checkout (see the install section below):
+
+```powershell
+python agent_review/agent_review.py install --dest C:/Dev/agent-review
+python C:/Dev/agent-review/agent_review.py check-project --project <name> --repo C:/Dev/<repo>   # reports the effective executable, Claude config dir, Codex home and profile
+python C:/Dev/agent-review/agent_review.py preflight --project <name>                          # one real Opus and one real Astra call
+```
+
+A gate that runs much slower on the new machine (for example while antivirus
+scans the test suite's temporary Git repositories) needs a larger
+`timeout_minutes` in a user-local copy of its project config.
+
 ## Onboarding a repository
 
 ```powershell
 $ar = 'C:/Dev/agent-review/agent_review.py'
-python $ar init-project --repo C:/Dev/<repo> --name <name> [--branch-prefix claude/] [--allow "npm test"] [--push-command '[...]']
+python $ar init-project --repo C:/Dev/<repo> --name <name> [--branch-prefix claude/] [--allow "npm test"] [--push-command '[...]'] [--claude-executable <path>] [--claude-config-dir <dir>]
 # add "gates" (id -> argv, optional extra_args_pattern, timeout_minutes) and protected-path denials, then:
 python $ar check-project --project <name> --repo C:/Dev/<repo>
 python $ar preflight --project <name>
 ```
 
 Shipped configs belong in `projects/` here (reviewed); `init-project` writes
-user-local ones to `~/.agent-review/projects/`. A project with
+user-local ones to `~/.agent-review/projects/`. It takes the Claude Code
+executable and config directory from its flags, otherwise from the machine
+profile, otherwise `claude` on PATH with Claude Code's standard config
+directory (a repository under `C:\Dev\nima` keeps `~/.claude`). A project with
 `"enrollment_allowed": false` can be checked but never enrolled.
 
 Required gates: a project's `required_gates` (by default every declared gate)

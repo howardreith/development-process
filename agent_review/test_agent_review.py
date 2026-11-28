@@ -1212,6 +1212,147 @@ class GeneralRepositoryTests(unittest.TestCase):
         self.assertEqual("black-tentacles", ar.plan_for_mission(ar.load_plan("black-tentacles"), Path("m.md"))["mission_id"])
 
 
+class FakeOnboardingGitHub:
+    """Simulated GitHub boundary for init-project."""
+
+    def __init__(self, slug):
+        self.slug = slug
+
+    def viewer(self):
+        return "owner"
+
+    def _json(self, *args):
+        return {"defaultBranchRef": {"name": "main"}}
+
+
+class MachinePortabilityTests(unittest.TestCase):
+    """Machine facts (where Claude Code runs, its config directory, the reviewer's Codex home) come from the owner's
+    machine profile, and every Codex process runs in the configured home whatever CODEX_HOME it inherits."""
+
+    def setUp(self):
+        self.env = Env("foreground", cfg_overrides={"push_command": None})
+        self.addCleanup(self.env.cleanup)
+        self.project = str(self.env.wf / "projects" / "test.json")
+        self.review_home = str(self.env.root / "review-home")
+
+    def write_profile(self, **sections):
+        ar.atomic_write_json(ar.machine_profile_path(), {"schema_version": ar.MACHINE_SCHEMA, **sections})
+
+    def test_reviewer_processes_run_in_the_configured_codex_home(self):
+        env = self.env
+        shim_dir = env.root / "codex-shim"
+        shim_dir.mkdir()
+        calls = shim_dir / "calls.jsonl"
+        script = shim_dir / "codex.py"
+        script.write_text("\n".join([  # simulated Codex CLI: records the home each process was started in
+            "import json, os, sys",
+            "if 'exec' in sys.argv:",
+            "    sys.stdin.read()",
+            f"open({str(calls)!r}, 'a').write(json.dumps([os.environ.get('CODEX_HOME'), sys.argv[1:3]]) + chr(10))",
+            "print('codex-cli simulated' if '--version' in sys.argv else 'Logged in (simulated)')",
+            ""]), encoding="utf-8")
+        shim = shim_dir / "codex.cmd"
+        shim.write_text(f'@"{sys.executable}" "{script}" %*\n', encoding="utf-8")
+        rev = ar.CodexReviewer({"executable": str(shim), "codex_home": self.review_home, "model": "m",
+                                "effort": "high"})
+        work = env.root / "review-work"
+        work.mkdir()
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(env.root / "another-projects-home")}):
+            self.assertEqual("codex-cli simulated", rev.version())
+            self.assertEqual("Logged in (simulated)", rev.auth_route())
+            rev.run("prompt", work, work / "schema.json", work / "result.json", work / "events.jsonl",
+                    work / "stderr.txt", 60, skip_git=True)
+        seen = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([["--version"], ["login", "status"], ["-a", "never"]], [args for _, args in seen])
+        self.assertEqual([self.review_home] * 3, [home for home, _ in seen])
+
+    def test_machine_profile_replaces_only_machine_facts(self):
+        before = ar.load_project(self.project, self.env.wf)
+        self.assertNotEqual("claude", before["developer"]["executable"])
+        self.write_profile(developer={"executable": "claude", "config_dir": "%USERPROFILE%/.claude"},
+                           reviewer={"codex_home": self.review_home})
+        after = ar.load_project(self.project, self.env.wf)
+        self.assertEqual(("claude", "%USERPROFILE%/.claude", self.review_home),
+                         (after["developer"]["executable"], after["developer"]["config_dir"],
+                          after["reviewer"]["codex_home"]))
+        self.assertEqual(Path(self.review_home), ar.CodexReviewer(after["reviewer"]).home)
+        facts = ar.machine_facts(after)
+        self.assertEqual((str(ar.machine_profile_path()), self.review_home, str(Path(ar.expand("%USERPROFILE%/.claude")))),
+                         (facts["machine_profile"], facts["codex_home"], facts["claude_config_dir"]))
+        for section, keys in ar.MACHINE_KEYS.items():
+            for key in keys:
+                before[section].pop(key, None)
+                after[section].pop(key, None)
+        self.assertEqual(before, after)  # nothing but the machine facts changed
+        self.write_profile(reviewer={"codex_home": self.review_home})  # a partial profile keeps the other facts
+        partial = ar.load_project(self.project, self.env.wf)
+        self.assertEqual(ar.read_json(self.project)["developer"]["executable"], partial["developer"]["executable"])
+
+    def test_machine_profile_cannot_change_policy(self):
+        for bad in ({"developer": {"model": "sonnet"}}, {"developer": {"effort": "low"}},
+                    {"reviewer": {"model": "gpt-other"}}, {"reviewer": {"effort": "low"}},
+                    {"developer": {"permissions": {"allow": ["Bash(*)"]}}}, {"gates": {}}, {"limits": {}},
+                    {"developer": "claude"}, {"developer": {"executable": ""}}, {"reviewer": {"codex_home": 5}}):
+            self.write_profile(**bad)
+            with self.assertRaises(ar.UsageError, msg=bad):
+                ar.load_project(self.project, self.env.wf)
+        ar.atomic_write_json(ar.machine_profile_path(), {"developer": {"executable": "claude"}})  # no schema
+        with self.assertRaises(ar.UsageError):
+            ar.load_project(self.project, self.env.wf)
+        ar.machine_profile_path().write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ar.UsageError):
+            ar.load_project(self.project, self.env.wf)
+
+    def test_profile_changes_reach_an_enrollment_only_through_activation(self):
+        env = self.env
+        ctl = env.controller()
+        pinned = json.loads(json.dumps(ctl.cfg))
+        self.write_profile(reviewer={"codex_home": self.review_home})
+        self.assertEqual(pinned, env.controller().cfg)  # the running enrollment keeps its pinned configuration
+        ctl.activate(refresh_project=self.project)
+        refreshed = env.controller()
+        self.assertEqual(self.review_home, refreshed.cfg["reviewer"]["codex_home"])
+        change = refreshed.state["project_history"][-1]
+        self.assertNotEqual(change["sha256"], change["by_sha256"])
+
+    def test_enrollment_pins_the_effective_configuration(self):
+        env = self.env
+        env.controller().cancel("enroll again under the machine profile")
+        self.write_profile(developer={"executable": "claude"}, reviewer={"codex_home": self.review_home})
+        _, state = ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
+        self.assertEqual(("claude", self.review_home),
+                         (state["project"]["developer"]["executable"], state["project"]["reviewer"]["codex_home"]))
+
+    def test_developer_config_dir_follows_what_the_cli_uses(self):
+        configured = str(self.env.root / "configured")
+        self.assertEqual(Path(configured), ar.claude_config_dir({"config_dir": configured}))
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.env.root / "inherited")}):
+            self.assertEqual(self.env.root / "inherited", ar.claude_config_dir({}))
+        with mock.patch.dict(os.environ):
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            self.assertEqual(Path.home() / ".claude", ar.claude_config_dir({}))
+
+    def test_init_project_uses_flags_then_the_machine_profile_then_portable_defaults(self):
+        env = self.env
+        git(env.work, "remote", "set-url", "origin", "https://github.com/owner/another-repo.git")
+        args = argparse.Namespace(repo=str(env.work), name="another-repo", branch_prefix="claude/", allow=[],
+                                  push_command=None, claude_config_dir=None, claude_executable=None, force=True)
+        _, cfg = ar.init_project(args, root=env.wf, github_factory=FakeOnboardingGitHub)
+        self.assertEqual("claude", cfg["developer"]["executable"])
+        self.assertNotIn("config_dir", cfg["developer"])  # Claude Code's own standard directory
+        self.assertEqual("~/.codex", cfg["reviewer"]["codex_home"])
+        self.write_profile(developer={"executable": "D:/tools/claude.exe", "config_dir": "D:/claude-config"},
+                           reviewer={"codex_home": self.review_home})
+        _, cfg = ar.init_project(args, root=env.wf, github_factory=FakeOnboardingGitHub)
+        self.assertEqual(("D:/tools/claude.exe", "D:/claude-config", self.review_home),
+                         (cfg["developer"]["executable"], cfg["developer"]["config_dir"],
+                          cfg["reviewer"]["codex_home"]))
+        self.assertEqual(ar.POLICY["reviewer"]["model"], cfg["reviewer"]["model"])
+        args.claude_executable, args.claude_config_dir = "E:/claude.exe", "E:/cfg"
+        _, cfg = ar.init_project(args, root=env.wf, github_factory=FakeOnboardingGitHub)
+        self.assertEqual(("E:/claude.exe", "E:/cfg"), (cfg["developer"]["executable"], cfg["developer"]["config_dir"]))
+
+
 class RoundTwoRegressionTests(Base):
     """Focused regressions for the round-2 review findings (publication, recovery, identity, permissions, readiness)."""
 

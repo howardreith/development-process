@@ -181,6 +181,14 @@ def expand(value: str) -> str:
     return os.path.expandvars(os.path.expanduser(value))
 
 
+def claude_config_dir(developer_cfg) -> Path:
+    """The Claude config directory the developer CLI uses: the configured one (passed as CLAUDE_CONFIG_DIR), else
+    the CLAUDE_CONFIG_DIR it inherits, else Claude Code's standard ~/.claude."""
+    if developer_cfg.get("config_dir"):
+        return Path(expand(developer_cfg["config_dir"]))
+    return Path(expand(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude"))
+
+
 def resolve_exe(name: str) -> str:
     candidate = expand(name)
     if os.path.isabs(candidate):
@@ -868,11 +876,16 @@ class CodexReviewer:
     def requested(self):
         return {"model": self.cfg["model"], "effort": self.cfg["effort"], "sandbox": "read-only"}
 
+    def env(self):
+        """Every Codex process runs in the configured home, so the rollout it writes is the one provenance reads; an
+        inherited CODEX_HOME (for example a home dedicated to another project) never selects it."""
+        return {**os.environ, "CODEX_HOME": str(self.home)}
+
     def version(self):
-        return run([self.exe, "--version"], timeout=60).stdout.strip()
+        return run([self.exe, "--version"], env=self.env(), timeout=60).stdout.strip()
 
     def auth_route(self):
-        proc = run([self.exe, "login", "status"], check=False, timeout=60)
+        proc = run([self.exe, "login", "status"], env=self.env(), check=False, timeout=60)
         text = (proc.stdout + proc.stderr).strip().splitlines()
         return text[0] if text else "unknown"
 
@@ -894,7 +907,8 @@ class CodexReviewer:
         with open(events_path, "w", encoding="utf-8") as out, open(stderr_path, "w", encoding="utf-8") as err:
             flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
             proc = subprocess.Popen(self.argv(workdir, schema, result_path, skip_git), stdin=subprocess.PIPE,
-                                    stdout=out, stderr=err, text=True, encoding="utf-8", creationflags=flags)
+                                    stdout=out, stderr=err, text=True, encoding="utf-8", env=self.env(),
+                                    creationflags=flags)
             if on_start:
                 on_start(proc.pid)
             timed_out = False
@@ -1131,7 +1145,7 @@ class ClaudeDeveloper:
         return run([self.exe, "--version"], env=self.env(), timeout=60).stdout.strip()
 
     def _transcripts(self, session_id):
-        base = (self.config_dir or Path.home() / ".claude") / "projects"
+        base = claude_config_dir(self.cfg) / "projects"
         return list(base.glob(f"*/{session_id}.jsonl")) if base.exists() else []
 
     def session_exists(self, session_id) -> bool:
@@ -5381,11 +5395,66 @@ def check_policy(cfg):
                 raise UsageError(f"project {role}.{key} is {cfg[role].get(key)!r}; owner policy requires {value!r}")
 
 
+MACHINE_SCHEMA = "agent-review.machine.v1"
+MACHINE_KEYS = {"developer": ("executable", "config_dir"), "reviewer": ("codex_home",)}  # machine facts, never policy
+
+
+def machine_profile_path() -> Path:
+    return agent_home() / "machine.json"
+
+
+def load_machine_profile():
+    """The owner's machine facts (where Claude Code is installed, its config directory, the reviewer's Codex home),
+    or None without a profile. Anything else, including models, effort, permissions, gates or limits, is refused."""
+    path = machine_profile_path()
+    if not path.exists() and not path.is_symlink():
+        return None
+    try:
+        profile = read_json(path)
+    except (OSError, ValueError) as exc:
+        raise UsageError(f"machine profile {path} is unreadable: {exc}")
+    if not isinstance(profile, dict) or profile.get("schema_version") != MACHINE_SCHEMA:
+        raise UsageError(f"machine profile {path} must be an object with schema_version {MACHINE_SCHEMA}")
+    for section, values in profile.items():
+        if section == "schema_version":
+            continue
+        if section not in MACHINE_KEYS or not isinstance(values, dict):
+            raise UsageError(f"machine profile {path}: '{section}' is not a machine setting "
+                             f"(allowed: {', '.join(f'{s}.{k}' for s, ks in MACHINE_KEYS.items() for k in ks)})")
+        for key, value in values.items():
+            if key not in MACHINE_KEYS[section]:
+                raise UsageError(f"machine profile {path}: '{section}.{key}' is not a machine setting")
+            if not isinstance(value, str) or not value.strip():
+                raise UsageError(f"machine profile {path}: '{section}.{key}' must be a non-empty string")
+    return profile
+
+
+def apply_machine_profile(cfg, profile):
+    """The effective project configuration: the profile's machine facts replace the project's own values."""
+    if not profile:
+        return cfg
+    cfg = json.loads(json.dumps(cfg))
+    for section in MACHINE_KEYS:
+        cfg.setdefault(section, {}).update(profile.get(section) or {})
+    return cfg
+
+
+def machine_facts(cfg):
+    """Where this machine runs the configured roles, as reported by check-project and preflight."""
+    profile = machine_profile_path()
+    dev, rev = cfg["developer"], cfg["reviewer"]
+    return {"machine_profile": str(profile) if profile.is_file() else None,
+            "developer_executable": dev.get("executable", "claude"),
+            "claude_config_dir": str(claude_config_dir(dev)),
+            "codex_home": str(Path(expand(rev.get("codex_home", "~/.codex"))))}
+
+
 def load_project(name_or_path, root=HERE):
     path = _trusted(root, "projects", name_or_path)
     cfg = read_json(path)
     if cfg.get("schema_version") != "agent-review.project.v1":
         raise UsageError(f"{path} is not an agent-review project config")
+    cfg = apply_machine_profile(cfg, load_machine_profile())
     check_policy(cfg)
     unknown = sorted(set(project_required_gates(cfg)) - set(cfg.get("gates") or {}))
     if unknown:
@@ -5649,7 +5718,7 @@ class _AmbientDeveloper(ClaudeDeveloper):
 
 def _user_status_allowance(cfg):
     """The owner's user-level allowance for the read-only `status` command, if granted (the ambient rule probed)."""
-    base = Path(expand(cfg["developer"]["config_dir"])) if cfg["developer"].get("config_dir") else Path.home() / ".claude"
+    base = claude_config_dir(cfg["developer"])
     settings = _json_file(base / "settings.json") or {}
     for rule in (settings.get("permissions") or {}).get("allow", []):
         if rule.startswith("Bash(python ") and rule.endswith(" status *)"):
@@ -5716,7 +5785,7 @@ def permission_isolation_probe(cfg, root, work):
 def preflight(cfg, root=HERE):
     """Real bounded calls to both configured models; records requested vs observed metadata."""
     import tempfile
-    out = {"at": now_iso(), "project": cfg["project_id"]}
+    out = {"at": now_iso(), "project": cfg["project_id"], "machine": machine_facts(cfg)}
     work = Path(tempfile.mkdtemp(prefix="agent-review-preflight-"))
     atomic_write_json(work / "developer-settings.json", compose_developer_settings(cfg, root, "preflight"))
     dev = ClaudeDeveloper(cfg["developer"], work / "developer-settings.json", root / REPORT_SCHEMA_FILE)
@@ -5897,6 +5966,15 @@ def check_project(cfg, repo):
         check_policy(cfg)
     except UsageError as exc:
         problems.append(str(exc))
+    facts.update(machine_facts(cfg))
+    for role, exe in (("developer", cfg["developer"].get("executable", "claude")),
+                      ("reviewer", cfg["reviewer"].get("executable", "codex"))):
+        try:
+            resolve_exe(exe)
+        except UsageError:
+            problems.append(f"{role} executable {exe} not found")
+    if not Path(facts["codex_home"]).is_dir():
+        problems.append(f"reviewer Codex home {facts['codex_home']} does not exist (sign it in with codex login)")
     facts["branch_pattern"] = cfg["branch_pattern"]
     facts["push"] = "repository wrapper" if cfg.get("push_command") else "built-in guarded push"
     facts["gates"] = sorted(cfg.get("gates") or {})
@@ -5928,7 +6006,12 @@ def init_project(args, root=HERE, github_factory=GitHub):
     owner, name = slug.split("/")
     prefix = args.branch_prefix.rstrip("/") + "/"
     in_nima = Path(top).resolve().as_posix().lower().startswith("c:/dev/nima")
-    config_dir = args.claude_config_dir or ("%USERPROFILE%/.claude" if in_nima else "%USERPROFILE%/.claude-personal")
+    machine = load_machine_profile() or {}
+    machine_dev = machine.get("developer") or {}
+    # explicit flags, then the nima rule, then this machine's profile; otherwise Claude Code on PATH with its own
+    # standard config directory (no config_dir key)
+    executable = getattr(args, "claude_executable", None) or machine_dev.get("executable") or "claude"
+    config_dir = args.claude_config_dir or ("%USERPROFILE%/.claude" if in_nima else machine_dev.get("config_dir"))
     instructions = [p for p in ("AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md") if (Path(top) / p).exists()]
     shipped = read_json(root / "projects" / "kingmaker-gunslinger.json")
     cfg = {
@@ -5936,11 +6019,11 @@ def init_project(args, root=HERE, github_factory=GitHub):
         "allowed_remote_urls": sorted({f"https://github.com/{owner}/{name}.git", f"git@github.com:{owner}/{name}.git", url}),
         "default_target_branch": default_branch, "branch_pattern": f"^{re.escape(prefix)}[a-z0-9][a-z0-9._/-]*$",
         "expected_actor": actor, "transcript_dir": "docs/agent-reviews", "instructions": instructions,
-        "developer": {"executable": "%USERPROFILE%/.local/bin/claude.exe", "config_dir": config_dir,
+        "developer": {"executable": executable, **({"config_dir": config_dir} if config_dir else {}),
                       **POLICY["developer"], "soft_deadline_minutes": 480, "grace_minutes": 60,
                       "permissions": {"allow": [r for cmd in args.allow for r in (f"Bash({cmd}*)", f"PowerShell({cmd}*)")],
                                       "deny": []}},
-        "reviewer": {**shipped["reviewer"], **POLICY["reviewer"]},
+        "reviewer": {**shipped["reviewer"], **(machine.get("reviewer") or {}), **POLICY["reviewer"]},
         "limits": shipped["limits"], "runtime_lock_paths": [],
     }
     if args.push_command:
@@ -6533,6 +6616,7 @@ def build_parser():
                    help="command prefix the headless developer may run (e.g. 'npm test'); repeatable")
     p.add_argument("--push-command", help="JSON argv for a repository-owned guarded push wrapper")
     p.add_argument("--claude-config-dir")
+    p.add_argument("--claude-executable", help="Claude Code executable (default: the machine profile, else claude on PATH)")
     p.add_argument("--force", action="store_true")
     p = sub.add_parser("push", help="developer helper: guarded push of the enrolled branch (no force)")
     p.add_argument("--enrollment", required=True)
