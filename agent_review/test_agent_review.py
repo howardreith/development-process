@@ -1699,8 +1699,7 @@ class MachinePortabilityTests(unittest.TestCase):
         with contextlib.chdir(first_dir):
             env.dir, state = ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
         same = os.path.normcase
-        # anchored as written (the stem); the extension is completed at launch, as for a later-installed tool
-        self.assertEqual(same(str(first_dir / "tools" / "claude-rel")), same(state["project"]["developer"]["executable"]))
+        self.assertEqual(same(str(original)), same(state["project"]["developer"]["executable"]))  # the installed file
         with contextlib.chdir(second_dir):
             ctl = env.controller()
             self.assertEqual(same(str(original)), same(ar.ClaudeDeveloper(ctl.cfg["developer"], None, None).exe))
@@ -1904,7 +1903,7 @@ class MachinePortabilityTests(unittest.TestCase):
                     rev.version()
         work = env.root / "rel-launch"
         self.command_shim(work / "tools", "codex.exe", record)
-        with contextlib.chdir(work):
+        with contextlib.chdir(work), mock.patch.dict(os.environ, {"PATHEXT": ".COM;.EXE;.BAT;.CMD"}):
             pinned = ar.pin_machine_values({"developer": {}, "reviewer": {"executable": "tools\\codex.exe"}})
             self.assertEqual(str(work / "tools" / "codex.exe"), pinned["reviewer"]["executable"])
             with self.assertRaises(ar.UsageError):
@@ -1913,9 +1912,29 @@ class MachinePortabilityTests(unittest.TestCase):
         self.command_shim(early, "codex-exact.exe", record)
         late.mkdir()
         (late / "codex-exact.exe").write_bytes(b"MZ")  # the exact name, later on PATH (selected, not run)
-        with mock.patch.dict(os.environ, {"PATH": os.pathsep.join([str(early), str(late)])}):
+        with mock.patch.dict(os.environ, {"PATH": os.pathsep.join([str(early), str(late)]),
+                                          "PATHEXT": ".COM;.EXE;.BAT;.CMD"}):
             self.assertEqual(str(late / "codex-exact.exe"), ar.resolve_exe("codex-exact.exe"))
         self.assertFalse(calls.exists())  # no double-suffixed wrapper was ever invoked
+
+    def test_an_installed_relative_executable_keeps_the_file_selected_at_enrollment(self):
+        """R8-F1: reversing PATHEXT later does not switch a resumed enrollment to another wrapper at the same stem."""
+        env = self.env
+        launch, other = env.root / "launch-e", env.root / "launch-f"
+        cmd = self.command_shim(launch / "tools", "codex", ["print('codex-cli cmd')"])
+        bat = launch / "tools" / "codex.bat"
+        bat.write_text(f'@"{sys.executable}" -c "print(\'codex-cli bat\')"\n', encoding="utf-8")
+        other.mkdir()
+        env.controller().cancel("enroll again with two wrappers at one stem")
+        cfg = ar.read_json(self.project)
+        cfg["reviewer"]["executable"] = "tools\\codex"
+        ar.atomic_write_json(self.project, cfg)
+        with contextlib.chdir(launch), mock.patch.dict(os.environ, {"PATHEXT": ".COM;.EXE;.CMD;.BAT"}):
+            env.dir, state = ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
+        self.assertEqual(os.path.normcase(str(cmd)), os.path.normcase(state["project"]["reviewer"]["executable"]))
+        with contextlib.chdir(other), mock.patch.dict(os.environ, {"PATHEXT": ".COM;.EXE;.BAT;.CMD"}):
+            rev = ar.CodexReviewer(env.controller().cfg["reviewer"])
+            self.assertEqual("codex-cli cmd", rev.version())  # the .bat now comes first in PATHEXT, unused
 
     def test_bare_commands_ignore_drive_less_path_entries(self):
         """R6-F2: a PATH entry without a drive follows the current drive and is skipped."""

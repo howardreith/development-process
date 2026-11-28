@@ -305,7 +305,9 @@ def pin_executable(value: str, what: str) -> str:
         raise UsageError(f"{what} '{value}' expands to a blank value")
     if is_command_name(exe) or is_fully_qualified(exe):
         return exe
-    return os.path.abspath(exe)  # anchored as written; a stem is completed with PATHEXT at launch (with_pathext)
+    anchored = os.path.abspath(exe)
+    matched = with_pathext(anchored)  # the installed file the matcher selects now, so PATHEXT order cannot change it
+    return matched if os.path.isfile(matched) else anchored  # an absent tool keeps the stem (completed at launch)
 
 
 def run(argv, cwd=None, input_text=None, env=None, timeout=300, check=True):
