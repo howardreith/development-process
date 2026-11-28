@@ -80,6 +80,9 @@ def smoke_machine_config(base):
     home before the fixture switches to its own isolated one (where no profile exists), with the machine values
     expanded there, as an enrollment pins them."""
     effective = ar.pin_machine_values(ar.apply_machine_profile(base, ar.load_machine_profile()))
+    unstable = ar.machine_value_problems(effective)
+    if unstable:  # the same refusal an enrollment applies
+        raise ar.UsageError("smoke fixture refused: " + "; ".join(unstable))
     return effective["developer"], effective["reviewer"]
 
 

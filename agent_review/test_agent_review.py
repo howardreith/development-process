@@ -1504,6 +1504,7 @@ class MachinePortabilityTests(unittest.TestCase):
                    required_gates=[], default_target_branch="master")
         cfg.update(cfg_changes)
         cfg["developer"]["executable"] = str(env.root / "absent" / "claude.exe")
+        cfg["reviewer"]["executable"] = str(env.root / "absent" / "codex.exe")  # never the host's Codex
         cfg["reviewer"]["codex_home"] = str(env.root / "absent-codex-home")
         ar.atomic_write_json(Path(os.environ["AGENT_REVIEW_HOME"]) / "projects" / "check-fixture.json", cfg)
 
@@ -1522,7 +1523,8 @@ class MachinePortabilityTests(unittest.TestCase):
         self.assertIsNone(out["machine_profile"])
         self.assertIn("does not exist", out["developer_executable"]["problem"])
         self.assertEqual(str(self.env.root / "absent-codex-home"), out["codex_home"]["path"])
-        self.assertEqual(2, len(out["machine_problems"]))
+        self.assertIn("does not exist", out["reviewer_executable"]["problem"])
+        self.assertEqual(3, len(out["machine_problems"]))
         self.check_fixture(allowed_remote_urls=["https://github.com/owner/elsewhere.git"])  # a repository failure
         code, out = self.run_cli("check-project", "--project", "check-fixture", "--repo", str(self.env.work))
         self.assertEqual(ar.EXIT_BLOCKED, code)
@@ -1532,7 +1534,11 @@ class MachinePortabilityTests(unittest.TestCase):
         """R2-F1: nothing is launched; the machine report reaches stdout and --out."""
         self.check_fixture()
         target = self.env.root / "preflight.json"
-        code, out = self.run_cli("preflight", "--project", "check-fixture", "--out", str(target))
+        scratch = self.env.root / "isolated-temp"
+        scratch.mkdir()
+        with mock.patch.object(tempfile, "tempdir", str(scratch)):
+            code, out = self.run_cli("preflight", "--project", "check-fixture", "--out", str(target))
+        self.assertEqual([], list(scratch.iterdir()))  # R3-F5: the work directory is removed on failure
         self.assertEqual(ar.EXIT_BLOCKED, code)
         self.assertFalse(out["ok"])
         self.assertIn("error", out)
@@ -1557,13 +1563,92 @@ class MachinePortabilityTests(unittest.TestCase):
         path, _ = ar.init_project(args, root=env.wf, github_factory=FakeOnboardingGitHub)
         before = path.read_bytes()
         for flags in ({"claude_config_dir": "%CLAUDE_CONFIG_DIR%"}, {"claude_config_dir": "relative/cfg"},
-                      {"claude_executable": "bin\\claude.exe"}):
+                      {"claude_executable": "bin\\claude.exe"}, {"claude_executable": "   "},
+                      {"claude_executable": "%AR_TEST_UNSET_CMD%"}):
             for key, value in flags.items():
                 setattr(args, key, value)
             with self.assertRaises(ar.UsageError, msg=flags):
                 ar.init_project(args, root=env.wf, github_factory=FakeOnboardingGitHub)
             self.assertEqual(before, path.read_bytes())
             args.claude_config_dir = args.claude_executable = None
+
+    def test_unresolved_variables_are_refused_before_enrollment(self):
+        """R1-F3: an absolute home or Claude directory containing an unset variable is never pinned."""
+        env = self.env
+        env.controller().cancel("enroll again under an unstable profile")
+        states = sorted((env.root / "state").iterdir())
+        with mock.patch.dict(os.environ):
+            os.environ.pop("AR_TEST_UNSET", None)
+            for profile in ({"reviewer": {"codex_home": str(env.root / "%AR_TEST_UNSET%" / "codex")}},
+                            {"developer": {"config_dir": str(env.root / "$AR_TEST_UNSET" / "claude")}}):
+                self.write_profile(**profile)
+                with self.assertRaises(ar.UsageError, msg=profile):  # the profile loader refuses it
+                    ar.load_project(self.project, env.wf)
+                ar.machine_profile_path().unlink()
+            reviewer = dict(ar.read_json(self.project)["reviewer"], codex_home=str(env.root / "%AR_TEST_UNSET%" / "codex"))
+            cfg = dict(ar.read_json(self.project), reviewer=reviewer)  # the same value in a project config
+            ar.atomic_write_json(self.project, cfg)
+            loaded = ar.load_project(self.project, env.wf)  # loads, for check-project to report
+            self.assertIn("%AR_TEST_UNSET%", loaded["reviewer"]["codex_home"])
+            with self.assertRaises(ar.UsageError) as refused:
+                ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
+            self.assertIn("nothing was created", str(refused.exception))
+            self.assertIn("unresolved variable", str(refused.exception))
+            self.assertEqual(states, sorted((env.root / "state").iterdir()))
+            self.write_profile(reviewer={"codex_home": str(env.root / "%AR_TEST_UNSET%" / "codex")})
+            with self.assertRaises(ar.UsageError):  # nor can the smoke fixture use it
+                __import__("test_live_smoke").smoke_machine_config(
+                    ar.read_json(HERE / "projects" / "kingmaker-gunslinger.json"))
+
+    def test_an_executable_template_naming_a_command_is_pinned(self):
+        """R3-F1: a later shell naming another command on the same PATH does not change the enrollment's."""
+        env = self.env
+        first = self.command_shim(env.root / "cmd-bin", "claude-first", ["print('first')"])
+        self.command_shim(env.root / "cmd-bin", "claude-second", ["print('second')"])
+        env.controller().cancel("enroll again under a templated executable")
+        path = str(env.root / "cmd-bin") + os.pathsep + os.environ["PATH"]  # Git stays available
+        with mock.patch.dict(os.environ, {"AR_TEST_CMD": "claude-first", "PATH": path}):
+            self.write_profile(developer={"executable": "%AR_TEST_CMD%"})
+            env.dir, state = ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
+        self.assertEqual("claude-first", state["project"]["developer"]["executable"])
+        with mock.patch.dict(os.environ, {"AR_TEST_CMD": "claude-second", "PATH": path}):
+            ctl = env.controller()
+            self.assertEqual(str(first), ar.ClaudeDeveloper(ctl.cfg["developer"], None, None).exe)
+
+    def test_check_project_keeps_the_machine_report_when_the_repository_check_fails(self):
+        """R3-F3: plain directory, missing origin, missing gh: nonzero, with the machine fields."""
+        env = self.env
+        self.check_fixture()
+        self.write_profile(reviewer={"codex_home": self.review_home})
+        plain = env.root / "plain"
+        plain.mkdir()
+        code, out = self.run_cli("check-project", "--project", "check-fixture", "--repo", str(plain))
+        self.assertEqual(ar.EXIT_BLOCKED, code)
+        self.assertTrue(any("not a git repository" in p for p in out["problems"]))
+        self.assertEqual(str(ar.machine_profile_path()), out["machine_profile"]["path"])
+        self.assertEqual(self.review_home, out["codex_home"]["path"])
+        git(env.work, "remote", "remove", "origin")
+        code, out = self.run_cli("check-project", "--project", "check-fixture", "--repo", str(env.work))
+        self.assertEqual(ar.EXIT_BLOCKED, code)
+        self.assertTrue(any("origin remote unavailable" in p for p in out["problems"]))
+        self.assertIn("developer_executable", out)
+        git(env.work, "remote", "add", "origin", "https://github.com/owner/repo.git")
+        self.check_fixture(gh=str(env.root / "absent" / "gh.exe"))
+        code, out = self.run_cli("check-project", "--project", "check-fixture", "--repo", str(env.work))
+        self.assertEqual(ar.EXIT_BLOCKED, code)
+        self.assertTrue(any("GitHub check failed" in p for p in out["problems"]))
+        self.assertIn("machine_problems", out)
+
+    def test_a_timed_out_preflight_probe_reports_the_machine(self):
+        """R3-F4: simulated timeout at the model CLI boundary."""
+        self.check_fixture()
+        target = self.env.root / "preflight-timeout.json"
+        with mock.patch.object(ar.ClaudeDeveloper, "run", side_effect=subprocess.TimeoutExpired(["claude"], 600)):
+            code, out = self.run_cli("preflight", "--project", "check-fixture", "--out", str(target))
+        self.assertEqual(ar.EXIT_BLOCKED, code)
+        self.assertIn("TimeoutExpired", out["error"])
+        self.assertIn("developer_executable", out["machine"])
+        self.assertEqual(out, ar.read_json(target))
 
     def test_nima_rule_matches_path_components(self):
         """R1-F6: a descendant of C:\\Dev\\nima, not a similarly named sibling."""

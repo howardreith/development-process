@@ -227,12 +227,25 @@ def resolve_exe(name: str) -> str:
     return found
 
 
+RESIDUAL_VAR_RE = re.compile(r"%[^%/\\\s]+%|\$\{?[A-Za-z_][A-Za-z0-9_]*")
+
+
+def expand_fully(value: str, what: str) -> str:
+    """The value with the user's home and environment expanded, refusing any variable that stays unresolved: a
+    later shell that defines it would otherwise give the stored value a different meaning."""
+    expanded = expand(value)
+    if RESIDUAL_VAR_RE.search(expanded):
+        raise UsageError(f"{what} '{value}' contains an unresolved variable ({expanded})")
+    return expanded
+
+
 def stable_dir(value: str, own_var: str, what: str) -> Path:
     """A configured directory with one meaning whatever shell runs the controller: absolute after expanding the
-    user's home and environment, and never defined through the variable it is meant to set for the child."""
+    user's home and environment, with nothing left unresolved, and never defined through the variable it is meant to
+    set for the child."""
     if re.search(rf"%{own_var}%|\${{?{own_var}\b", value, re.I):
         raise UsageError(f"{what} '{value}' may not refer to the inherited {own_var}")
-    path = Path(expand(value))
+    path = Path(expand_fully(value, what))
     if not path.is_absolute():
         raise UsageError(f"{what} '{value}' does not expand to an absolute directory")
     return path
@@ -4182,6 +4195,9 @@ class Controller:
     def _activate(self, refresh_project):
         if refresh_project:
             new_cfg, machine = load_project_effective(refresh_project, self.wf)
+            unstable = machine_value_problems(new_cfg)
+            if unstable:
+                raise UsageError("refreshing the project refused: " + "; ".join(unstable))
             frozen = [k for k in ("project_id", "repository", "expected_actor", "transcript_dir")
                       if new_cfg.get(k) != self.cfg.get(k)]
             if frozen:
@@ -5498,17 +5514,21 @@ def load_machine_profile():
 
 def validate_machine_value(key, value, label):
     """The machine-value grammar: an executable is a command name or an absolute path; a directory is stable."""
+    if not isinstance(value, str) or not value.strip():
+        raise UsageError(f"{label} must be a non-empty string")
     if key == "executable":
-        if not (is_command_name(expand(value)) or os.path.isabs(expand(value))):
+        exe = expand_fully(value, label)
+        if not (is_command_name(exe) or os.path.isabs(exe)):
             raise UsageError(f"{label} must be a command name or an absolute path")
     else:
         stable_dir(value, {"config_dir": "CLAUDE_CONFIG_DIR", "codex_home": "CODEX_HOME"}[key], label)
 
 
 def pin_machine_values(cfg):
-    """The machine directories, and an executable given as a path, expanded once when the configuration is loaded,
-    so the values an enrollment pins keep their meaning whatever environment later controller instances inherit. A
-    value that cannot be made stable is left as configured; the reviewer and developer boundaries refuse it."""
+    """The machine directories and executables expanded once when the configuration is loaded, so the values an
+    enrollment pins keep their meaning whatever environment later controller instances inherit. A value that cannot
+    be made stable is left as configured for check-project to report; enrollment and project refresh refuse it
+    (machine_value_problems)."""
     cfg = json.loads(json.dumps(cfg))
     dev, rev = cfg["developer"], cfg["reviewer"]
     for section, key, var, default in ((dev, "config_dir", "CLAUDE_CONFIG_DIR", None),
@@ -5520,10 +5540,33 @@ def pin_machine_values(cfg):
             except UsageError:
                 pass
     for section in (dev, rev):
-        exe = expand(section["executable"]) if section.get("executable") else None
-        if exe and os.path.isabs(exe):
-            section["executable"] = exe
+        if section.get("executable"):
+            try:
+                section["executable"] = expand_fully(section["executable"], "executable")
+            except UsageError:
+                pass
     return cfg
+
+
+def machine_value_problems(cfg):
+    """Why a loaded configuration's machine values could change meaning after pinning (empty when stable)."""
+    problems = []
+    for section, key, default in (("developer", "config_dir", None), ("developer", "executable", None),
+                                  ("reviewer", "codex_home", "~/.codex"), ("reviewer", "executable", None)):
+        value = cfg[section].get(key, default)
+        if value is None:
+            continue
+        try:
+            if not isinstance(value, str) or not value.strip():
+                raise UsageError(f"{section}.{key} must be a non-empty string")
+            if key == "executable":
+                expand_fully(value, f"{section}.{key}")  # an explicit relative project path stays allowed
+            else:
+                stable_dir(value, {"config_dir": "CLAUDE_CONFIG_DIR", "codex_home": "CODEX_HOME"}[key],
+                           f"{section}.{key}")
+        except UsageError as exc:
+            problems.append(str(exc))
+    return problems
 
 
 def machine_identity(profile):
@@ -5662,6 +5705,9 @@ def resolve_enroll_mode(mode):
 def enroll(args, github=None, root=HERE, developer=None):
     args.mode = resolve_enroll_mode(getattr(args, "mode", None))  # first: a refusal touches nothing
     cfg, machine = load_project_effective(args.project, root)
+    unstable = machine_value_problems(cfg)
+    if unstable:  # refused before anything is created: a pinned value must keep its meaning
+        raise UsageError("enrollment refused; nothing was created: " + "; ".join(unstable))
     if cfg.get("enrollment_allowed") is False:  # the repository's own instructions forbid this workflow's actions
         raise UsageError(f"project {cfg['project_id']} does not allow enrollment: {cfg.get('enrollment_blocked_reason')}")
     plan = load_plan(args.plan, root)
@@ -5912,10 +5958,18 @@ def permission_isolation_probe(cfg, root, work):
 
 
 def preflight(cfg, root=HERE, machine=None):
-    """Real bounded calls to both configured models; records requested vs observed metadata."""
+    """Real bounded calls to both configured models; records requested vs observed metadata. The temporary work
+    directory is removed whether the calls succeed or fail."""
     import tempfile
-    out = {"at": now_iso(), "project": cfg["project_id"], "machine": machine_facts(cfg, machine)}
     work = Path(tempfile.mkdtemp(prefix="agent-review-preflight-"))
+    try:
+        return _preflight(cfg, root, machine, work)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _preflight(cfg, root, machine, work):
+    out = {"at": now_iso(), "project": cfg["project_id"], "machine": machine_facts(cfg, machine)}
     atomic_write_json(work / "developer-settings.json", compose_developer_settings(cfg, root, "preflight"))
     dev = ClaudeDeveloper(cfg["developer"], work / "developer-settings.json", root / REPORT_SCHEMA_FILE)
     sid = str(uuid.uuid4())
@@ -5956,7 +6010,6 @@ def preflight(cfg, root=HERE, machine=None):
         "Cost: Claude reports list-price cost even on subscription auth; Codex reports tokens and plan type only. "
         "No precise combined cost is claimed.",
     ]
-    shutil.rmtree(work, ignore_errors=True)
     return out
 
 
@@ -6059,13 +6112,24 @@ def check_project(cfg, repo, machine=None):
     """Compare a project config with its repository, GitHub and local tools. Returns (problems, facts). `machine` is
     the identity of the machine profile the configuration was loaded under (load_project_effective)."""
     problems, facts = [], {}
+    # local availability is reported beside, not in, the problems that decide this command's result
+    facts.update(machine_facts(cfg, machine))
+    facts["machine_problems"] = [f"{key}: {facts[key]['problem']}" for key in
+                                 ("developer_executable", "reviewer_executable", "claude_config_dir", "codex_home")
+                                 if facts[key].get("problem")]
+    if facts["codex_home"]["path"] and not Path(facts["codex_home"]["path"]).is_dir():
+        facts["machine_problems"].append(f"codex_home: {facts['codex_home']['path']} does not exist "
+                                         "(sign it in with codex login)")
     git = Git(repo)
     try:
         top = git.toplevel()
-    except CommandError as exc:
+    except (CommandError, OSError) as exc:
         return [f"not a git repository: {exc}"], facts
     facts["repo_root"] = top
-    url = git.remote_url()
+    try:
+        url = git.remote_url()
+    except CommandError as exc:
+        return [f"origin remote unavailable: {exc}"], facts
     facts["origin"] = url
     if url not in cfg["allowed_remote_urls"] or github_slug(url) != cfg["repository"]:
         problems.append(f"origin {url} does not match {cfg['repository']}")
@@ -6080,7 +6144,7 @@ def check_project(cfg, repo, machine=None):
             problems.append(f"default branch is {facts['default_branch']}, config says {cfg['default_target_branch']}")
         if facts["permission"] not in ("ADMIN", "MAINTAIN", "WRITE"):
             problems.append(f"insufficient repository permission {facts['permission']}")
-    except (CommandError, UsageError, ValueError, KeyError) as exc:
+    except (CommandError, UsageError, ValueError, KeyError, OSError) as exc:  # OSError: gh could not be started
         problems.append(f"GitHub check failed: {exc}")
     for item in cfg.get("push_command") or []:
         if item.lower().endswith((".ps1", ".py", ".sh")) and "{" not in item and not Path(expand(item)).is_file():
@@ -6096,14 +6160,6 @@ def check_project(cfg, repo, machine=None):
         check_policy(cfg)
     except UsageError as exc:
         problems.append(str(exc))
-    # local availability is reported beside, not in, the problems that decide this command's result
-    facts.update(machine_facts(cfg, machine))
-    facts["machine_problems"] = [f"{key}: {facts[key]['problem']}" for key in
-                                 ("developer_executable", "reviewer_executable", "claude_config_dir", "codex_home")
-                                 if facts[key].get("problem")]
-    if facts["codex_home"]["path"] and not Path(facts["codex_home"]["path"]).is_dir():
-        facts["machine_problems"].append(f"codex_home: {facts['codex_home']['path']} does not exist "
-                                         "(sign it in with codex login)")
     facts["branch_pattern"] = cfg["branch_pattern"]
     facts["push"] = "repository wrapper" if cfg.get("push_command") else "built-in guarded push"
     facts["gates"] = sorted(cfg.get("gates") or {})
@@ -6868,7 +6924,7 @@ def dispatch(args, root=HERE):
             cfg, machine = load_project_effective(args.project)
             try:
                 result = preflight(cfg, machine=machine)
-            except (UsageError, CommandError, OSError) as exc:  # e.g. a configured CLI cannot be resolved or started
+            except (UsageError, CommandError, OSError, subprocess.SubprocessError) as exc:  # unresolvable, unstartable or timed-out CLI
                 result = {"at": now_iso(), "project": cfg["project_id"], "machine": machine_facts(cfg, machine),
                           "ok": False, "error": f"{type(exc).__name__}: {exc}"}
             text = json.dumps(result, indent=2)

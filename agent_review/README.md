@@ -176,10 +176,14 @@ A machine whose projects need different Claude config directories (for example
 a work account for one repository) leaves `developer.config_dir` out of the
 profile and sets it per project.
 
-Loading a project expands its Claude config directory, Codex home and any
-executable given as a path once (environment templates included), so the values
-an enrollment pins keep their meaning whatever environment a later controller
-instance inherits. An enrollment pins that effective configuration and the
+Loading a project expands its Claude config directory, Codex home and
+executables once (environment templates included, so `%TOOL%` naming a command
+is stored as that command), so the values an enrollment pins keep their meaning
+whatever environment a later controller instance inherits. A value that would
+still contain an unresolved variable after expansion (`C:/x/%UNSET%/codex`), a
+blank value, or a relative or self-referencing directory is refused by the
+profile loader and by `enroll` and `activate --refresh-project` before anything
+changes; `check-project` reports it under `machine_problems`. An enrollment pins that effective configuration and the
 profile identity it was loaded under. If the profile changes later, `status` (and the next `review`
 result) reports `machine_profile.changed: true`, and the enrollment keeps using
 its pinned values. Adopting the new profile is an owner decision between runs:
@@ -212,8 +216,11 @@ python C:/Dev/agent-review/agent_review.py preflight --project <name>           
 
 `check-project` lists missing local tools under `machine_problems`; they do not
 change its result, which still reflects the repository, GitHub and policy
-checks. `preflight` fails when a configured CLI cannot be resolved or started,
-and its output (and `--out` file) still carries the machine report.
+checks. The machine report is printed even when those checks fail early (not a
+Git repository, no origin, `gh` missing). `preflight` fails when a configured
+CLI cannot be resolved, started or finished in time, and its output (and
+`--out` file) still carries the machine report; its temporary work directory is
+removed either way.
 
 A gate that runs much slower on the new machine (for example while antivirus
 scans the test suite's temporary Git repositories) needs a larger
