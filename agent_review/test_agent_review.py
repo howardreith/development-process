@@ -1679,10 +1679,12 @@ class MachinePortabilityTests(unittest.TestCase):
             self.assertIn("nothing was created", str(refused.exception))
             self.assertEqual(states, sorted((env.root / "state").iterdir()))
         with mock.patch.dict(os.environ, {"Review Slot": str(env.root / "elsewhere")}):  # defined later
-            rev = ar.CodexReviewer({"executable": sys.executable, "codex_home": slot, "model": "m", "effort": "high"})
+            pinned = {ar.PINNED_MARK: True}  # how a configuration load stores the sections it pinned
+            rev = ar.CodexReviewer({"executable": sys.executable, "codex_home": slot, "model": "m", "effort": "high",
+                                    **pinned})
             self.assertEqual(Path(slot), rev.home)
             self.assertEqual(slot, rev.env()["CODEX_HOME"])
-            self.assertEqual(Path(slot), ar.claude_config_dir({"config_dir": slot}))
+            self.assertEqual(Path(slot), ar.claude_config_dir({"config_dir": slot, **pinned}))
 
     def test_relative_role_executables_are_anchored_at_enrollment(self):
         """R4-F1: a fresh controller in another directory still selects the original file."""
@@ -1730,6 +1732,118 @@ class MachinePortabilityTests(unittest.TestCase):
         self.assertIn("developer_executable", out)
         self.assertEqual(self.review_home, out["codex_home"]["path"])
         self.assertIn("path", out["claude_config_dir"])
+
+    def rewrite_check_fixture(self, change):
+        path = Path(os.environ["AGENT_REVIEW_HOME"]) / "projects" / "check-fixture.json"
+        cfg = ar.read_json(path)
+        change(cfg)
+        ar.atomic_write_json(path, cfg)
+
+    def test_current_drive_rooted_executables_keep_their_drive(self):
+        """R4-F1, including Python 3.12's os.path.isabs, for which \\tools\\x is absolute."""
+        env = self.env
+        shim = self.command_shim(env.root / "tools-abs", "claude-root", ["print('rooted')"])
+        rooted = str(shim)[2:]  # the drive stripped, the leading separator kept
+        self.assertTrue(rooted.startswith("\\"))
+        same = os.path.normcase
+        ntpath_312 = lambda p: bool(re.match(r"^([A-Za-z]:)?[\\/]", os.fspath(p)))
+        with mock.patch.object(ar.os.path, "isabs", ntpath_312):
+            self.assertFalse(ar.is_fully_qualified(rooted))
+            pinned = ar.pin_machine_values({"developer": {"executable": rooted}, "reviewer": {}})
+        self.assertEqual(same(str(shim)), same(pinned["developer"]["executable"]))
+        env.controller().cancel("enroll again with a current-drive-rooted executable")
+        cfg = ar.read_json(self.project)
+        cfg["developer"]["executable"] = rooted
+        ar.atomic_write_json(self.project, cfg)
+        with contextlib.chdir(env.root):
+            env.dir, state = ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
+        self.assertEqual(same(str(shim)), same(state["project"]["developer"]["executable"]))
+        with self.assertRaises(ar.UsageError):  # the profile grammar wants a drive as well
+            ar.validate_machine_value("executable", rooted, "profile executable")
+
+    def test_invalid_project_directories_are_shown_and_never_launched(self):
+        """R5-F1: check-project lists the refusal enrollment would give; preflight launches neither role."""
+        env = self.env
+        calls = env.root / "role-calls.txt"
+        recorder = ["import sys", f"open({str(calls)!r}, 'a').write(' '.join(sys.argv) + chr(10))"]
+        claude = self.command_shim(env.root / "role-bin", "claude-rec", recorder)
+        codex = self.command_shim(env.root / "role-bin", "codex-rec", recorder)
+        for key in ("config_dir", "codex_home"):
+            self.check_fixture()
+
+            def change(cfg, key=key):
+                cfg["developer"]["executable"], cfg["reviewer"]["executable"] = str(claude), str(codex)
+                section = cfg["developer"] if key == "config_dir" else cfg["reviewer"]
+                section[key] = str(env.root / "%AR_UNSET_SLOT%" / key)
+            self.rewrite_check_fixture(change)
+            with mock.patch.dict(os.environ):
+                os.environ.pop("AR_UNSET_SLOT", None)
+                code, out = self.run_cli("check-project", "--project", "check-fixture", "--repo", str(env.work))
+                self.assertEqual(ar.EXIT_OK, code, out["problems"])  # machine diagnostics keep the exit policy
+                self.assertTrue(any("unresolved variable" in p for p in out["machine_problems"]), out)
+                fact = out["claude_config_dir" if key == "config_dir" else "codex_home"]
+                self.assertIsNone(fact["path"])
+                self.assertIn("unresolved variable", fact["problem"])
+                target = env.root / f"preflight-{key}.json"
+                code, out = self.run_cli("preflight", "--project", "check-fixture", "--out", str(target))
+                self.assertEqual(ar.EXIT_BLOCKED, code)
+                self.assertIn("unresolved variable", out["error"])
+                self.assertEqual(out, ar.read_json(target))
+            self.assertFalse(calls.exists(), key)  # neither shim was invoked
+
+    def test_github_executable_templates_still_expand(self):
+        """R5-F2: the GitHub client's configured path is expanded at its boundary, as before."""
+        env = self.env
+        self.check_fixture()
+        self.rewrite_check_fixture(lambda cfg: cfg.update(gh=str(env.root / "%AR_GH_DIR%" / "gh-sim.cmd")))
+        with mock.patch.dict(os.environ, {"AR_GH_DIR": "gh-shim"}):
+            self.assertEqual(str(env.root / "gh-shim" / "gh-sim.cmd"),
+                             ar.GitHub("owner/repo", str(env.root / "%AR_GH_DIR%" / "gh-sim.cmd")).gh)
+            code, out = self.run_cli("check-project", "--project", "check-fixture", "--repo", str(env.work))
+        self.assertEqual(ar.EXIT_OK, code, out["problems"])
+        self.assertEqual("owner", out["actor"])
+
+    def test_bare_activation_keeps_a_legacy_enrollments_expansion(self):
+        """R5-F3: raw settings of a state written before pinning keep their established meaning."""
+        env = self.env
+        legacy_exe = self.command_shim(env.root / "bin", "claude-legacy", ["print('legacy')"])
+        ctl = env.controller()
+        state = ar.read_json(ctl.state_path)
+        state.pop("machine_profile", None)
+        for section in ("developer", "reviewer"):
+            state["project"][section].pop(ar.PINNED_MARK, None)
+        state["project"]["developer"]["executable"] = str(env.root / "%AR_LEGACY_BIN%" / "claude-legacy.cmd")
+        state["project"]["reviewer"]["executable"] = sys.executable
+        state["project"]["reviewer"]["codex_home"] = str(env.root / "%AR_LEGACY_HOME%")
+        ar.atomic_write_json(ctl.state_path, state)
+        self.write_profile(developer={"executable": "claude"}, reviewer={"codex_home": self.review_home})
+        with mock.patch.dict(os.environ, {"AR_LEGACY_BIN": "bin", "AR_LEGACY_HOME": "legacy-home"}):
+            env.controller().activate()
+            fresh = env.controller()
+            self.assertEqual(str(legacy_exe), ar.ClaudeDeveloper(fresh.cfg["developer"], None, None).exe)
+            rev = ar.CodexReviewer(fresh.cfg["reviewer"])
+            self.assertEqual(env.root / "legacy-home", rev.home)  # provenance root
+            self.assertEqual(str(env.root / "legacy-home"), rev.env()["CODEX_HOME"])  # child home
+        self.assertNotEqual(self.review_home, fresh.cfg["reviewer"]["codex_home"])  # the profile was not applied
+
+    def test_a_relative_tool_installed_after_enrollment_is_found_with_its_extension(self):
+        """R5-F4."""
+        env = self.env
+        first_dir, second_dir = env.root / "launch-c", env.root / "launch-d"
+        first_dir.mkdir()
+        env.controller().cancel("enroll again before the reviewer CLI is installed")
+        cfg = ar.read_json(self.project)
+        cfg["reviewer"]["executable"] = "tools\\codex"
+        ar.atomic_write_json(self.project, cfg)
+        with contextlib.chdir(first_dir):
+            env.dir, state = ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
+        self.assertEqual(str(first_dir / "tools" / "codex"), state["project"]["reviewer"]["executable"])
+        installed = self.command_shim(first_dir / "tools", "codex", ["print('codex-cli first')"])
+        self.command_shim(second_dir / "tools", "codex", ["print('codex-cli second')"])
+        with contextlib.chdir(second_dir):
+            rev = ar.CodexReviewer(env.controller().cfg["reviewer"])
+            self.assertEqual(os.path.normcase(str(installed)), os.path.normcase(rev.exe))
+            self.assertEqual("codex-cli first", rev.version())
 
     def test_nima_rule_matches_path_components(self):
         """R1-F6: a descendant of C:\\Dev\\nima, not a similarly named sibling."""

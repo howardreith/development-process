@@ -185,8 +185,28 @@ def claude_config_dir(developer_cfg) -> Path:
     """The Claude config directory the developer CLI uses: the configured one (passed as CLAUDE_CONFIG_DIR), else
     the CLAUDE_CONFIG_DIR it inherits, else Claude Code's standard ~/.claude."""
     if developer_cfg.get("config_dir"):
-        return stable_dir(developer_cfg["config_dir"], "CLAUDE_CONFIG_DIR", "Claude config directory")
+        return stable_dir(developer_cfg["config_dir"], "CLAUDE_CONFIG_DIR", "Claude config directory",
+                          literal=developer_cfg.get(PINNED_MARK) is True)
     return Path(expand(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude"))
+
+
+PINNED_MARK = "machine_values_pinned"  # set by pin_machine_values on a role section whose machine values it pinned
+
+
+def is_fully_qualified(path: str) -> bool:
+    """Absolute including, on Windows, the drive: a current-drive-rooted path such as \\tools\\x is not (it
+    counts as absolute for os.path.isabs before Python 3.13)."""
+    return os.path.isabs(path) and (os.name != "nt" or bool(os.path.splitdrive(path)[0]))
+
+
+def with_pathext(path: str) -> str:
+    """An absolute executable path, or on Windows the first PATHEXT spelling of it that exists (an extensionless
+    path pinned before its tool was installed still finds, for example, codex.cmd in that directory)."""
+    if os.name == "nt" and not os.path.exists(path):
+        for ext in (os.environ.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD").split(os.pathsep):
+            if ext and os.path.isfile(path + ext):
+                return path + ext
+    return path
 
 
 def find_on_path(name: str):
@@ -212,10 +232,12 @@ def is_command_name(value: str) -> bool:
     return bool(value) and not any(sep in value for sep in ("/", "\\", ":"))
 
 
-def resolve_exe(name: str) -> str:
-    candidate = name if os.path.isabs(name) else expand(name)  # an absolute (pinned) path is used as written
-    if os.path.isabs(candidate):
-        return candidate
+def resolve_exe(name: str, literal: bool = False) -> str:
+    """The executable to launch. `literal`: a role path the configuration load pinned, used as written; every
+    other value (the GitHub client's, a legacy enrollment's) is expanded as configured."""
+    candidate = name if literal else expand(name)
+    if is_fully_qualified(candidate):
+        return with_pathext(candidate)
     if not is_command_name(candidate):  # an explicit relative path is checked as given, never searched for
         found = shutil.which(candidate)
         if not found:
@@ -251,12 +273,12 @@ def pin_dir(value: str, own_var: str, what: str) -> Path:
     return path
 
 
-def stable_dir(value: str, own_var: str, what: str) -> Path:
-    """The directory a launch uses: an absolute value exactly as written (loading stores pinned directories that
-    way, so a variable defined later never changes one), otherwise the value pinned now."""
+def stable_dir(value: str, own_var: str, what: str, literal: bool = False) -> Path:
+    """The directory a launch uses. `literal`: a directory the configuration load pinned, used exactly as written
+    (a variable defined later never changes it); any other value is pinned now."""
     if re.search(rf"%{own_var}%|\${{?{own_var}\b", value, re.I):
         raise UsageError(f"{what} '{value}' may not refer to the inherited {own_var}")
-    if Path(value).is_absolute():
+    if literal and Path(value).is_absolute():
         return Path(value)
     return pin_dir(value, own_var, what)
 
@@ -267,9 +289,9 @@ def pin_executable(value: str, what: str) -> str:
     exe = expand_fully(value, what)
     if not exe.strip():
         raise UsageError(f"{what} '{value}' expands to a blank value")
-    if is_command_name(exe) or os.path.isabs(exe):
+    if is_command_name(exe) or is_fully_qualified(exe):
         return exe
-    return os.path.abspath(shutil.which(exe) or exe)  # explicit paths keep their PATHEXT lookup
+    return os.path.abspath(shutil.which(exe) or exe)  # explicit paths keep their PATHEXT lookup (also at launch)
 
 
 def run(argv, cwd=None, input_text=None, env=None, timeout=300, check=True):
@@ -942,8 +964,9 @@ class CodexReviewer:
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        self.exe = resolve_exe(cfg.get("executable", "codex"))
-        self.home = stable_dir(cfg.get("codex_home", "~/.codex"), "CODEX_HOME", "reviewer Codex home")
+        pinned = cfg.get(PINNED_MARK) is True
+        self.exe = resolve_exe(cfg.get("executable", "codex"), literal=pinned)
+        self.home = stable_dir(cfg.get("codex_home", "~/.codex"), "CODEX_HOME", "reviewer Codex home", literal=pinned)
 
     @property
     def requested(self):
@@ -1198,7 +1221,7 @@ class ClaudeDeveloper:
     @property
     def exe(self):
         if self._exe is None:
-            self._exe = resolve_exe(self.cfg.get("executable", "claude"))
+            self._exe = resolve_exe(self.cfg.get("executable", "claude"), literal=self.cfg.get(PINNED_MARK) is True)
         return self._exe
 
     @property
@@ -5539,7 +5562,7 @@ def validate_machine_value(key, value, label):
         raise UsageError(f"{label} must be a non-empty string")
     if key == "executable":
         pin_executable(value, label)  # refuses unresolved variables and blank expansions
-        if not (is_command_name(expand(value)) or os.path.isabs(expand(value))):
+        if not (is_command_name(expand(value)) or is_fully_qualified(expand(value))):
             raise UsageError(f"{label} must be a command name or an absolute path")
     else:
         pin_dir(value, {"config_dir": "CLAUDE_CONFIG_DIR", "codex_home": "CODEX_HOME"}[key], label)
@@ -5568,6 +5591,11 @@ def pin_machine_values(cfg):
                 section["executable"] = pin_executable(section["executable"], "executable")
             except UsageError:
                 pass
+    unstable = " ".join(machine_value_problems(cfg))
+    for name, section in (("developer", dev), ("reviewer", rev)):
+        section.pop(PINNED_MARK, None)
+        if f"{name}." not in unstable:
+            section[PINNED_MARK] = True
     return cfg
 
 
@@ -5614,9 +5642,10 @@ def machine_facts(cfg, identity):
     """Where this machine runs the configured roles, from the loaded configuration and the identity of the profile
     that load applied (check-project, preflight): each executable as resolved, and the Claude config directory and
     Codex home the child processes use. A resolution failure is reported in place of a path."""
-    def executable(exe):
+    def executable(section, default):
+        exe = section.get("executable", default)
         try:
-            path = resolve_exe(exe)
+            path = resolve_exe(exe, literal=section.get(PINNED_MARK) is True)
         except UsageError as exc:
             return {"configured": exe, "path": None, "problem": str(exc)}
         if not Path(path).is_file():
@@ -5630,11 +5659,12 @@ def machine_facts(cfg, identity):
             return {"path": None, "problem": str(exc)}
     dev, rev = cfg["developer"], cfg["reviewer"]
     return {"machine_profile": identity,
-            "developer_executable": executable(dev.get("executable", "claude")),
-            "reviewer_executable": executable(rev.get("executable", "codex")),
+            "developer_executable": executable(dev, "claude"),
+            "reviewer_executable": executable(rev, "codex"),
             "claude_config_dir": directory(lambda: claude_config_dir(dev)),
             "codex_home": directory(lambda: stable_dir(rev.get("codex_home", "~/.codex"), "CODEX_HOME",
-                                                       "reviewer Codex home"))}
+                                                       "reviewer Codex home", literal=rev.get(PINNED_MARK) is True)),
+            "invalid_values": machine_value_problems(cfg)}
 
 
 def load_project_effective(name_or_path, root=HERE):
@@ -6140,6 +6170,8 @@ def check_project(cfg, repo, machine=None):
     facts["machine_problems"] = [f"{key}: {facts[key]['problem']}" for key in
                                  ("developer_executable", "reviewer_executable", "claude_config_dir", "codex_home")
                                  if facts[key].get("problem")]
+    facts["machine_problems"] += [f"invalid value: {p}" for p in facts["invalid_values"]
+                                  if not any(p in q for q in facts["machine_problems"])]
     if facts["codex_home"]["path"] and not Path(facts["codex_home"]["path"]).is_dir():
         facts["machine_problems"].append(f"codex_home: {facts['codex_home']['path']} does not exist "
                                          "(sign it in with codex login)")
@@ -6948,6 +6980,9 @@ def dispatch(args, root=HERE):
         if args.command == "preflight":
             cfg, machine = load_project_effective(args.project)
             try:
+                unstable = machine_value_problems(cfg)
+                if unstable:  # the values enrollment refuses are never launched with
+                    raise UsageError("invalid machine values: " + "; ".join(unstable))
                 result = preflight(cfg, machine=machine)
             except (UsageError, CommandError, OSError, subprocess.SubprocessError) as exc:  # unresolvable, unstartable or timed-out CLI
                 result = {"at": now_iso(), "project": cfg["project_id"], "machine": machine_facts(cfg, machine),

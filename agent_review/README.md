@@ -178,12 +178,17 @@ profile and sets it per project.
 
 Loading a project expands its Claude config directory, Codex home and
 executables once (environment templates included, so `%TOOL%` naming a command
-is stored as that command, and an explicit relative executable path is anchored
-to an absolute one), so the values an enrollment pins keep their meaning
-whatever environment or directory a later controller instance runs in. An
-absolute directory or executable is then used exactly as written; it is never
-expanded again. A project's empty `developer.config_dir` keeps its established
-meaning: Claude Code's standard directory.
+is stored as that command, and an explicit relative or current-drive-rooted
+executable path is anchored to a full path with its drive), so the values an
+enrollment pins keep their meaning whatever environment or directory a later
+controller instance runs in. The load marks each role section it pinned, and
+the controller uses those values exactly as written; it never expands them
+again. Values it did not pin (the GitHub client's `gh`, and the raw settings of
+an enrollment made before this release, including after a bare `activate`) are
+expanded as before. An anchored executable without an extension still finds,
+for example, `codex.cmd` at that location if the tool is installed later. A
+project's empty `developer.config_dir` keeps its established meaning: the
+inherited `CLAUDE_CONFIG_DIR` when set, otherwise `~/.claude`.
 
 A value that would still contain an unresolved variable after expansion
 (`C:/x/%UNSET%/codex`, `%Review Slot%`, `${NAME}`), a blank value, or a
@@ -192,8 +197,9 @@ relative or self-referencing directory is refused:
 - in `machine.json`, by the profile loader, so every command that loads a
   project (including `check-project`) stops with that refusal;
 - in a project config, at `enroll` and `activate --refresh-project` before
-  anything changes; `check-project` still loads such a project and lists the
-  value under `machine_problems`. An enrollment pins that effective configuration and the
+  anything changes, and by `preflight` before it launches either role;
+  `check-project` still loads such a project and lists the value under
+  `machine_problems` (and `invalid_values`) without changing its result. An enrollment pins that effective configuration and the
 profile identity it was loaded under. If the profile changes later, `status` (and the next `review`
 result) reports `machine_profile.changed: true`, and the enrollment keeps using
 its pinned values. Adopting the new profile is an owner decision between runs:
