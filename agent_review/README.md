@@ -176,8 +176,11 @@ A machine whose projects need different Claude config directories (for example
 a work account for one repository) leaves `developer.config_dir` out of the
 profile and sets it per project.
 
-An enrollment pins the effective configuration and the profile identity it was
-loaded under. If the profile changes later, `status` (and the next `review`
+Loading a project expands its Claude config directory, Codex home and any
+executable given as a path once (environment templates included), so the values
+an enrollment pins keep their meaning whatever environment a later controller
+instance inherits. An enrollment pins that effective configuration and the
+profile identity it was loaded under. If the profile changes later, `status` (and the next `review`
 result) reports `machine_profile.changed: true`, and the enrollment keeps using
 its pinned values. Adopting the new profile is an owner decision between runs:
 
@@ -187,7 +190,9 @@ python C:/Dev/agent-review/agent_review.py activate --enrollment <id> --refresh-
 
 Bare executable names (`claude`, `codex`, `gh`) are looked up only in PATH's
 absolute directories, never in the current directory, so a file in a worktree
-cannot stand in for them. Every Codex process the controller starts runs with
+cannot stand in for them. An explicit relative path in a project config (not
+allowed in the profile) still names the file relative to the invoking
+directory, resolved to an absolute path. Every Codex process the controller starts runs with
 `CODEX_HOME` set to the configured `reviewer.codex_home`, whatever `CODEX_HOME`
 the shell inherits, so the reviewer writes the rollout the controller verifies.
 Give reviews a dedicated Codex home and sign it in once. From Claude Code's `!`
@@ -204,6 +209,11 @@ python agent_review/agent_review.py install --dest C:/Dev/agent-review
 python C:/Dev/agent-review/agent_review.py check-project --project <name> --repo C:/Dev/<repo>   # reports the resolved executables, Claude config dir, Codex home and applied profile
 python C:/Dev/agent-review/agent_review.py preflight --project <name>                          # one real Opus and one real Astra call
 ```
+
+`check-project` lists missing local tools under `machine_problems`; they do not
+change its result, which still reflects the repository, GitHub and policy
+checks. `preflight` fails when a configured CLI cannot be resolved or started,
+and its output (and `--out` file) still carries the machine report.
 
 A gate that runs much slower on the new machine (for example while antivirus
 scans the test suite's temporary Git repositories) needs a larger

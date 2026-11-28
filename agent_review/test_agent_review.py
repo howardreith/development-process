@@ -1201,7 +1201,7 @@ class GeneralRepositoryTests(unittest.TestCase):
         self.assertEqual(["CLAUDE.md"], cfg["instructions"])
         self.assertIn("Bash(npm test*)", cfg["developer"]["permissions"]["allow"])
         self.assertNotIn("push_command", cfg)
-        self.assertEqual(cfg, ar.load_project("another-repo", env.wf))
+        self.assertEqual(ar.pin_machine_values(cfg), ar.load_project("another-repo", env.wf))  # directories pinned
         with self.assertRaises(ar.UsageError):
             ar.init_project(args, root=env.wf, github_factory=FakeRepoGitHub)  # no silent overwrite
 
@@ -1309,8 +1309,8 @@ class MachinePortabilityTests(unittest.TestCase):
         with contextlib.chdir(env.work), mock.patch.dict(os.environ, {"PATH": str(env.root / "empty")}):
             with self.assertRaises(ar.UsageError):
                 ar.resolve_exe("claude-sim")  # present only in the working directory
-            with self.assertRaises(ar.UsageError):
-                ar.resolve_exe(".\\claude-sim.cmd")  # relative paths are neither commands nor absolute
+            # R2-F2: an explicit relative path still names that file, resolved to an unambiguous absolute path
+            self.assertEqual(str(planted), ar.resolve_exe(".\\claude-sim.cmd"))
 
     def test_machine_profile_replaces_only_machine_facts(self):
         before = ar.load_project(self.project, self.env.wf)
@@ -1318,7 +1318,7 @@ class MachinePortabilityTests(unittest.TestCase):
         self.write_profile(developer={"executable": "claude", "config_dir": "%USERPROFILE%/.claude"},
                            reviewer={"codex_home": self.review_home})
         after, identity = ar.load_project_effective(self.project, self.env.wf)
-        self.assertEqual(("claude", "%USERPROFILE%/.claude", self.review_home),
+        self.assertEqual(("claude", str(Path.home() / ".claude"), self.review_home),
                          (after["developer"]["executable"], after["developer"]["config_dir"],
                           after["reviewer"]["codex_home"]))
         self.assertEqual(str(ar.machine_profile_path()), identity["path"])
@@ -1332,7 +1332,8 @@ class MachinePortabilityTests(unittest.TestCase):
         self.assertEqual(before, after)  # nothing but the machine facts changed
         self.write_profile(reviewer={"codex_home": self.review_home})  # a partial profile keeps the other facts
         partial = ar.load_project(self.project, self.env.wf)
-        self.assertEqual(ar.read_json(self.project)["developer"]["executable"], partial["developer"]["executable"])
+        self.assertEqual(ar.expand(ar.read_json(self.project)["developer"]["executable"]),  # pinned as expanded
+                         partial["developer"]["executable"])
 
     def test_machine_profile_cannot_change_policy(self):
         for bad in ({"developer": {"model": "sonnet"}}, {"developer": {"effort": "low"}},
@@ -1467,7 +1468,102 @@ class MachinePortabilityTests(unittest.TestCase):
         args.claude_executable, args.claude_config_dir = "E:/claude.exe", "E:/cfg"
         _, cfg = ar.init_project(args, root=env.wf, github_factory=FakeOnboardingGitHub)
         self.assertEqual(("E:/claude.exe", "E:/cfg"), (cfg["developer"]["executable"], cfg["developer"]["config_dir"]))
-        self.assertEqual("D:/claude-config", ar.load_project("another-repo", env.wf)["developer"]["config_dir"])
+        self.assertEqual(str(Path("D:/claude-config")),
+                         ar.load_project("another-repo", env.wf)["developer"]["config_dir"])
+
+    def test_directory_templates_are_pinned_when_the_configuration_is_loaded(self):
+        """R1-F3: a home derived from an environment variable keeps the value it had at enrollment."""
+        first, second = self.env.root / "first", self.env.root / "second"
+        reviewer = dict(ar.read_json(HERE / "projects" / "kingmaker-gunslinger.json")["reviewer"],
+                        codex_home="%AR_TEST_REVIEW_ROOT%/codex")
+        with mock.patch.dict(os.environ, {"AR_TEST_REVIEW_ROOT": str(first)}):
+            env = Env("foreground", cfg_overrides={"push_command": None, "reviewer": reviewer})
+            self.addCleanup(env.cleanup)
+            self.write_profile(reviewer={"codex_home": "%AR_TEST_REVIEW_ROOT%/profile-codex"})
+            developer, smoke_reviewer = __import__("test_live_smoke").smoke_machine_config(
+                ar.read_json(HERE / "projects" / "kingmaker-gunslinger.json"))
+        self.assertEqual(str(first / "codex"), ar.read_json(env.dir / "state.json")["project"]["reviewer"]["codex_home"])
+        with mock.patch.dict(os.environ, {"AR_TEST_REVIEW_ROOT": str(second)}):
+            ctl = env.controller()  # a later controller instance inherits a different value
+            rev = ar.CodexReviewer({**ctl.cfg["reviewer"], "executable": sys.executable})
+            self.assertEqual(first / "codex", rev.home)  # provenance root
+            self.assertEqual(str(first / "codex"), rev.env()["CODEX_HOME"])  # child home
+            self.assertEqual(str(first / "profile-codex"), smoke_reviewer["codex_home"])  # captured for the smoke
+
+    def check_fixture(self, **cfg_changes):
+        """A user-local project for check-project with simulated GitHub (the external boundary)."""
+        env = self.env
+        git(env.work, "remote", "set-url", "origin", "https://github.com/owner/repo.git")
+        gh = self.command_shim(env.root / "gh-shim", "gh-sim", [
+            "import json, sys",
+            "args = sys.argv[1:]",
+            "print(json.dumps({'login': 'owner'} if args[:2] == ['api', 'user'] else",
+            "                 {'defaultBranchRef': {'name': 'master'}, 'viewerPermission': 'ADMIN'}))"])
+        cfg = ar.read_json(self.project)
+        cfg.update(allowed_remote_urls=["https://github.com/owner/repo.git"], gh=str(gh), instructions=[], gates={},
+                   required_gates=[], default_target_branch="master")
+        cfg.update(cfg_changes)
+        cfg["developer"]["executable"] = str(env.root / "absent" / "claude.exe")
+        cfg["reviewer"]["codex_home"] = str(env.root / "absent-codex-home")
+        ar.atomic_write_json(Path(os.environ["AGENT_REVIEW_HOME"]) / "projects" / "check-fixture.json", cfg)
+
+    def run_cli(self, *argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = ar.main(list(argv))
+        return code, json.loads(out.getvalue())
+
+    def test_local_availability_does_not_change_the_check_project_result(self):
+        """R1-F7: no profile, absent model executable and Codex home: reported, and the check still passes."""
+        self.check_fixture()
+        code, out = self.run_cli("check-project", "--project", "check-fixture", "--repo", str(self.env.work))
+        self.assertEqual(ar.EXIT_OK, code, out["problems"])
+        self.assertEqual([], out["problems"])
+        self.assertIsNone(out["machine_profile"])
+        self.assertIn("does not exist", out["developer_executable"]["problem"])
+        self.assertEqual(str(self.env.root / "absent-codex-home"), out["codex_home"]["path"])
+        self.assertEqual(2, len(out["machine_problems"]))
+        self.check_fixture(allowed_remote_urls=["https://github.com/owner/elsewhere.git"])  # a repository failure
+        code, out = self.run_cli("check-project", "--project", "check-fixture", "--repo", str(self.env.work))
+        self.assertEqual(ar.EXIT_BLOCKED, code)
+        self.assertTrue(any("origin" in p for p in out["problems"]))
+
+    def test_preflight_reports_the_machine_when_a_cli_is_missing(self):
+        """R2-F1: nothing is launched; the machine report reaches stdout and --out."""
+        self.check_fixture()
+        target = self.env.root / "preflight.json"
+        code, out = self.run_cli("preflight", "--project", "check-fixture", "--out", str(target))
+        self.assertEqual(ar.EXIT_BLOCKED, code)
+        self.assertFalse(out["ok"])
+        self.assertIn("error", out)
+        self.assertIn("does not exist", out["machine"]["developer_executable"]["problem"])
+        self.assertEqual(out, ar.read_json(target))
+
+    def test_explicit_relative_tool_paths_still_work_without_a_profile(self):
+        """R2-F2: a simulated gh named by a relative path, from the same invocation directory as before."""
+        env = self.env
+        gh = self.command_shim(env.root / "tools", "gh-sim", ["import json", "print(json.dumps({'login': 'owner'}))"])
+        with contextlib.chdir(env.root):
+            client = ar.GitHub("owner/repo", gh="tools\\gh-sim.cmd")
+            self.assertEqual(str(gh), client.gh)
+            self.assertEqual("owner", client.viewer())
+
+    def test_init_project_refuses_unstable_flags_before_writing(self):
+        """R2-F3."""
+        env = self.env
+        git(env.work, "remote", "set-url", "origin", "https://github.com/owner/another-repo.git")
+        args = argparse.Namespace(repo=str(env.work), name="another-repo", branch_prefix="claude/", allow=[],
+                                  push_command=None, claude_config_dir=None, claude_executable=None, force=True)
+        path, _ = ar.init_project(args, root=env.wf, github_factory=FakeOnboardingGitHub)
+        before = path.read_bytes()
+        for flags in ({"claude_config_dir": "%CLAUDE_CONFIG_DIR%"}, {"claude_config_dir": "relative/cfg"},
+                      {"claude_executable": "bin\\claude.exe"}):
+            for key, value in flags.items():
+                setattr(args, key, value)
+            with self.assertRaises(ar.UsageError, msg=flags):
+                ar.init_project(args, root=env.wf, github_factory=FakeOnboardingGitHub)
+            self.assertEqual(before, path.read_bytes())
+            args.claude_config_dir = args.claude_executable = None
 
     def test_nima_rule_matches_path_components(self):
         """R1-F6: a descendant of C:\\Dev\\nima, not a similarly named sibling."""

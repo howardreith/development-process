@@ -77,8 +77,9 @@ else:
 
 def smoke_machine_config(base):
     """The fixture's developer and reviewer settings under the owner's machine profile, read from the owner's agent
-    home before the fixture switches to its own isolated one (where no profile exists)."""
-    effective = ar.apply_machine_profile(base, ar.load_machine_profile())
+    home before the fixture switches to its own isolated one (where no profile exists), with the machine values
+    expanded there, as an enrollment pins them."""
+    effective = ar.pin_machine_values(ar.apply_machine_profile(base, ar.load_machine_profile()))
     return effective["developer"], effective["reviewer"]
 
 

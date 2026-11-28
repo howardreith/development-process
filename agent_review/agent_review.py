@@ -216,8 +216,11 @@ def resolve_exe(name: str) -> str:
     candidate = expand(name)
     if os.path.isabs(candidate):
         return candidate
-    if not is_command_name(candidate):
-        raise UsageError(f"Executable {name} must be a command name found on PATH or an absolute path")
+    if not is_command_name(candidate):  # an explicit relative path is checked as given, never searched for
+        found = shutil.which(candidate)
+        if not found:
+            raise UsageError(f"Executable not found: {name}")
+        return os.path.abspath(found)
     found = find_on_path(candidate)
     if not found:
         raise UsageError(f"Executable not found on PATH: {name}")
@@ -5489,14 +5492,38 @@ def load_machine_profile():
                 raise UsageError(f"machine profile {path}: '{section}.{key}' is not a machine setting")
             if not isinstance(value, str) or not value.strip():
                 raise UsageError(f"machine profile {path}: '{section}.{key}' must be a non-empty string")
-            if key == "executable":
-                if not (is_command_name(expand(value)) or os.path.isabs(expand(value))):
-                    raise UsageError(f"machine profile {path}: '{section}.{key}' must be a command name or an "
-                                     "absolute path")
-            else:
-                stable_dir(value, {"config_dir": "CLAUDE_CONFIG_DIR", "codex_home": "CODEX_HOME"}[key],
-                           f"machine profile {path}: '{section}.{key}'")
+            validate_machine_value(key, value, f"machine profile {path}: '{section}.{key}'")
     return profile
+
+
+def validate_machine_value(key, value, label):
+    """The machine-value grammar: an executable is a command name or an absolute path; a directory is stable."""
+    if key == "executable":
+        if not (is_command_name(expand(value)) or os.path.isabs(expand(value))):
+            raise UsageError(f"{label} must be a command name or an absolute path")
+    else:
+        stable_dir(value, {"config_dir": "CLAUDE_CONFIG_DIR", "codex_home": "CODEX_HOME"}[key], label)
+
+
+def pin_machine_values(cfg):
+    """The machine directories, and an executable given as a path, expanded once when the configuration is loaded,
+    so the values an enrollment pins keep their meaning whatever environment later controller instances inherit. A
+    value that cannot be made stable is left as configured; the reviewer and developer boundaries refuse it."""
+    cfg = json.loads(json.dumps(cfg))
+    dev, rev = cfg["developer"], cfg["reviewer"]
+    for section, key, var, default in ((dev, "config_dir", "CLAUDE_CONFIG_DIR", None),
+                                       (rev, "codex_home", "CODEX_HOME", "~/.codex")):
+        value = section.get(key, default)
+        if value:
+            try:
+                section[key] = str(stable_dir(value, var, key))
+            except UsageError:
+                pass
+    for section in (dev, rev):
+        exe = expand(section["executable"]) if section.get("executable") else None
+        if exe and os.path.isabs(exe):
+            section["executable"] = exe
+    return cfg
 
 
 def machine_identity(profile):
@@ -5551,7 +5578,7 @@ def load_project_effective(name_or_path, root=HERE):
     if cfg.get("schema_version") != "agent-review.project.v1":
         raise UsageError(f"{path} is not an agent-review project config")
     profile = load_machine_profile()
-    cfg = apply_machine_profile(cfg, profile)
+    cfg = pin_machine_values(apply_machine_profile(cfg, profile))
     check_policy(cfg)
     unknown = sorted(set(project_required_gates(cfg)) - set(cfg.get("gates") or {}))
     if unknown:
@@ -6069,12 +6096,14 @@ def check_project(cfg, repo, machine=None):
         check_policy(cfg)
     except UsageError as exc:
         problems.append(str(exc))
+    # local availability is reported beside, not in, the problems that decide this command's result
     facts.update(machine_facts(cfg, machine))
-    for key in ("developer_executable", "reviewer_executable", "claude_config_dir", "codex_home"):
-        if facts[key].get("problem"):
-            problems.append(f"{key}: {facts[key]['problem']}")
+    facts["machine_problems"] = [f"{key}: {facts[key]['problem']}" for key in
+                                 ("developer_executable", "reviewer_executable", "claude_config_dir", "codex_home")
+                                 if facts[key].get("problem")]
     if facts["codex_home"]["path"] and not Path(facts["codex_home"]["path"]).is_dir():
-        problems.append(f"codex_home: {facts['codex_home']['path']} does not exist (sign it in with codex login)")
+        facts["machine_problems"].append(f"codex_home: {facts['codex_home']['path']} does not exist "
+                                         "(sign it in with codex login)")
     facts["branch_pattern"] = cfg["branch_pattern"]
     facts["push"] = "repository wrapper" if cfg.get("push_command") else "built-in guarded push"
     facts["gates"] = sorted(cfg.get("gates") or {})
@@ -6134,6 +6163,8 @@ def init_project(args, root=HERE, github_factory=GitHub):
     }
     if args.push_command:
         cfg["push_command"] = json.loads(args.push_command)
+    for section, key in (("developer", "executable"), ("developer", "config_dir"), ("reviewer", "codex_home")):
+        validate_machine_value(key, cfg[section][key], f"init-project {section}.{key}")  # before any write
     check_policy(cfg)
     atomic_write_json(target, cfg)
     return target, cfg
@@ -6835,11 +6866,17 @@ def dispatch(args, root=HERE):
             return EXIT_OK if result["ok"] else EXIT_BLOCKED
         if args.command == "preflight":
             cfg, machine = load_project_effective(args.project)
-            result = preflight(cfg, machine=machine)
+            try:
+                result = preflight(cfg, machine=machine)
+            except (UsageError, CommandError, OSError) as exc:  # e.g. a configured CLI cannot be resolved or started
+                result = {"at": now_iso(), "project": cfg["project_id"], "machine": machine_facts(cfg, machine),
+                          "ok": False, "error": f"{type(exc).__name__}: {exc}"}
             text = json.dumps(result, indent=2)
             if args.out:
                 write_text(args.out, text + "\n")
             print(text)
+            if result.get("error"):
+                return EXIT_BLOCKED
             isolation = result["developer"]["permission_isolation"]["ok"] is not False  # None: nothing to probe
             return EXIT_OK if result["developer"]["ok"] and isolation and result["reviewer"]["ok"] else EXIT_BLOCKED
         if args.command == "init-project":
