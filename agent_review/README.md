@@ -145,18 +145,129 @@ handoff is re-checked after posting the receipt and after editing the PR body;
 `status --remote` re-runs the same checks (including the receipt) to tell
 whether a handoff is still current, and `resume` reopens a superseded one.
 
+## Setting up a new machine
+
+Project configs name machine facts: where Claude Code is installed
+(`developer.executable`), its config directory (`developer.config_dir`) and
+the reviewer's Codex home (`reviewer.codex_home`). The shipped configs record
+the original machine's values. On another machine, put that machine's values
+in an optional **machine profile**, `~/.agent-review/machine.json` (under
+`AGENT_REVIEW_HOME` when that is set):
+
+```json
+{
+  "schema_version": "agent-review.machine.v1",
+  "developer": {"executable": "claude", "config_dir": "%USERPROFILE%/.claude"},
+  "reviewer": {"codex_home": "~/.codex"}
+}
+```
+
+`schema_version` is required; each of the three settings is optional, so the
+smallest useful profile is `{"schema_version": "agent-review.machine.v1",
+"reviewer": {"codex_home": "~/.codex"}}`. When the file exists, its values
+replace those keys in every project config the controller loads, shipped or
+user-local. Nothing else can be set there: models, effort, permissions, gates,
+limits, unknown keys, duplicate JSON members and a file that resolves outside
+the agent home (through a link) are refused. `executable` is a command name or
+an absolute path; `config_dir` and `codex_home` must expand (`~`,
+`%USERPROFILE%`) to absolute directories and may not refer to the variable they
+set (`%CLAUDE_CONFIG_DIR%`, `%CODEX_HOME%`). Without a profile nothing changes.
+A machine whose projects need different Claude config directories (for example
+a work account for one repository) leaves `developer.config_dir` out of the
+profile and sets it per project.
+
+Loading a project expands its Claude config directory, Codex home and
+executables once (environment templates included, so `%TOOL%` naming a command
+is stored as that command, and an explicit relative or current-drive-rooted
+executable path is anchored to a full path with its drive, naming the installed
+file the matcher selects at that moment when one exists; such a selected file is
+later launched by that exact filename, whatever PATHEXT lists then), so the values an
+enrollment pins keep their meaning whatever environment or directory a later
+controller instance runs in. The load marks each role section it pinned, and
+the controller uses those values exactly as written; it never expands them
+again. Values it did not pin (the GitHub client's `gh`, and the raw settings of
+an enrollment made before this release, including after a bare `activate`) are
+expanded as before. Executable names are matched as Windows does: a name that
+already carries an executable extension (`.exe`, `.cmd`, `.bat`, `.com` or any
+PATHEXT entry) is exact, whether absolute, relative or bare, whatever PATHEXT
+lists; a command stem (`codex`) is completed with PATHEXT, so it still finds,
+for example, `codex.cmd` installed there later even if a directory or
+extensionless file shares the stem. When no suffixed sibling exists, the
+configured path itself is used, and `check-project` reports it as missing if it
+is not a regular file. Bare names search only fully qualified PATH directories.
+A machine field present with a non-string or empty value is reported and
+refused like any other invalid value; an omitted field keeps its default. A
+project's empty or null `developer.config_dir` keeps its established meaning: the
+inherited `CLAUDE_CONFIG_DIR` when set, otherwise `~/.claude`.
+
+A value that would still contain an unresolved variable after expansion
+(`C:/x/%UNSET%/codex`, `%Review Slot%`, `${NAME}`), a blank value, or a
+relative or self-referencing directory is refused:
+
+- in `machine.json`, by the profile loader, so every command that loads a
+  project (including `check-project`) stops with that refusal;
+- in a project config, at `enroll` and `activate --refresh-project` before
+  anything changes, and by `preflight` before it launches either role;
+  `check-project` still loads such a project and lists the value under
+  `machine_problems` (and `invalid_values`) without changing its result. An enrollment pins that effective configuration and the
+profile identity it was loaded under. If the profile changes later, `status` (and the next `review`
+result) reports `machine_profile.changed: true`, and the enrollment keeps using
+its pinned values. Adopting the new profile is an owner decision between runs:
+
+```powershell
+python C:/Dev/agent-review/agent_review.py activate --enrollment <id> --refresh-project <project>
+```
+
+Bare executable names (`claude`, `codex`, `gh`) are looked up only in PATH's
+absolute directories, never in the current directory, so a file in a worktree
+cannot stand in for them. An explicit relative path in a project config (not
+allowed in the profile) still names the file relative to the invoking
+directory, resolved to an absolute path. Every Codex process the controller starts runs with
+`CODEX_HOME` set to the configured `reviewer.codex_home`, whatever `CODEX_HOME`
+the shell inherits, so the reviewer writes the rollout the controller verifies.
+Give reviews a dedicated Codex home and sign it in once. From Claude Code's `!`
+prefix (a bash shell):
+
+```bash
+CODEX_HOME="$HOME/.codex" codex login
+```
+
+Then, from a reviewed checkout (see the install section below):
+
+```powershell
+python agent_review/agent_review.py install --dest C:/Dev/agent-review
+python C:/Dev/agent-review/agent_review.py check-project --project <name> --repo C:/Dev/<repo>   # reports the resolved executables, Claude config dir, Codex home and applied profile
+python C:/Dev/agent-review/agent_review.py preflight --project <name>                          # one real Opus and one real Astra call
+```
+
+`check-project` lists missing local tools under `machine_problems`; they do not
+change its result, which still reflects the repository, GitHub and policy
+checks. The machine report is printed even when those checks fail early (not a
+Git repository, no origin, `gh` missing). `preflight` fails when a configured
+CLI cannot be resolved, started or finished in time, and its output (and
+`--out` file) still carries the machine report; its temporary work directory is
+removed either way.
+
+A gate that runs much slower on the new machine (for example while antivirus
+scans the test suite's temporary Git repositories) needs a larger
+`timeout_minutes` in a user-local copy of its project config.
+
 ## Onboarding a repository
 
 ```powershell
 $ar = 'C:/Dev/agent-review/agent_review.py'
-python $ar init-project --repo C:/Dev/<repo> --name <name> [--branch-prefix claude/] [--allow "npm test"] [--push-command '[...]']
+python $ar init-project --repo C:/Dev/<repo> --name <name> [--branch-prefix claude/] [--allow "npm test"] [--push-command '[...]'] [--claude-executable <path>] [--claude-config-dir <dir>]
 # add "gates" (id -> argv, optional extra_args_pattern, timeout_minutes) and protected-path denials, then:
 python $ar check-project --project <name> --repo C:/Dev/<repo>
 python $ar preflight --project <name>
 ```
 
 Shipped configs belong in `projects/` here (reviewed); `init-project` writes
-user-local ones to `~/.agent-review/projects/`. A project with
+user-local ones to `~/.agent-review/projects/`. It takes the Claude Code
+executable and config directory from its flags, otherwise from the machine
+profile, otherwise `claude` on PATH with `config_dir` `~/.claude`, written
+explicitly so an inherited `CLAUDE_CONFIG_DIR` cannot redirect it (a repository
+in or below `C:\Dev\nima` keeps `%USERPROFILE%/.claude`). A project with
 `"enrollment_allowed": false` can be checked but never enrolled.
 
 Required gates: a project's `required_gates` (by default every declared gate)

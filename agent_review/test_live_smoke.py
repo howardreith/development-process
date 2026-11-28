@@ -75,11 +75,23 @@ else:
 '''
 
 
+def smoke_machine_config(base):
+    """The fixture's developer and reviewer settings under the owner's machine profile, read from the owner's agent
+    home before the fixture switches to its own isolated one (where no profile exists), with the machine values
+    expanded there, as an enrollment pins them."""
+    effective = ar.pin_machine_values(ar.apply_machine_profile(base, ar.load_machine_profile()))
+    unstable = ar.machine_value_problems(effective)
+    if unstable:  # the same refusal an enrollment applies
+        raise ar.UsageError("smoke fixture refused: " + "; ".join(unstable))
+    return effective["developer"], effective["reviewer"]
+
+
 @unittest.skipUnless(os.environ.get("AGENT_REVIEW_LIVE") == "1", "live model smoke; set AGENT_REVIEW_LIVE=1")
 class LiveHeadlessSmoke(unittest.TestCase):
     def test_real_models_headless_cycle_with_simulated_github(self):
         base = ar.read_json(Path(__file__).resolve().parent / "projects" / "kingmaker-gunslinger.json")
-        developer = dict(base["developer"], permissions=EXTRA_PERMISSIONS, soft_deadline_minutes=30)
+        machine_developer, machine_reviewer = smoke_machine_config(base)
+        developer = dict(machine_developer, permissions=EXTRA_PERMISSIONS, soft_deadline_minutes=30)
         limits = dict(base["limits"], max_review_rounds_per_checkpoint=2, max_developer_invocations=4,
                       retry_backoff_seconds=[10, 30])
         # No push_command: the developer uses the controller's built-in guarded push helper (general-repo path).
@@ -93,7 +105,8 @@ class LiveHeadlessSmoke(unittest.TestCase):
         shim = shim_dir / "gh-sim.cmd"
         shim.write_text(f'@"{sys.executable}" "{shim_dir / "fake_gh.py"}" %*\n', encoding="utf-8")
         env = Env("headless", cfg_overrides={"push_command": None, "developer": developer, "limits": limits,
-                                             "instructions": [], "gates": gates, "gh": str(shim)},
+                                             "instructions": [], "gates": gates, "gh": str(shim),
+                                             "reviewer": machine_reviewer},
                   plan=PLAN, mission_text=MISSION, extra_files={".gitignore": "__pycache__/\n"})
         self.addCleanup(env.cleanup)
         (shim_dir / "fake-gh.json").write_text(json.dumps({"origin": str(env.origin), "branch": env.branch,

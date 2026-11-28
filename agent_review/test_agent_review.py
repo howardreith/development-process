@@ -1201,7 +1201,7 @@ class GeneralRepositoryTests(unittest.TestCase):
         self.assertEqual(["CLAUDE.md"], cfg["instructions"])
         self.assertIn("Bash(npm test*)", cfg["developer"]["permissions"]["allow"])
         self.assertNotIn("push_command", cfg)
-        self.assertEqual(cfg, ar.load_project("another-repo", env.wf))
+        self.assertEqual(ar.pin_machine_values(cfg), ar.load_project("another-repo", env.wf))  # directories pinned
         with self.assertRaises(ar.UsageError):
             ar.init_project(args, root=env.wf, github_factory=FakeRepoGitHub)  # no silent overwrite
 
@@ -1210,6 +1210,810 @@ class GeneralRepositoryTests(unittest.TestCase):
         named = ar.plan_for_mission(plan, Path("C:/Dev/x/ADD-SEARCH-MISSION.md"))
         self.assertEqual(("add-search-mission", "ADD-SEARCH-MISSION"), (named["mission_id"], named["title"]))
         self.assertEqual("black-tentacles", ar.plan_for_mission(ar.load_plan("black-tentacles"), Path("m.md"))["mission_id"])
+
+
+class FakeOnboardingGitHub:
+    """Simulated GitHub boundary for init-project."""
+
+    def __init__(self, slug):
+        self.slug = slug
+
+    def viewer(self):
+        return "owner"
+
+    def _json(self, *args):
+        return {"defaultBranchRef": {"name": "main"}}
+
+
+class MachinePortabilityTests(unittest.TestCase):
+    """Machine facts (where Claude Code runs, its config directory, the reviewer's Codex home) come from the owner's
+    machine profile, and every Codex process runs in the configured home whatever CODEX_HOME it inherits."""
+
+    def setUp(self):
+        self.env = Env("foreground", cfg_overrides={"push_command": None})
+        self.addCleanup(self.env.cleanup)
+        self.project = str(self.env.wf / "projects" / "test.json")
+        self.review_home = str(self.env.root / "review-home")
+
+    def write_profile(self, **sections):
+        ar.atomic_write_json(ar.machine_profile_path(), {"schema_version": ar.MACHINE_SCHEMA, **sections})
+
+    def command_shim(self, folder, name, script_lines):
+        """A simulated CLI (the external boundary): `name`.cmd running a small Python script."""
+        folder.mkdir(parents=True, exist_ok=True)
+        script = folder / f"{name}.py"
+        script.write_text("\n".join(script_lines + [""]), encoding="utf-8")
+        shim = folder / f"{name}.cmd"
+        shim.write_text(f'@"{sys.executable}" "{script}" %*\n', encoding="utf-8")
+        return shim
+
+    def test_reviewer_processes_run_in_the_configured_codex_home(self):
+        env = self.env
+        calls = env.root / "codex-calls.jsonl"
+        shim = self.command_shim(env.root / "codex-shim", "codex", [  # records the home each process started in
+            "import json, os, sys",
+            "if 'exec' in sys.argv:",
+            "    sys.stdin.read()",
+            f"open({str(calls)!r}, 'a').write(json.dumps([os.environ.get('CODEX_HOME'), sys.argv[1:3]]) + chr(10))",
+            "print('codex-cli simulated' if '--version' in sys.argv else 'Logged in (simulated)')"])
+        rev = ar.CodexReviewer({"executable": str(shim), "codex_home": self.review_home, "model": "m",
+                                "effort": "high"})
+        work = env.root / "review-work"
+        work.mkdir()
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(env.root / "another-projects-home")}):
+            self.assertEqual("codex-cli simulated", rev.version())
+            self.assertEqual("Logged in (simulated)", rev.auth_route())
+            rev.run("prompt", work, work / "schema.json", work / "result.json", work / "events.jsonl",
+                    work / "stderr.txt", 60, skip_git=True)
+        seen = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([["--version"], ["login", "status"], ["-a", "never"]], [args for _, args in seen])
+        self.assertEqual([self.review_home] * 3, [home for home, _ in seen])
+
+    def test_configured_directories_never_follow_the_calling_shell(self):
+        """R1-F3: a home defined through the variable it sets, or a relative one, is refused; home forms work."""
+        env = self.env
+        for value in ("%CODEX_HOME%", "%codex_home%/reviews", "$CODEX_HOME", "${CODEX_HOME}/x"):
+            for inherited in (env.root / "home-a", env.root / "home-b"):
+                with mock.patch.dict(os.environ, {"CODEX_HOME": str(inherited)}), \
+                        self.assertRaises(ar.UsageError, msg=value):
+                    ar.CodexReviewer({"executable": sys.executable, "codex_home": value, "model": "m", "effort": "high"})
+        for cwd in (env.work, env.root):
+            with contextlib.chdir(cwd):
+                with self.assertRaises(ar.UsageError):
+                    ar.CodexReviewer({"executable": sys.executable, "codex_home": "relative/home", "model": "m",
+                                      "effort": "high"})
+                with self.assertRaises(ar.UsageError):
+                    ar.claude_config_dir({"config_dir": "relative-claude"})
+                with self.assertRaises(ar.UsageError):
+                    ar.claude_config_dir({"config_dir": "%CLAUDE_CONFIG_DIR%"})
+        for value in ("~/.codex", "%USERPROFILE%/.codex"):
+            home = ar.CodexReviewer({"executable": sys.executable, "codex_home": value, "model": "m",
+                                     "effort": "high"}).home
+            self.assertEqual(Path.home() / ".codex", home)
+        for bad in ({"reviewer": {"codex_home": "%CODEX_HOME%"}}, {"reviewer": {"codex_home": "rel/home"}},
+                    {"developer": {"config_dir": "${CLAUDE_CONFIG_DIR}"}}, {"developer": {"executable": "bin/claude"}}):
+            self.write_profile(**bad)
+            with self.assertRaises(ar.UsageError, msg=bad):
+                ar.load_project(self.project, env.wf)
+
+    def test_bare_commands_resolve_from_path_never_the_working_directory(self):
+        """R1-F2: a same-named file in the worktree is not selected; the PATH directory's is."""
+        env = self.env
+        planted = self.command_shim(env.work, "claude-sim", ["print('worktree')"])
+        on_path = self.command_shim(env.root / "path-bin", "claude-sim", ["print('path')"])
+        with contextlib.chdir(env.work), mock.patch.dict(os.environ, {"PATH": str(env.root / "path-bin")}):
+            self.assertTrue(planted.is_file())
+            self.assertEqual(str(on_path), ar.resolve_exe("claude-sim"))
+            self.assertEqual(str(on_path), ar.ClaudeDeveloper({"executable": "claude-sim", "model": "opus",
+                                                               "effort": "high"}, None, None).exe)
+        with contextlib.chdir(env.work), mock.patch.dict(os.environ, {"PATH": str(env.root / "empty")}):
+            with self.assertRaises(ar.UsageError):
+                ar.resolve_exe("claude-sim")  # present only in the working directory
+            # R2-F2: an explicit relative path still names that file, resolved to an unambiguous absolute path
+            self.assertEqual(str(planted), ar.resolve_exe(".\\claude-sim.cmd"))
+
+    def test_machine_profile_replaces_only_machine_facts(self):
+        before = ar.load_project(self.project, self.env.wf)
+        self.assertNotEqual("claude", before["developer"]["executable"])
+        self.write_profile(developer={"executable": "claude", "config_dir": "%USERPROFILE%/.claude"},
+                           reviewer={"codex_home": self.review_home})
+        after, identity = ar.load_project_effective(self.project, self.env.wf)
+        self.assertEqual(("claude", str(Path.home() / ".claude"), self.review_home),
+                         (after["developer"]["executable"], after["developer"]["config_dir"],
+                          after["reviewer"]["codex_home"]))
+        self.assertEqual(str(ar.machine_profile_path()), identity["path"])
+        # R1-F9: the effective home is checked through a fixture executable, not a host Codex installation
+        self.assertEqual(Path(self.review_home),
+                         ar.CodexReviewer({**after["reviewer"], "executable": sys.executable}).home)
+        for section, keys in ar.MACHINE_KEYS.items():
+            for key in keys:
+                before[section].pop(key, None)
+                after[section].pop(key, None)
+        self.assertEqual(before, after)  # nothing but the machine facts changed
+        self.write_profile(reviewer={"codex_home": self.review_home})  # a partial profile keeps the other facts
+        partial = ar.load_project(self.project, self.env.wf)
+        self.assertEqual(ar.expand(ar.read_json(self.project)["developer"]["executable"]),  # pinned as expanded
+                         partial["developer"]["executable"])
+
+    def test_machine_profile_cannot_change_policy(self):
+        for bad in ({"developer": {"model": "sonnet"}}, {"developer": {"effort": "low"}},
+                    {"reviewer": {"model": "gpt-other"}}, {"reviewer": {"effort": "low"}},
+                    {"developer": {"permissions": {"allow": ["Bash(*)"]}}}, {"gates": {}}, {"limits": {}},
+                    {"developer": "claude"}, {"developer": {"executable": ""}}, {"reviewer": {"codex_home": 5}}):
+            self.write_profile(**bad)
+            with self.assertRaises(ar.UsageError, msg=bad):
+                ar.load_project(self.project, self.env.wf)
+        ar.atomic_write_json(ar.machine_profile_path(), {"developer": {"executable": "claude"}})  # no schema
+        with self.assertRaises(ar.UsageError):
+            ar.load_project(self.project, self.env.wf)
+        ar.machine_profile_path().write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ar.UsageError):
+            ar.load_project(self.project, self.env.wf)
+
+    def test_duplicate_members_cannot_hide_a_disallowed_setting(self):
+        """R1-F5."""
+        ar.machine_profile_path().parent.mkdir(parents=True, exist_ok=True)
+        ar.machine_profile_path().write_text(
+            '{"schema_version": "agent-review.machine.v1", "developer": {"model": "sonnet"}, '
+            '"developer": {"executable": "claude"}}', encoding="utf-8")
+        with self.assertRaises(ar.UsageError) as refused:
+            ar.load_project(self.project, self.env.wf)
+        self.assertIn("machine profile", str(refused.exception))
+        self.assertIn("duplicate", str(refused.exception))
+
+    def test_profile_resolving_outside_the_agent_home_is_refused(self):
+        """R1-F4."""
+        env = self.env
+        target = env.work / "machine.json"
+        target.write_text(json.dumps({"schema_version": ar.MACHINE_SCHEMA, "developer": {"executable": "claude"}}),
+                          encoding="utf-8")
+        ar.machine_profile_path().parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.symlink(target, ar.machine_profile_path())
+        except OSError as exc:  # creating file symlinks needs Developer Mode or the privilege on Windows
+            self.skipTest(f"symbolic links unavailable: {exc}")
+        with self.assertRaises(ar.UsageError) as refused:
+            ar.load_project(self.project, env.wf)
+        self.assertIn("outside the trusted", str(refused.exception))
+        ar.machine_profile_path().unlink()
+        self.write_profile(developer={"executable": "claude"})  # an ordinary owner-local profile loads
+        self.assertEqual("claude", ar.load_project(self.project, env.wf)["developer"]["executable"])
+
+    def test_an_enrollment_reports_a_changed_profile_and_adopts_it_only_on_refresh(self):
+        """R1-F1."""
+        env = self.env
+        env.controller().cancel("enroll again under a machine profile")
+        self.write_profile(reviewer={"codex_home": self.review_home})
+        env.dir, state = ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
+        self.assertEqual(self.review_home, state["project"]["reviewer"]["codex_home"])
+        pinned = state["machine_profile"]
+        self.assertFalse(env.controller().status()["machine_profile"]["changed"])
+        moved = str(env.root / "moved-home")
+        self.write_profile(reviewer={"codex_home": moved})
+        ctl = env.controller()
+        drift = ctl.status()["machine_profile"]
+        self.assertTrue(drift["changed"])
+        self.assertEqual(pinned, drift["pinned"])
+        self.assertIn("--refresh-project", drift["note"])
+        self.assertEqual(self.review_home, ctl.cfg["reviewer"]["codex_home"])  # the pin is still in use
+        env.reviewer.script = [{"decision": "checkpoint_passed"}]
+        ctl.accept_report(report(env, "phase-1"))
+        ctl.transition("review", "t")
+        ctl.review_round()
+        self.assertTrue(ctl.review_outcome()["machine_profile"]["changed"])  # the review result says so too
+        ctl.activate(refresh_project=self.project)
+        refreshed = env.controller()
+        self.assertEqual(moved, refreshed.cfg["reviewer"]["codex_home"])
+        self.assertFalse(refreshed.status()["machine_profile"]["changed"])
+        legacy = refreshed.state
+        del legacy["machine_profile"]  # state written before machine profiles: loads and reports, never compares
+        ar.atomic_write_json(refreshed.state_path, legacy)
+        self.assertIsNone(env.controller().status()["machine_profile"]["pinned"])
+
+    def test_machine_diagnostics_describe_the_loaded_values(self):
+        """R1-F7."""
+        env = self.env
+        shim = self.command_shim(env.root / "diag-bin", "claude-diag", ["print('simulated')"])
+        self.write_profile(developer={"executable": "claude-diag"},
+                           reviewer={"codex_home": str(env.root / "absent-home")})
+        cfg, identity = ar.load_project_effective(self.project, env.wf)
+        cfg["reviewer"]["executable"] = str(env.root / "absent" / "codex.exe")
+        ar.machine_profile_path().unlink()  # presence changes between load and reporting
+        with mock.patch.dict(os.environ, {"PATH": str(env.root / "diag-bin")}):
+            facts = ar.machine_facts(cfg, identity)
+        self.assertEqual(identity, facts["machine_profile"])
+        self.assertEqual(str(shim), facts["developer_executable"]["path"])
+        self.assertIsNone(facts["reviewer_executable"]["path"])
+        self.assertIn("does not exist", facts["reviewer_executable"]["problem"])
+        self.assertEqual(str(env.root / "absent-home"), facts["codex_home"]["path"])
+        self.assertIsNone(ar.machine_facts(ar.load_project(self.project, env.wf), None)["machine_profile"])
+
+    def test_live_smoke_fixture_receives_the_owners_machine_facts(self):
+        """R1-F8: read before the fixture switches to its isolated agent home."""
+        import test_live_smoke
+        winget = str(self.env.root / "WinGet" / "Packages" / "Anthropic.ClaudeCode" / "claude.exe")
+        self.write_profile(developer={"executable": winget}, reviewer={"codex_home": self.review_home})
+        base = ar.read_json(HERE / "projects" / "kingmaker-gunslinger.json")
+        developer, reviewer = test_live_smoke.smoke_machine_config(base)
+        self.assertEqual((winget, self.review_home), (developer["executable"], reviewer["codex_home"]))
+        self.assertEqual(base["reviewer"]["model"], reviewer["model"])
+
+    def test_developer_config_dir_follows_what_the_cli_uses(self):
+        configured = str(self.env.root / "configured")
+        self.assertEqual(Path(configured), ar.claude_config_dir({"config_dir": configured}))
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.env.root / "inherited")}):
+            self.assertEqual(self.env.root / "inherited", ar.claude_config_dir({}))
+        with mock.patch.dict(os.environ):
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            self.assertEqual(Path.home() / ".claude", ar.claude_config_dir({}))
+
+    def test_init_project_uses_flags_then_the_machine_profile_then_portable_defaults(self):
+        env = self.env
+        git(env.work, "remote", "set-url", "origin", "https://github.com/owner/another-repo.git")
+        args = argparse.Namespace(repo=str(env.work), name="another-repo", branch_prefix="claude/", allow=[],
+                                  push_command=None, claude_config_dir=None, claude_executable=None, force=True)
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(env.root / "inherited-claude")}):
+            _, cfg = ar.init_project(args, root=env.wf, github_factory=FakeOnboardingGitHub)
+            self.assertEqual(("claude", "~/.claude"), (cfg["developer"]["executable"], cfg["developer"]["config_dir"]))
+            loaded = ar.load_project("another-repo", env.wf)  # R1-F6: the inherited directory does not redirect it
+            self.assertEqual(Path.home() / ".claude", ar.claude_config_dir(loaded["developer"]))
+        self.assertEqual("~/.codex", cfg["reviewer"]["codex_home"])
+        self.write_profile(developer={"executable": "D:/tools/claude.exe", "config_dir": "D:/claude-config"},
+                           reviewer={"codex_home": self.review_home})
+        _, cfg = ar.init_project(args, root=env.wf, github_factory=FakeOnboardingGitHub)
+        self.assertEqual(("D:/tools/claude.exe", "D:/claude-config", self.review_home),
+                         (cfg["developer"]["executable"], cfg["developer"]["config_dir"],
+                          cfg["reviewer"]["codex_home"]))
+        self.assertEqual(ar.POLICY["reviewer"]["model"], cfg["reviewer"]["model"])
+        args.claude_executable, args.claude_config_dir = "E:/claude.exe", "E:/cfg"
+        _, cfg = ar.init_project(args, root=env.wf, github_factory=FakeOnboardingGitHub)
+        self.assertEqual(("E:/claude.exe", "E:/cfg"), (cfg["developer"]["executable"], cfg["developer"]["config_dir"]))
+        self.assertEqual(str(Path("D:/claude-config")),
+                         ar.load_project("another-repo", env.wf)["developer"]["config_dir"])
+
+    def test_directory_templates_are_pinned_when_the_configuration_is_loaded(self):
+        """R1-F3: a home derived from an environment variable keeps the value it had at enrollment."""
+        first, second = self.env.root / "first", self.env.root / "second"
+        reviewer = dict(ar.read_json(HERE / "projects" / "kingmaker-gunslinger.json")["reviewer"],
+                        codex_home="%AR_TEST_REVIEW_ROOT%/codex")
+        with mock.patch.dict(os.environ, {"AR_TEST_REVIEW_ROOT": str(first)}):
+            env = Env("foreground", cfg_overrides={"push_command": None, "reviewer": reviewer})
+            self.addCleanup(env.cleanup)
+            self.write_profile(reviewer={"codex_home": "%AR_TEST_REVIEW_ROOT%/profile-codex"})
+            developer, smoke_reviewer = __import__("test_live_smoke").smoke_machine_config(
+                ar.read_json(HERE / "projects" / "kingmaker-gunslinger.json"))
+        self.assertEqual(str(first / "codex"), ar.read_json(env.dir / "state.json")["project"]["reviewer"]["codex_home"])
+        with mock.patch.dict(os.environ, {"AR_TEST_REVIEW_ROOT": str(second)}):
+            ctl = env.controller()  # a later controller instance inherits a different value
+            rev = ar.CodexReviewer({**ctl.cfg["reviewer"], "executable": sys.executable})
+            self.assertEqual(first / "codex", rev.home)  # provenance root
+            self.assertEqual(str(first / "codex"), rev.env()["CODEX_HOME"])  # child home
+            self.assertEqual(str(first / "profile-codex"), smoke_reviewer["codex_home"])  # captured for the smoke
+
+    def check_fixture(self, **cfg_changes):
+        """A user-local project for check-project with simulated GitHub (the external boundary)."""
+        env = self.env
+        git(env.work, "remote", "set-url", "origin", "https://github.com/owner/repo.git")
+        gh = self.command_shim(env.root / "gh-shim", "gh-sim", [
+            "import json, sys",
+            "args = sys.argv[1:]",
+            "print(json.dumps({'login': 'owner'} if args[:2] == ['api', 'user'] else",
+            "                 {'defaultBranchRef': {'name': 'master'}, 'viewerPermission': 'ADMIN'}))"])
+        cfg = ar.read_json(self.project)
+        cfg.update(allowed_remote_urls=["https://github.com/owner/repo.git"], gh=str(gh), instructions=[], gates={},
+                   required_gates=[], default_target_branch="master")
+        cfg.update(cfg_changes)
+        cfg["developer"]["executable"] = str(env.root / "absent" / "claude.exe")
+        cfg["reviewer"]["executable"] = str(env.root / "absent" / "codex.exe")  # never the host's Codex
+        cfg["reviewer"]["codex_home"] = str(env.root / "absent-codex-home")
+        ar.atomic_write_json(Path(os.environ["AGENT_REVIEW_HOME"]) / "projects" / "check-fixture.json", cfg)
+
+    def run_cli(self, *argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = ar.main(list(argv))
+        return code, json.loads(out.getvalue())
+
+    def test_local_availability_does_not_change_the_check_project_result(self):
+        """R1-F7: no profile, absent model executable and Codex home: reported, and the check still passes."""
+        self.check_fixture()
+        code, out = self.run_cli("check-project", "--project", "check-fixture", "--repo", str(self.env.work))
+        self.assertEqual(ar.EXIT_OK, code, out["problems"])
+        self.assertEqual([], out["problems"])
+        self.assertIsNone(out["machine_profile"])
+        self.assertIn("does not exist", out["developer_executable"]["problem"])
+        self.assertEqual(str(self.env.root / "absent-codex-home"), out["codex_home"]["path"])
+        self.assertIn("does not exist", out["reviewer_executable"]["problem"])
+        self.assertEqual(3, len(out["machine_problems"]))
+        self.check_fixture(allowed_remote_urls=["https://github.com/owner/elsewhere.git"])  # a repository failure
+        code, out = self.run_cli("check-project", "--project", "check-fixture", "--repo", str(self.env.work))
+        self.assertEqual(ar.EXIT_BLOCKED, code)
+        self.assertTrue(any("origin" in p for p in out["problems"]))
+
+    def test_preflight_reports_the_machine_when_a_cli_is_missing(self):
+        """R2-F1: nothing is launched; the machine report reaches stdout and --out."""
+        self.check_fixture()
+        target = self.env.root / "preflight.json"
+        scratch = self.env.root / "isolated-temp"
+        scratch.mkdir()
+        with mock.patch.object(tempfile, "tempdir", str(scratch)):
+            code, out = self.run_cli("preflight", "--project", "check-fixture", "--out", str(target))
+        self.assertEqual([], list(scratch.iterdir()))  # R3-F5: the work directory is removed on failure
+        self.assertEqual(ar.EXIT_BLOCKED, code)
+        self.assertFalse(out["ok"])
+        self.assertIn("error", out)
+        self.assertIn("does not exist", out["machine"]["developer_executable"]["problem"])
+        self.assertEqual(out, ar.read_json(target))
+
+    def test_explicit_relative_tool_paths_still_work_without_a_profile(self):
+        """R2-F2: a simulated gh named by a relative path, from the same invocation directory as before."""
+        env = self.env
+        gh = self.command_shim(env.root / "tools", "gh-sim", ["import json", "print(json.dumps({'login': 'owner'}))"])
+        with contextlib.chdir(env.root):
+            client = ar.GitHub("owner/repo", gh="tools\\gh-sim.cmd")
+            self.assertEqual(str(gh), client.gh)
+            self.assertEqual("owner", client.viewer())
+
+    def test_init_project_refuses_unstable_flags_before_writing(self):
+        """R2-F3."""
+        env = self.env
+        git(env.work, "remote", "set-url", "origin", "https://github.com/owner/another-repo.git")
+        args = argparse.Namespace(repo=str(env.work), name="another-repo", branch_prefix="claude/", allow=[],
+                                  push_command=None, claude_config_dir=None, claude_executable=None, force=True)
+        path, _ = ar.init_project(args, root=env.wf, github_factory=FakeOnboardingGitHub)
+        before = path.read_bytes()
+        with mock.patch.dict(os.environ, {"AR_TEST_SPACES": "   "}):
+            os.environ.pop("AR_TEST_UNSET_CMD", None)
+            for flags in ({"claude_config_dir": "%CLAUDE_CONFIG_DIR%"}, {"claude_config_dir": "relative/cfg"},
+                          {"claude_executable": "bin\\claude.exe"}, {"claude_executable": "   "},
+                          {"claude_executable": "%AR_TEST_UNSET_CMD%"}, {"claude_executable": ""},
+                          {"claude_config_dir": ""}, {"claude_executable": "%AR_TEST_SPACES%"}):
+                for key, value in flags.items():
+                    setattr(args, key, value)
+                with self.assertRaises(ar.UsageError, msg=flags):
+                    ar.init_project(args, root=env.wf, github_factory=FakeOnboardingGitHub)
+                self.assertEqual(before, path.read_bytes())
+                args.claude_config_dir = args.claude_executable = None
+
+    def test_unresolved_variables_are_refused_before_enrollment(self):
+        """R1-F3: an absolute home or Claude directory containing an unset variable is never pinned."""
+        env = self.env
+        env.controller().cancel("enroll again under an unstable profile")
+        states = sorted((env.root / "state").iterdir())
+        with mock.patch.dict(os.environ):
+            os.environ.pop("AR_TEST_UNSET", None)
+            for profile in ({"reviewer": {"codex_home": str(env.root / "%AR_TEST_UNSET%" / "codex")}},
+                            {"developer": {"config_dir": str(env.root / "$AR_TEST_UNSET" / "claude")}}):
+                self.write_profile(**profile)
+                with self.assertRaises(ar.UsageError, msg=profile):  # the profile loader refuses it
+                    ar.load_project(self.project, env.wf)
+                ar.machine_profile_path().unlink()
+            reviewer = dict(ar.read_json(self.project)["reviewer"], codex_home=str(env.root / "%AR_TEST_UNSET%" / "codex"))
+            cfg = dict(ar.read_json(self.project), reviewer=reviewer)  # the same value in a project config
+            ar.atomic_write_json(self.project, cfg)
+            loaded = ar.load_project(self.project, env.wf)  # loads, for check-project to report
+            self.assertIn("%AR_TEST_UNSET%", loaded["reviewer"]["codex_home"])
+            with self.assertRaises(ar.UsageError) as refused:
+                ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
+            self.assertIn("nothing was created", str(refused.exception))
+            self.assertIn("unresolved variable", str(refused.exception))
+            self.assertEqual(states, sorted((env.root / "state").iterdir()))
+            self.write_profile(reviewer={"codex_home": str(env.root / "%AR_TEST_UNSET%" / "codex")})
+            with self.assertRaises(ar.UsageError):  # nor can the smoke fixture use it
+                __import__("test_live_smoke").smoke_machine_config(
+                    ar.read_json(HERE / "projects" / "kingmaker-gunslinger.json"))
+
+    def test_an_executable_template_naming_a_command_is_pinned(self):
+        """R3-F1: a later shell naming another command on the same PATH does not change the enrollment's."""
+        env = self.env
+        first = self.command_shim(env.root / "cmd-bin", "claude-first", ["print('first')"])
+        self.command_shim(env.root / "cmd-bin", "claude-second", ["print('second')"])
+        env.controller().cancel("enroll again under a templated executable")
+        path = str(env.root / "cmd-bin") + os.pathsep + os.environ["PATH"]  # Git stays available
+        with mock.patch.dict(os.environ, {"AR_TEST_CMD": "claude-first", "PATH": path}):
+            self.write_profile(developer={"executable": "%AR_TEST_CMD%"})
+            env.dir, state = ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
+        self.assertEqual("claude-first", state["project"]["developer"]["executable"])
+        with mock.patch.dict(os.environ, {"AR_TEST_CMD": "claude-second", "PATH": path}):
+            ctl = env.controller()
+            self.assertEqual(str(first), ar.ClaudeDeveloper(ctl.cfg["developer"], None, None).exe)
+
+    def test_check_project_keeps_the_machine_report_when_the_repository_check_fails(self):
+        """R3-F3: plain directory, missing origin, missing gh: nonzero, with the machine fields."""
+        env = self.env
+        self.check_fixture()
+        self.write_profile(reviewer={"codex_home": self.review_home})
+        plain = env.root / "plain"
+        plain.mkdir()
+        code, out = self.run_cli("check-project", "--project", "check-fixture", "--repo", str(plain))
+        self.assertEqual(ar.EXIT_BLOCKED, code)
+        self.assertTrue(any("not a git repository" in p for p in out["problems"]))
+        self.assertEqual(str(ar.machine_profile_path()), out["machine_profile"]["path"])
+        self.assertEqual(self.review_home, out["codex_home"]["path"])
+        git(env.work, "remote", "remove", "origin")
+        code, out = self.run_cli("check-project", "--project", "check-fixture", "--repo", str(env.work))
+        self.assertEqual(ar.EXIT_BLOCKED, code)
+        self.assertTrue(any("origin remote unavailable" in p for p in out["problems"]))
+        self.assertIn("developer_executable", out)
+        git(env.work, "remote", "add", "origin", "https://github.com/owner/repo.git")
+        self.check_fixture(gh=str(env.root / "absent" / "gh.exe"))
+        code, out = self.run_cli("check-project", "--project", "check-fixture", "--repo", str(env.work))
+        self.assertEqual(ar.EXIT_BLOCKED, code)
+        self.assertTrue(any("GitHub check failed" in p for p in out["problems"]))
+        self.assertIn("machine_problems", out)
+
+    def test_a_timed_out_preflight_probe_reports_the_machine(self):
+        """R3-F4: simulated timeout at the model CLI boundary."""
+        self.check_fixture()
+        target = self.env.root / "preflight-timeout.json"
+        with mock.patch.object(ar.ClaudeDeveloper, "run", side_effect=subprocess.TimeoutExpired(["claude"], 600)):
+            code, out = self.run_cli("preflight", "--project", "check-fixture", "--out", str(target))
+        self.assertEqual(ar.EXIT_BLOCKED, code)
+        self.assertIn("TimeoutExpired", out["error"])
+        self.assertIn("developer_executable", out["machine"])
+        self.assertEqual(out, ar.read_json(target))
+
+    def test_windows_variable_spellings_never_move_a_pinned_directory(self):
+        """R1-F3: `%Review Slot%` is refused before pinning; a stored absolute directory is used as written."""
+        env = self.env
+        slot = str(env.root / "%Review Slot%" / "codex")
+        with mock.patch.dict(os.environ):
+            os.environ.pop("Review Slot", None)
+            self.write_profile(reviewer={"codex_home": slot})
+            with self.assertRaises(ar.UsageError):
+                ar.load_project(self.project, env.wf)
+            self.write_profile(developer={"config_dir": str(env.root / "${Review Slot}" / "claude")})
+            with self.assertRaises(ar.UsageError):
+                ar.load_project(self.project, env.wf)
+            with self.assertRaises(ar.UsageError):
+                __import__("test_live_smoke").smoke_machine_config(
+                    ar.read_json(HERE / "projects" / "kingmaker-gunslinger.json"))
+            ar.machine_profile_path().unlink()
+            env.controller().cancel("enroll again with an unresolvable home")
+            states = sorted((env.root / "state").iterdir())
+            cfg = ar.read_json(self.project)
+            cfg["reviewer"]["codex_home"] = slot
+            ar.atomic_write_json(self.project, cfg)
+            with self.assertRaises(ar.UsageError) as refused:
+                ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
+            self.assertIn("nothing was created", str(refused.exception))
+            self.assertEqual(states, sorted((env.root / "state").iterdir()))
+        with mock.patch.dict(os.environ, {"Review Slot": str(env.root / "elsewhere")}):  # defined later
+            pinned = {ar.PINNED_MARK: True}  # how a configuration load stores the sections it pinned
+            rev = ar.CodexReviewer({"executable": sys.executable, "codex_home": slot, "model": "m", "effort": "high",
+                                    **pinned})
+            self.assertEqual(Path(slot), rev.home)
+            self.assertEqual(slot, rev.env()["CODEX_HOME"])
+            self.assertEqual(Path(slot), ar.claude_config_dir({"config_dir": slot, **pinned}))
+
+    def test_relative_role_executables_are_anchored_at_enrollment(self):
+        """R4-F1: a fresh controller in another directory still selects the original file."""
+        env = self.env
+        first_dir, second_dir = env.root / "launch-a", env.root / "launch-b"
+        original = self.command_shim(first_dir / "tools", "claude-rel", ["print('original')"])
+        self.command_shim(second_dir / "tools", "claude-rel", ["print('other')"])
+        env.controller().cancel("enroll again with a relative executable")
+        cfg = ar.read_json(self.project)
+        cfg["developer"]["executable"] = "tools\\claude-rel"
+        ar.atomic_write_json(self.project, cfg)
+        with contextlib.chdir(first_dir):
+            env.dir, state = ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
+        same = os.path.normcase
+        self.assertEqual(same(str(original)), same(state["project"]["developer"]["executable"]))  # the installed file
+        with contextlib.chdir(second_dir):
+            ctl = env.controller()
+            self.assertEqual(same(str(original)), same(ar.ClaudeDeveloper(ctl.cfg["developer"], None, None).exe))
+
+    def test_a_legacy_empty_claude_directory_means_the_standard_one(self):
+        """R4-F2, R7-F1: an empty or null project config_dir enrolls like an omitted one (the inherited
+        CLAUDE_CONFIG_DIR when set, otherwise ~/.claude); empty or null profile values are refused."""
+        env = self.env
+        inherited = env.root / "inherited-claude"
+        for legacy in ("", None):
+            for inherit in (None, inherited):
+                env.controller().cancel("enroll again with a legacy config_dir")
+                cfg = ar.read_json(self.project)
+                cfg["developer"]["config_dir"] = legacy
+                ar.atomic_write_json(self.project, cfg)
+                with mock.patch.dict(os.environ):
+                    os.environ.pop("CLAUDE_CONFIG_DIR", None)
+                    if inherit:
+                        os.environ["CLAUDE_CONFIG_DIR"] = str(inherit)
+                    env.dir, state = ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
+                    self.assertNotIn("config_dir", state["project"]["developer"])
+                    effective = ar.claude_config_dir(env.controller().cfg["developer"])
+                    self.assertEqual(inherit or Path.home() / ".claude", effective, (legacy, inherit))
+                    reported = ar.machine_facts(env.controller().cfg, None)["claude_config_dir"]["path"]
+                    self.assertEqual(str(effective), reported)
+        for bad in ("", None):
+            self.write_profile(developer={"config_dir": bad})
+            with self.assertRaises(ar.UsageError):
+                ar.load_project(self.project, env.wf)
+
+    def test_a_timed_out_repository_probe_keeps_the_check_project_report(self):
+        """R4-F3: simulated TimeoutExpired at the GitHub boundary."""
+        self.check_fixture()
+        self.write_profile(reviewer={"codex_home": self.review_home})
+        with mock.patch.object(ar.GitHub, "viewer", side_effect=subprocess.TimeoutExpired(["gh", "api", "user"], 180)):
+            code, out = self.run_cli("check-project", "--project", "check-fixture", "--repo", str(self.env.work))
+        self.assertEqual(ar.EXIT_BLOCKED, code)
+        self.assertTrue(any("GitHub check failed" in p and "timed out" in p for p in out["problems"]), out["problems"])
+        self.assertEqual(str(ar.machine_profile_path()), out["machine_profile"]["path"])
+        self.assertIn("developer_executable", out)
+        self.assertEqual(self.review_home, out["codex_home"]["path"])
+        self.assertIn("path", out["claude_config_dir"])
+
+    def rewrite_check_fixture(self, change):
+        path = Path(os.environ["AGENT_REVIEW_HOME"]) / "projects" / "check-fixture.json"
+        cfg = ar.read_json(path)
+        change(cfg)
+        ar.atomic_write_json(path, cfg)
+
+    def test_current_drive_rooted_executables_keep_their_drive(self):
+        """R4-F1. Native path functions, run from the fixture's directory (whose drive the spelling refers to).
+        Whatever this interpreter's os.path.isabs says about \\tools\\x (True before Python 3.13), the drive is
+        what makes a path fully qualified."""
+        env = self.env
+        shim = self.command_shim(env.root / "tools-abs", "claude-root", ["print('rooted')"])
+        drive, rooted = os.path.splitdrive(str(shim))  # the drive stripped, the leading separator kept
+        self.assertTrue(drive and rooted.startswith("\\"))
+        same = os.path.normcase
+        with contextlib.chdir(env.root):
+            self.assertEqual("", os.path.splitdrive(rooted)[0])
+            self.assertFalse(ar.is_fully_qualified(rooted))
+            pinned = ar.pin_machine_values({"developer": {"executable": rooted}, "reviewer": {}})
+        self.assertEqual(same(str(shim)), same(pinned["developer"]["executable"]))
+        env.controller().cancel("enroll again with a current-drive-rooted executable")
+        cfg = ar.read_json(self.project)
+        cfg["developer"]["executable"] = rooted
+        ar.atomic_write_json(self.project, cfg)
+        with contextlib.chdir(env.root):
+            env.dir, state = ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
+        self.assertEqual(same(str(shim)), same(state["project"]["developer"]["executable"]))
+        with self.assertRaises(ar.UsageError):  # the profile grammar wants a drive as well
+            ar.validate_machine_value("executable", rooted, "profile executable")
+
+    def test_invalid_project_directories_are_shown_and_never_launched(self):
+        """R5-F1: check-project lists the refusal enrollment would give; preflight launches neither role."""
+        env = self.env
+        calls = env.root / "role-calls.txt"
+        recorder = ["import sys", f"open({str(calls)!r}, 'a').write(' '.join(sys.argv) + chr(10))"]
+        claude = self.command_shim(env.root / "role-bin", "claude-rec", recorder)
+        codex = self.command_shim(env.root / "role-bin", "codex-rec", recorder)
+        for key in ("config_dir", "codex_home"):
+            self.check_fixture()
+
+            def change(cfg, key=key):
+                cfg["developer"]["executable"], cfg["reviewer"]["executable"] = str(claude), str(codex)
+                section = cfg["developer"] if key == "config_dir" else cfg["reviewer"]
+                section[key] = str(env.root / "%AR_UNSET_SLOT%" / key)
+            self.rewrite_check_fixture(change)
+            with mock.patch.dict(os.environ):
+                os.environ.pop("AR_UNSET_SLOT", None)
+                code, out = self.run_cli("check-project", "--project", "check-fixture", "--repo", str(env.work))
+                self.assertEqual(ar.EXIT_OK, code, out["problems"])  # machine diagnostics keep the exit policy
+                self.assertTrue(any("unresolved variable" in p for p in out["machine_problems"]), out)
+                fact = out["claude_config_dir" if key == "config_dir" else "codex_home"]
+                self.assertIsNone(fact["path"])
+                self.assertIn("unresolved variable", fact["problem"])
+                target = env.root / f"preflight-{key}.json"
+                code, out = self.run_cli("preflight", "--project", "check-fixture", "--out", str(target))
+                self.assertEqual(ar.EXIT_BLOCKED, code)
+                self.assertIn("unresolved variable", out["error"])
+                self.assertEqual(out, ar.read_json(target))
+            self.assertFalse(calls.exists(), key)  # neither shim was invoked
+
+    def test_github_executable_templates_still_expand(self):
+        """R5-F2: the GitHub client's configured path is expanded at its boundary, as before."""
+        env = self.env
+        self.check_fixture()
+        self.rewrite_check_fixture(lambda cfg: cfg.update(gh=str(env.root / "%AR_GH_DIR%" / "gh-sim.cmd")))
+        with mock.patch.dict(os.environ, {"AR_GH_DIR": "gh-shim"}):
+            self.assertEqual(str(env.root / "gh-shim" / "gh-sim.cmd"),
+                             ar.GitHub("owner/repo", str(env.root / "%AR_GH_DIR%" / "gh-sim.cmd")).gh)
+            code, out = self.run_cli("check-project", "--project", "check-fixture", "--repo", str(env.work))
+        self.assertEqual(ar.EXIT_OK, code, out["problems"])
+        self.assertEqual("owner", out["actor"])
+
+    def test_bare_activation_keeps_a_legacy_enrollments_expansion(self):
+        """R5-F3: raw settings of a state written before pinning keep their established meaning."""
+        env = self.env
+        legacy_exe = self.command_shim(env.root / "bin", "claude-legacy", ["print('legacy')"])
+        ctl = env.controller()
+        state = ar.read_json(ctl.state_path)
+        state.pop("machine_profile", None)
+        for section in ("developer", "reviewer"):
+            state["project"][section].pop(ar.PINNED_MARK, None)
+        state["project"]["developer"]["executable"] = str(env.root / "%AR_LEGACY_BIN%" / "claude-legacy.cmd")
+        state["project"]["reviewer"]["executable"] = sys.executable
+        state["project"]["reviewer"]["codex_home"] = str(env.root / "%AR_LEGACY_HOME%")
+        ar.atomic_write_json(ctl.state_path, state)
+        self.write_profile(developer={"executable": "claude"}, reviewer={"codex_home": self.review_home})
+        with mock.patch.dict(os.environ, {"AR_LEGACY_BIN": "bin", "AR_LEGACY_HOME": "legacy-home"}):
+            env.controller().activate()
+            fresh = env.controller()
+            self.assertEqual(str(legacy_exe), ar.ClaudeDeveloper(fresh.cfg["developer"], None, None).exe)
+            rev = ar.CodexReviewer(fresh.cfg["reviewer"])
+            self.assertEqual(env.root / "legacy-home", rev.home)  # provenance root
+            self.assertEqual(str(env.root / "legacy-home"), rev.env()["CODEX_HOME"])  # child home
+        self.assertNotEqual(self.review_home, fresh.cfg["reviewer"]["codex_home"])  # the profile was not applied
+
+    def test_a_relative_tool_installed_after_enrollment_is_found_with_its_extension(self):
+        """R5-F4."""
+        env = self.env
+        first_dir, second_dir = env.root / "launch-c", env.root / "launch-d"
+        first_dir.mkdir()
+        env.controller().cancel("enroll again before the reviewer CLI is installed")
+        cfg = ar.read_json(self.project)
+        cfg["reviewer"]["executable"] = "tools\\codex"
+        ar.atomic_write_json(self.project, cfg)
+        with contextlib.chdir(first_dir):
+            env.dir, state = ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
+        self.assertEqual(str(first_dir / "tools" / "codex"), state["project"]["reviewer"]["executable"])
+        installed = self.command_shim(first_dir / "tools", "codex", ["print('codex-cli first')"])
+        self.command_shim(second_dir / "tools", "codex", ["print('codex-cli second')"])
+        stem = first_dir / "tools" / "codex"
+        for occupant in ("nothing", "directory", "text launcher"):
+            if occupant == "directory":
+                stem.mkdir()
+            elif occupant == "text launcher":
+                stem.rmdir()
+                stem.write_text("#!/bin/sh\necho not-a-windows-executable\n", encoding="utf-8")
+            with contextlib.chdir(second_dir):
+                rev = ar.CodexReviewer(env.controller().cfg["reviewer"])
+                self.assertEqual(os.path.normcase(str(installed)), os.path.normcase(rev.exe), occupant)
+                self.assertEqual("codex-cli first", rev.version(), occupant)
+
+    def test_an_explicit_executable_extension_is_exact(self):
+        """R6-F1: a missing codex.exe is reported missing, never replaced by codex.exe.cmd."""
+        env = self.env
+        calls = env.root / "exe-calls.txt"
+        self.command_shim(env.root / "exe-dir", "codex.exe",
+                          ["import sys", f"open({str(calls)!r}, 'a').write('called' + chr(10))", "print('wrong')"])
+        missing = str(env.root / "exe-dir" / "codex.exe")
+        self.assertEqual(missing, ar.resolve_exe(missing))
+        facts = ar.machine_facts({"developer": {"executable": sys.executable},
+                                  "reviewer": {"executable": missing, "codex_home": self.review_home}}, None)
+        self.assertIn("does not exist", facts["reviewer_executable"]["problem"])
+        rev = ar.CodexReviewer({"executable": missing, "codex_home": self.review_home, "model": "m", "effort": "high"})
+        with self.assertRaises(OSError):
+            rev.version()
+        self.assertFalse(calls.exists())
+        stem = str(env.root / "exe-dir" / "codex")  # the extensionless case still finds a wrapper
+        self.command_shim(env.root / "exe-dir", "codex", ["print('right')"])
+        self.assertEqual(os.path.normcase(stem + ".cmd"), os.path.normcase(ar.resolve_exe(stem)))
+
+    def test_explicit_executable_names_are_exact_whatever_pathext_lists(self):
+        """R6-F1: absolute, relative and bare `.exe` names never select a double-suffixed `.exe.cmd` wrapper."""
+        env = self.env
+        calls = env.root / "double-suffix-calls.txt"
+        record = ["import sys", f"open({str(calls)!r}, 'a').write('called' + chr(10))", "print('wrong')"]
+        absolute = env.root / "abs-dir" / "codex.exe"
+        self.command_shim(env.root / "abs-dir", "codex.exe", record)
+        for pathext in (".CMD", ".COM;.EXE;.BAT;.CMD"):
+            with mock.patch.dict(os.environ, {"PATHEXT": pathext}):
+                self.assertEqual(str(absolute), ar.resolve_exe(str(absolute)), pathext)
+                facts = ar.machine_facts({"developer": {"executable": sys.executable},
+                                          "reviewer": {"executable": str(absolute), "codex_home": self.review_home}},
+                                         None)
+                self.assertIn("does not exist", facts["reviewer_executable"]["problem"])
+                rev = ar.CodexReviewer({"executable": str(absolute), "codex_home": self.review_home, "model": "m",
+                                        "effort": "high"})
+                with self.assertRaises(OSError):
+                    rev.version()
+        work = env.root / "rel-launch"
+        self.command_shim(work / "tools", "codex.exe", record)
+        with contextlib.chdir(work), mock.patch.dict(os.environ, {"PATHEXT": ".COM;.EXE;.BAT;.CMD"}):
+            pinned = ar.pin_machine_values({"developer": {}, "reviewer": {"executable": "tools\\codex.exe"}})
+            self.assertEqual(str(work / "tools" / "codex.exe"), pinned["reviewer"]["executable"])
+            with self.assertRaises(ar.UsageError):
+                ar.resolve_exe("tools\\codex.exe")  # missing, and never completed to codex.exe.cmd
+        early, late = env.root / "path-early", env.root / "path-late"
+        self.command_shim(early, "codex-exact.exe", record)
+        late.mkdir()
+        (late / "codex-exact.exe").write_bytes(b"MZ")  # the exact name, later on PATH (selected, not run)
+        with mock.patch.dict(os.environ, {"PATH": os.pathsep.join([str(early), str(late)]),
+                                          "PATHEXT": ".COM;.EXE;.BAT;.CMD"}):
+            self.assertEqual(str(late / "codex-exact.exe"), ar.resolve_exe("codex-exact.exe"))
+        self.assertFalse(calls.exists())  # no double-suffixed wrapper was ever invoked
+
+    def test_an_installed_relative_executable_keeps_the_file_selected_at_enrollment(self):
+        """R8-F1: reversing PATHEXT later does not switch a resumed enrollment to another wrapper at the same stem."""
+        env = self.env
+        launch, other = env.root / "launch-e", env.root / "launch-f"
+        cmd = self.command_shim(launch / "tools", "codex", ["print('codex-cli cmd')"])
+        bat = launch / "tools" / "codex.bat"
+        bat.write_text(f'@"{sys.executable}" -c "print(\'codex-cli bat\')"\n', encoding="utf-8")
+        other.mkdir()
+        env.controller().cancel("enroll again with two wrappers at one stem")
+        cfg = ar.read_json(self.project)
+        cfg["reviewer"]["executable"] = "tools\\codex"
+        ar.atomic_write_json(self.project, cfg)
+        with contextlib.chdir(launch), mock.patch.dict(os.environ, {"PATHEXT": ".COM;.EXE;.CMD;.BAT"}):
+            env.dir, state = ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
+        self.assertEqual(os.path.normcase(str(cmd)), os.path.normcase(state["project"]["reviewer"]["executable"]))
+        with contextlib.chdir(other), mock.patch.dict(os.environ, {"PATHEXT": ".COM;.EXE;.BAT;.CMD"}):
+            rev = ar.CodexReviewer(env.controller().cfg["reviewer"])
+            self.assertEqual("codex-cli cmd", rev.version())  # the .bat now comes first in PATHEXT, unused
+
+    def test_a_selected_custom_suffix_executable_survives_a_pathext_change(self):
+        """R9-F1: codex.bin, selected at enrollment while .BIN was in PATHEXT, is still launched after .BIN is
+        removed; a codex.bin.cmd beside it is never used."""
+        env = self.env
+        launch, other = env.root / "launch-g", env.root / "launch-h"
+        native = launch / "tools" / "codex.bin"
+        native.parent.mkdir(parents=True)
+        shutil.copyfile(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "where.exe", native)
+        calls = env.root / "bin-cmd-calls.txt"
+        self.command_shim(launch / "tools", "codex.bin",
+                          ["import sys", f"open({str(calls)!r}, 'a').write('called' + chr(10))", "print('wrong')"])
+        other.mkdir()
+        env.controller().cancel("enroll again with a custom-suffix executable")
+        cfg = ar.read_json(self.project)
+        cfg["reviewer"]["executable"] = "tools\\codex.bin"
+        ar.atomic_write_json(self.project, cfg)
+        with contextlib.chdir(launch), mock.patch.dict(os.environ, {"PATHEXT": ".COM;.EXE;.BAT;.CMD;.BIN"}):
+            env.dir, state = ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
+        self.assertEqual(str(native), state["project"]["reviewer"]["executable"])
+        self.assertIs(True, state["project"]["reviewer"][ar.SELECTED_MARK])
+        with contextlib.chdir(other), mock.patch.dict(os.environ, {"PATHEXT": ".COM;.EXE;.BAT;.CMD"}):
+            rev = ar.CodexReviewer(env.controller().cfg["reviewer"])
+            self.assertEqual(str(native), rev.exe)
+            self.assertEqual(str(native), ar.machine_facts(env.controller().cfg, None)["reviewer_executable"]["path"])
+            ran = subprocess.run([rev.exe, "cmd"], capture_output=True, text=True)  # where.exe, renamed
+        self.assertEqual(0, ran.returncode)
+        self.assertIn("cmd.exe", ran.stdout.lower())  # the native file answered
+        self.assertFalse(calls.exists())  # the double-suffixed wrapper was never invoked
+
+    def test_bare_commands_ignore_drive_less_path_entries(self):
+        """R6-F2: a PATH entry without a drive follows the current drive and is skipped."""
+        env = self.env
+        self.command_shim(env.root / "driveless-bin", "claude-pathcheck", ["print('drive-less')"])
+        qualified = self.command_shim(env.root / "qualified-bin", "claude-pathcheck", ["print('qualified')"])
+        driveless = os.path.splitdrive(str(env.root / "driveless-bin"))[1]
+        path = os.pathsep.join([driveless, str(env.root / "qualified-bin")])
+        with contextlib.chdir(env.root), mock.patch.dict(os.environ, {"PATH": path}):
+            self.assertFalse(ar.is_fully_qualified(driveless))
+            self.assertEqual(os.path.normcase(str(qualified)), os.path.normcase(ar.resolve_exe("claude-pathcheck")))
+
+    def test_non_string_machine_fields_are_reported_and_refused(self):
+        """R6-F3: a null or numeric reviewer home; the omitted home keeps its default."""
+        env = self.env
+        env.controller().cancel("enroll again with malformed machine fields")
+        states = sorted((env.root / "state").iterdir())
+        original = ar.read_json(self.project)
+        for bad in (None, 5):
+            self.check_fixture()
+            self.rewrite_check_fixture(lambda cfg, bad=bad: cfg["reviewer"].update(codex_home=bad))
+            code, out = self.run_cli("check-project", "--project", "check-fixture", "--repo", str(env.work))
+            self.assertEqual(ar.EXIT_OK, code, out["problems"])  # the existing exit policy for machine diagnostics
+            self.assertIsNone(out["codex_home"]["path"])
+            self.assertIn("non-empty string", out["codex_home"]["problem"])
+            self.assertTrue(any("reviewer.codex_home" in p for p in out["machine_problems"]))
+            target = env.root / f"preflight-home-{bad}.json"
+            code, out = self.run_cli("preflight", "--project", "check-fixture", "--out", str(target))
+            self.assertEqual(ar.EXIT_BLOCKED, code)
+            self.assertIn("reviewer.codex_home", out["error"])
+            self.assertEqual(out, ar.read_json(target))
+            cfg = json.loads(json.dumps(original))
+            cfg["reviewer"]["codex_home"] = bad
+            ar.atomic_write_json(self.project, cfg)
+            with self.assertRaises(ar.UsageError) as refused:
+                ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
+            self.assertIn("nothing was created", str(refused.exception))
+            self.assertEqual(states, sorted((env.root / "state").iterdir()))
+        cfg = json.loads(json.dumps(original))
+        cfg["reviewer"].pop("codex_home")
+        ar.atomic_write_json(self.project, cfg)
+        self.assertEqual(str(Path.home() / ".codex"), ar.load_project(self.project, env.wf)["reviewer"]["codex_home"])
+
+    def test_nima_rule_matches_path_components(self):
+        """R1-F6: a descendant of C:\\Dev\\nima, not a similarly named sibling."""
+        self.assertTrue(ar.in_nima("C:/Dev/nima"))
+        self.assertTrue(ar.in_nima("c:\\dev\\NIMA\\service\\repo"))
+        self.assertFalse(ar.in_nima("C:/Dev/nima-tools/repo"))
+        self.assertFalse(ar.in_nima("C:/Dev/nimaX"))
+        self.assertFalse(ar.in_nima("D:/Dev/nima/repo"))
 
 
 class RoundTwoRegressionTests(Base):
@@ -5446,10 +6250,10 @@ class ResumeGuidanceTests(Base):
         ctl._reviewer = None  # normal lazy construction of the real Codex boundary
         name = ar.expand(ctl.cfg["reviewer"].get("executable", "codex"))
         self.assertFalse(os.path.isabs(name))  # the shipped configuration needs a PATH lookup
-        which = shutil.which
+        lookup = ar.find_on_path
         env.developer.script += [self.fix]
         reviews = len(env.reviewer.calls)
-        with mock.patch.object(ar.shutil, "which", lambda cmd, *a, **k: None if cmd == name else which(cmd, *a, **k)):
+        with mock.patch.object(ar, "find_on_path", lambda cmd: None if cmd == name else lookup(cmd)):
             code, out = self.resume(ctl, guidance=path)  # simulated: the reviewer executable is absent from PATH
         self.assertEqual(ar.EXIT_BLOCKED, code)
         self.assertIn("could not be prepared", out["reason"])

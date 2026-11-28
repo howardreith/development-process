@@ -27,7 +27,7 @@ import sys
 import threading
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 PROTOCOL = "agent-review.v1"
 STATE_SCHEMA = "agent-review.state.v1"
@@ -181,14 +181,147 @@ def expand(value: str) -> str:
     return os.path.expandvars(os.path.expanduser(value))
 
 
-def resolve_exe(name: str) -> str:
-    candidate = expand(name)
-    if os.path.isabs(candidate):
-        return candidate
-    found = shutil.which(candidate)
+def claude_config_dir(developer_cfg) -> Path:
+    """The Claude config directory the developer CLI uses: the configured one (passed as CLAUDE_CONFIG_DIR), else
+    the CLAUDE_CONFIG_DIR it inherits, else Claude Code's standard ~/.claude."""
+    if developer_cfg.get("config_dir"):
+        return stable_dir(developer_cfg["config_dir"], "CLAUDE_CONFIG_DIR", "Claude config directory",
+                          literal=developer_cfg.get(PINNED_MARK) is True)
+    return Path(expand(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude"))
+
+
+PINNED_MARK = "machine_values_pinned"  # set by pin_machine_values on a role section whose machine values it pinned
+SELECTED_MARK = "executable_selected"  # ...and, beside it, when the pinned executable names a concrete installed file
+
+
+def pinned_role(section) -> dict:
+    """How a role section's machine values are used: literally when the load pinned them, and its executable by its
+    saved filename when the load selected a concrete file (an unresolved stem is still matched at launch)."""
+    literal = section.get(PINNED_MARK) is True
+    return {"literal": literal, "selected": literal and section.get(SELECTED_MARK) is True}
+
+
+def is_fully_qualified(path: str) -> bool:
+    """Absolute including, on Windows, the drive: a current-drive-rooted path such as \\tools\\x is not (it
+    counts as absolute for os.path.isabs before Python 3.13)."""
+    return os.path.isabs(path) and (os.name != "nt" or bool(os.path.splitdrive(path)[0]))
+
+
+def with_pathext(path: str) -> str:
+    """A fully qualified executable path as Windows matches it: a name carrying a PATHEXT extension (codex.exe) is
+    exact; a command stem (codex) is matched only as stem+extension, so a directory or extensionless file at the stem
+    never hides, for example, a codex.cmd installed after the stem was pinned. Elsewhere the path is exact."""
+    if os.name != "nt" or has_executable_suffix(path):
+        return path
+    for ext in windows_pathext():
+        if os.path.isfile(path + ext):
+            return path + ext
+    return path  # no suffixed sibling: the configured path itself (reported missing if absent)
+
+
+WINDOWS_EXECUTABLE_SUFFIXES = (".com", ".exe", ".bat", ".cmd")
+
+
+def windows_pathext():
+    return [e.lower() for e in (os.environ.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if e]
+
+
+def has_executable_suffix(name: str) -> bool:
+    """Whether a Windows executable name already carries its extension (codex.exe): such a name is matched exactly,
+    whatever the shell's PATHEXT lists; only a stem (codex) is completed with PATHEXT."""
+    return Path(name).suffix.lower() in set(WINDOWS_EXECUTABLE_SUFFIXES) | set(windows_pathext())
+
+
+def find_on_path(name: str):
+    """A bare command found only in PATH's absolute directories. Unlike shutil.which on Windows, the current
+    directory (for example a worktree holding a same-named file) is never searched."""
+    exts = [""]
+    if os.name == "nt" and not has_executable_suffix(name):  # a name with its extension is matched exactly
+        exts = windows_pathext()
+    for folder in os.environ.get("PATH", "").split(os.pathsep):
+        folder = folder.strip().strip('"')
+        if not folder or not is_fully_qualified(folder):  # a drive-less entry would follow the current drive
+            continue
+        for ext in exts:
+            candidate = os.path.join(folder, name + ext)
+            if os.path.exists(candidate) and not os.path.isdir(candidate) and \
+                    (os.name == "nt" or os.access(candidate, os.X_OK)):
+                return candidate
+    return None
+
+
+def is_command_name(value: str) -> bool:
+    return bool(value) and not any(sep in value for sep in ("/", "\\", ":"))
+
+
+def resolve_exe(name: str, literal: bool = False, selected: bool = False) -> str:
+    """The executable to launch. `literal`: a role path the configuration load pinned, used as written; every
+    other value (the GitHub client's, a legacy enrollment's) is expanded as configured. `selected`: the load chose
+    this concrete file, so it is launched by that filename, whatever PATHEXT lists now."""
+    candidate = name if literal else expand(name)
+    if is_fully_qualified(candidate):
+        return candidate if selected else with_pathext(candidate)
+    if not is_command_name(candidate):  # an explicit relative path is checked as given, never searched for
+        found = with_pathext(os.path.abspath(candidate))
+        if not os.path.isfile(found):
+            raise UsageError(f"Executable not found: {name}")
+        return found
+    found = find_on_path(candidate)
     if not found:
         raise UsageError(f"Executable not found on PATH: {name}")
     return found
+
+
+RESIDUAL_VAR_RE = re.compile(r"%[^%]+%|\$\{[^}]*\}|\$[A-Za-z0-9_-]+")  # every form os.path.expandvars accepts
+
+
+def expand_fully(value: str, what: str) -> str:
+    """The value with the user's home and environment expanded, refusing any variable that stays unresolved: a
+    later shell that defines it would otherwise give the stored value a different meaning."""
+    expanded = expand(value)
+    if RESIDUAL_VAR_RE.search(expanded):
+        raise UsageError(f"{what} '{value}' contains an unresolved variable ({expanded})")
+    return expanded
+
+
+def pin_dir(value: str, own_var: str, what: str) -> Path:
+    """The directory a configuration load pins: the value expanded once (the user's home and environment, absolute
+    values included) with nothing left unresolved, absolute, and never defined through the variable it is meant to
+    set for the child."""
+    if re.search(rf"%{own_var}%|\${{?{own_var}\b", value, re.I):
+        raise UsageError(f"{what} '{value}' may not refer to the inherited {own_var}")
+    path = Path(expand_fully(value, what))
+    if not path.is_absolute():
+        raise UsageError(f"{what} '{value}' does not expand to an absolute directory")
+    return path
+
+
+def stable_dir(value: str, own_var: str, what: str, literal: bool = False) -> Path:
+    """The directory a launch uses. `literal`: a directory the configuration load pinned, used exactly as written
+    (a variable defined later never changes it); any other value is pinned now."""
+    if re.search(rf"%{own_var}%|\${{?{own_var}\b", value, re.I):
+        raise UsageError(f"{what} '{value}' may not refer to the inherited {own_var}")
+    if literal and Path(value).is_absolute():
+        return Path(value)
+    return pin_dir(value, own_var, what)
+
+
+def pin_executable(value: str, what: str) -> str:
+    """The executable a configuration load pins: fully expanded and not blank; a command name stays a name (PATH
+    lookup at launch), and an explicit relative project path is anchored where the configuration is loaded."""
+    exe = expand_fully(value, what)
+    if not exe.strip():
+        raise UsageError(f"{what} '{value}' expands to a blank value")
+    if is_command_name(exe):
+        return exe
+    anchored = exe if is_fully_qualified(exe) else os.path.abspath(exe)
+    matched = with_pathext(anchored)  # the installed file the matcher selects now, so PATHEXT cannot change it later
+    return matched if os.path.isfile(matched) else anchored  # an absent tool keeps the stem (completed at launch)
+
+
+def is_selected_executable(exe: str) -> bool:
+    """Whether a pinned executable names a concrete installed file the matcher selected (not a stem to complete)."""
+    return is_fully_qualified(exe) and os.path.isfile(exe) and (os.name != "nt" or has_executable_suffix(exe))
 
 
 def run(argv, cwd=None, input_text=None, env=None, timeout=300, check=True):
@@ -861,18 +994,25 @@ class CodexReviewer:
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        self.exe = resolve_exe(cfg.get("executable", "codex"))
-        self.home = Path(expand(cfg.get("codex_home", "~/.codex")))
+        role = pinned_role(cfg)
+        self.exe = resolve_exe(cfg.get("executable", "codex"), **role)
+        self.home = stable_dir(cfg.get("codex_home", "~/.codex"), "CODEX_HOME", "reviewer Codex home",
+                               literal=role["literal"])
 
     @property
     def requested(self):
         return {"model": self.cfg["model"], "effort": self.cfg["effort"], "sandbox": "read-only"}
 
+    def env(self):
+        """Every Codex process runs in the configured home, so the rollout it writes is the one provenance reads; an
+        inherited CODEX_HOME (for example a home dedicated to another project) never selects it."""
+        return {**os.environ, "CODEX_HOME": str(self.home)}
+
     def version(self):
-        return run([self.exe, "--version"], timeout=60).stdout.strip()
+        return run([self.exe, "--version"], env=self.env(), timeout=60).stdout.strip()
 
     def auth_route(self):
-        proc = run([self.exe, "login", "status"], check=False, timeout=60)
+        proc = run([self.exe, "login", "status"], env=self.env(), check=False, timeout=60)
         text = (proc.stdout + proc.stderr).strip().splitlines()
         return text[0] if text else "unknown"
 
@@ -894,7 +1034,8 @@ class CodexReviewer:
         with open(events_path, "w", encoding="utf-8") as out, open(stderr_path, "w", encoding="utf-8") as err:
             flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
             proc = subprocess.Popen(self.argv(workdir, schema, result_path, skip_git), stdin=subprocess.PIPE,
-                                    stdout=out, stderr=err, text=True, encoding="utf-8", creationflags=flags)
+                                    stdout=out, stderr=err, text=True, encoding="utf-8", env=self.env(),
+                                    creationflags=flags)
             if on_start:
                 on_start(proc.pid)
             timed_out = False
@@ -1106,12 +1247,12 @@ class ClaudeDeveloper:
     def __init__(self, cfg: dict, settings_path: Path, schema_path: Path, schema_text: str = None):
         self.cfg, self.settings_path, self.schema_path, self.schema_text = cfg, settings_path, schema_path, schema_text
         self._exe = None  # resolved when something is launched: reading a transcript needs no executable
-        self.config_dir = Path(expand(cfg["config_dir"])) if cfg.get("config_dir") else None
+        self.config_dir = claude_config_dir(cfg) if cfg.get("config_dir") else None
 
     @property
     def exe(self):
         if self._exe is None:
-            self._exe = resolve_exe(self.cfg.get("executable", "claude"))
+            self._exe = resolve_exe(self.cfg.get("executable", "claude"), **pinned_role(self.cfg))
         return self._exe
 
     @property
@@ -1131,7 +1272,7 @@ class ClaudeDeveloper:
         return run([self.exe, "--version"], env=self.env(), timeout=60).stdout.strip()
 
     def _transcripts(self, session_id):
-        base = (self.config_dir or Path.home() / ".claude") / "projects"
+        base = claude_config_dir(self.cfg) / "projects"
         return list(base.glob(f"*/{session_id}.jsonl")) if base.exists() else []
 
     def session_exists(self, session_id) -> bool:
@@ -2047,6 +2188,9 @@ class Controller:
             out["problem"] = ("the accepted review envelope is missing or altered in private state; restore the "
                               "preserved result under supervision (its digest is recorded in the round)")
             return out
+        machine = self.machine_profile_status()
+        if machine.get("changed"):
+            out["machine_profile"] = machine
         result = json.loads(raw)["result"]
         out["continuation"] = result.get("decision_rationale")
         out["findings"] = [{k: f.get(k) for k in ("id", "priority", "category", "blocks_readiness", "title",
@@ -4125,7 +4269,10 @@ class Controller:
 
     def _activate(self, refresh_project):
         if refresh_project:
-            new_cfg = load_project(refresh_project, self.wf)
+            new_cfg, machine = load_project_effective(refresh_project, self.wf)
+            unstable = machine_value_problems(new_cfg)
+            if unstable:
+                raise UsageError("refreshing the project refused: " + "; ".join(unstable))
             frozen = [k for k in ("project_id", "repository", "expected_actor", "transcript_dir")
                       if new_cfg.get(k) != self.cfg.get(k)]
             if frozen:
@@ -4134,6 +4281,7 @@ class Controller:
                 {"replaced_at": now_iso(), "sha256": sha256_text(json.dumps(self.cfg, sort_keys=True)),
                  "by_sha256": sha256_text(json.dumps(new_cfg, sort_keys=True))})
             self.state["project"] = self.cfg = new_cfg
+            self.state["machine_profile"] = machine  # the profile identity the refreshed configuration was loaded under
         last = self.state.get("project_history", [{}])[-1] if refresh_project else {}
         project_changed = bool(refresh_project) and last.get("sha256") != last.get("by_sha256")
         self.snapshot_fp, _, self.files = load_workflow(self.wf)  # this process continues under the new version
@@ -5131,6 +5279,24 @@ class Controller:
                                "permission profile is not applied to a foreground session",
                 "source": prov.get("source")}
 
+    def machine_profile_status(self):
+        """The machine profile this enrollment's pinned configuration was loaded under, compared with the owner's
+        current one. A difference is reported only: the pinned values stay in use until the owner refreshes the
+        project between runs (`activate --refresh-project`)."""
+        if "machine_profile" not in self.state:
+            return {"pinned": None, "note": "not recorded: enrolled before machine profiles existed"}
+        pinned = self.state["machine_profile"]
+        try:
+            current = machine_identity(load_machine_profile())
+        except UsageError as exc:
+            current = {"problem": str(exc)}
+        out = {"pinned": pinned, "current": current, "changed": current != pinned}
+        if out["changed"]:
+            out["note"] = ("the machine profile changed after this configuration was pinned; the enrollment keeps "
+                           "using its pinned values. To adopt the current profile, as an owner decision between runs: "
+                           f"`activate --enrollment {self.state['enrollment_id']} --refresh-project <project>`")
+        return out
+
     def status(self, remote=False):
         s = self.state
         lock = self.lock("status")
@@ -5161,6 +5327,7 @@ class Controller:
             "archive_pending": bool(s.get("archive_pending")),
             "workflow_fingerprint_matches": fp_ok, "updated_at": s.get("updated_at"),
         }
+        out["machine_profile"] = self.machine_profile_status()
         out["guidance"] = self.guidance_status()
         out["amendments"] = self.guidance_status("amendments")
         out["live_log"] = str(self.live_path)  # readable progress (tail it); never evidence
@@ -5381,16 +5548,198 @@ def check_policy(cfg):
                 raise UsageError(f"project {role}.{key} is {cfg[role].get(key)!r}; owner policy requires {value!r}")
 
 
-def load_project(name_or_path, root=HERE):
+MACHINE_SCHEMA = "agent-review.machine.v1"
+MACHINE_KEYS = {"developer": ("executable", "config_dir"), "reviewer": ("codex_home",)}  # machine facts, never policy
+
+
+def machine_profile_path() -> Path:
+    return agent_home() / "machine.json"
+
+
+def load_machine_profile():
+    """The owner's machine facts (where Claude Code is installed, its config directory, the reviewer's Codex home),
+    or None without a profile. Anything else, including models, effort, permissions, gates or limits, is refused,
+    and so is a file that resolves outside the owner's agent home (the trusted-location rule of project configs)."""
+    path = machine_profile_path()
+    if not path.exists() and not path.is_symlink():
+        return None
+    resolved = path.resolve()
+    if resolved.parent != agent_home().resolve() or not resolved.is_file():
+        raise UsageError(f"machine profile {path} resolves to {resolved}, outside the trusted {agent_home()}")
+    try:
+        profile = json.loads(resolved.read_text(encoding="utf-8"), object_pairs_hook=_no_duplicate_keys)
+    except (OSError, ValueError) as exc:
+        raise UsageError(f"machine profile {path} is unreadable: {exc}")
+    if not isinstance(profile, dict) or profile.get("schema_version") != MACHINE_SCHEMA:
+        raise UsageError(f"machine profile {path} must be an object with schema_version {MACHINE_SCHEMA}")
+    for section, values in profile.items():
+        if section == "schema_version":
+            continue
+        if section not in MACHINE_KEYS or not isinstance(values, dict):
+            raise UsageError(f"machine profile {path}: '{section}' is not a machine setting "
+                             f"(allowed: {', '.join(f'{s}.{k}' for s, ks in MACHINE_KEYS.items() for k in ks)})")
+        for key, value in values.items():
+            if key not in MACHINE_KEYS[section]:
+                raise UsageError(f"machine profile {path}: '{section}.{key}' is not a machine setting")
+            if not isinstance(value, str) or not value.strip():
+                raise UsageError(f"machine profile {path}: '{section}.{key}' must be a non-empty string")
+            validate_machine_value(key, value, f"machine profile {path}: '{section}.{key}'")
+    return profile
+
+
+def validate_machine_value(key, value, label):
+    """The machine-value grammar: an executable is a command name or an absolute path; a directory is stable."""
+    if not isinstance(value, str) or not value.strip():
+        raise UsageError(f"{label} must be a non-empty string")
+    if key == "executable":
+        pin_executable(value, label)  # refuses unresolved variables and blank expansions
+        if not (is_command_name(expand(value)) or is_fully_qualified(expand(value))):
+            raise UsageError(f"{label} must be a command name or an absolute path")
+    else:
+        pin_dir(value, {"config_dir": "CLAUDE_CONFIG_DIR", "codex_home": "CODEX_HOME"}[key], label)
+
+
+def pin_machine_values(cfg):
+    """The machine directories and executables expanded once when the configuration is loaded, so the values an
+    enrollment pins keep their meaning whatever environment later controller instances inherit. A value that cannot
+    be made stable is left as configured for check-project to report; enrollment and project refresh refuse it
+    (machine_value_problems)."""
+    cfg = json.loads(json.dumps(cfg))
+    dev, rev = cfg["developer"], cfg["reviewer"]
+    if "config_dir" in dev and dev["config_dir"] in ("", None):
+        del dev["config_dir"]  # the established project forms of "Claude Code's standard directory"
+    for section, key, var, default in ((dev, "config_dir", "CLAUDE_CONFIG_DIR", None),
+                                       (rev, "codex_home", "CODEX_HOME", "~/.codex")):
+        value, problem = machine_field(section, key, default, key)
+        if value and not problem:
+            try:
+                section[key] = str(pin_dir(value, var, key))
+            except UsageError:
+                pass
+    for section in (dev, rev):
+        section.pop(SELECTED_MARK, None)  # only a load may claim it
+        value, problem = machine_field(section, "executable", None, "executable")
+        if value and not problem:
+            try:
+                section["executable"] = pin_executable(value, "executable")
+            except UsageError:
+                continue
+            if is_selected_executable(section["executable"]):
+                section[SELECTED_MARK] = True
+    unstable = " ".join(machine_value_problems(cfg))
+    for name, section in (("developer", dev), ("reviewer", rev)):
+        section.pop(PINNED_MARK, None)
+        if f"{name}." not in unstable:
+            section[PINNED_MARK] = True
+        else:
+            section.pop(SELECTED_MARK, None)
+    return cfg
+
+
+def machine_field(section_cfg, key, default, label):
+    """(value, problem) for one machine field: the default when the field is omitted; a present value must be a
+    non-empty string, and is never passed on otherwise."""
+    if key not in section_cfg:
+        return default, None
+    value = section_cfg[key]
+    if isinstance(value, str) and value.strip():
+        return value, None
+    return None, f"{label} must be a non-empty string (got {json.dumps(value)})"
+
+
+def machine_value_problems(cfg):
+    """Why a loaded configuration's machine values could change meaning after pinning (empty when stable)."""
+    problems = []
+    for section, key, default in (("developer", "config_dir", None), ("developer", "executable", None),
+                                  ("reviewer", "codex_home", "~/.codex"), ("reviewer", "executable", None)):
+        value, problem = machine_field(cfg[section], key, default, f"{section}.{key}")
+        if problem:
+            problems.append(problem)
+            continue
+        if value is None:
+            continue
+        try:
+            if key == "executable":
+                pin_executable(value, f"{section}.{key}")  # an explicit relative project path stays allowed
+            else:
+                pin_dir(value, {"config_dir": "CLAUDE_CONFIG_DIR", "codex_home": "CODEX_HOME"}[key],
+                        f"{section}.{key}")
+        except UsageError as exc:
+            problems.append(str(exc))
+    return problems
+
+
+def machine_identity(profile):
+    """What an enrollment records of the profile it was loaded under: its path and the digest of its settings."""
+    if not profile:
+        return None
+    settings = {k: v for k, v in profile.items() if k != "schema_version"}
+    return {"path": str(machine_profile_path()), "sha256": sha256_text(json.dumps(settings, sort_keys=True))}
+
+
+def apply_machine_profile(cfg, profile):
+    """The effective project configuration: the profile's machine facts replace the project's own values."""
+    if not profile:
+        return cfg
+    cfg = json.loads(json.dumps(cfg))
+    for section in MACHINE_KEYS:
+        cfg.setdefault(section, {}).update(profile.get(section) or {})
+    return cfg
+
+
+def machine_facts(cfg, identity):
+    """Where this machine runs the configured roles, from the loaded configuration and the identity of the profile
+    that load applied (check-project, preflight): each executable as resolved, and the Claude config directory and
+    Codex home the child processes use. A resolution failure is reported in place of a path."""
+    def executable(section, name, default):
+        exe, problem = machine_field(section, "executable", default, f"{name}.executable")
+        if problem:
+            return {"configured": section.get("executable"), "path": None, "problem": problem}
+        try:
+            path = resolve_exe(exe, **pinned_role(section))
+        except UsageError as exc:
+            return {"configured": exe, "path": None, "problem": str(exc)}
+        if not Path(path).is_file():
+            return {"configured": exe, "path": None, "problem": f"{path} does not exist"}
+        return {"configured": exe, "path": path}
+
+    def directory(section, label, key, default, resolve):
+        _, problem = machine_field(section, key, default, label)
+        if problem:  # never handed to a path function
+            return {"path": None, "problem": problem}
+        try:
+            return {"path": str(resolve())}
+        except UsageError as exc:
+            return {"path": None, "problem": str(exc)}
+    dev, rev = cfg["developer"], cfg["reviewer"]
+    return {"machine_profile": identity,
+            "developer_executable": executable(dev, "developer", "claude"),
+            "reviewer_executable": executable(rev, "reviewer", "codex"),
+            "claude_config_dir": directory(dev, "developer.config_dir", "config_dir", None,
+                                           lambda: claude_config_dir(dev)),
+            "codex_home": directory(rev, "reviewer.codex_home", "codex_home", "~/.codex",
+                                    lambda: stable_dir(rev.get("codex_home", "~/.codex"), "CODEX_HOME",
+                                                       "reviewer Codex home", literal=rev.get(PINNED_MARK) is True)),
+            "invalid_values": machine_value_problems(cfg)}
+
+
+def load_project_effective(name_or_path, root=HERE):
+    """(effective project configuration, identity of the machine profile applied to it or None)."""
     path = _trusted(root, "projects", name_or_path)
     cfg = read_json(path)
     if cfg.get("schema_version") != "agent-review.project.v1":
         raise UsageError(f"{path} is not an agent-review project config")
+    profile = load_machine_profile()
+    cfg = pin_machine_values(apply_machine_profile(cfg, profile))
     check_policy(cfg)
     unknown = sorted(set(project_required_gates(cfg)) - set(cfg.get("gates") or {}))
     if unknown:
         raise UsageError(f"{path} requires undeclared gates: {unknown}")
-    return cfg
+    return cfg, machine_identity(profile)
+
+
+def load_project(name_or_path, root=HERE):
+    return load_project_effective(name_or_path, root)[0]
 
 
 def load_plan(name_or_path, root=HERE):
@@ -5464,7 +5813,10 @@ def resolve_enroll_mode(mode):
 
 def enroll(args, github=None, root=HERE, developer=None):
     args.mode = resolve_enroll_mode(getattr(args, "mode", None))  # first: a refusal touches nothing
-    cfg = load_project(args.project, root)
+    cfg, machine = load_project_effective(args.project, root)
+    unstable = machine_value_problems(cfg)
+    if unstable:  # refused before anything is created: a pinned value must keep its meaning
+        raise UsageError("enrollment refused; nothing was created: " + "; ".join(unstable))
     if cfg.get("enrollment_allowed") is False:  # the repository's own instructions forbid this workflow's actions
         raise UsageError(f"project {cfg['project_id']} does not allow enrollment: {cfg.get('enrollment_blocked_reason')}")
     plan = load_plan(args.plan, root)
@@ -5516,13 +5868,14 @@ def enroll(args, github=None, root=HERE, developer=None):
         folder.mkdir()
         try:
             return _enroll_into(folder, enrollment_id, cfg, plan, args, git, gh, mission, top, branch, reg, root,
-                                foreground_session)
+                                foreground_session, machine)
         except BaseException:
             shutil.rmtree(folder, ignore_errors=True)  # a refused enrollment leaves no partial state
             raise
 
 
-def _enroll_into(folder, enrollment_id, cfg, plan, args, git, gh, mission, top, branch, reg, root, foreground_session):
+def _enroll_into(folder, enrollment_id, cfg, plan, args, git, gh, mission, top, branch, reg, root, foreground_session,
+                 machine=None):
     snapshot = folder / "mission" / mission.name
     snapshot.parent.mkdir()
     shutil.copy2(mission, snapshot)
@@ -5566,7 +5919,7 @@ def _enroll_into(folder, enrollment_id, cfg, plan, args, git, gh, mission, top, 
         limits["max_review_rounds_per_checkpoint"] = int(args.max_rounds)
     state = {
         "schema_version": STATE_SCHEMA, "protocol": PROTOCOL, "enrollment_id": enrollment_id,
-        "project_id": cfg["project_id"], "project": cfg, "plan": plan, "mode": args.mode,
+        "project_id": cfg["project_id"], "project": cfg, "machine_profile": machine, "plan": plan, "mode": args.mode,
         "foreground_session": foreground_session,
         "repo_root": top, "branch": branch, "target": target,
         "pr": {"number": number, "url": pr["url"]},
@@ -5649,7 +6002,7 @@ class _AmbientDeveloper(ClaudeDeveloper):
 
 def _user_status_allowance(cfg):
     """The owner's user-level allowance for the read-only `status` command, if granted (the ambient rule probed)."""
-    base = Path(expand(cfg["developer"]["config_dir"])) if cfg["developer"].get("config_dir") else Path.home() / ".claude"
+    base = claude_config_dir(cfg["developer"])
     settings = _json_file(base / "settings.json") or {}
     for rule in (settings.get("permissions") or {}).get("allow", []):
         if rule.startswith("Bash(python ") and rule.endswith(" status *)"):
@@ -5713,11 +6066,19 @@ def permission_isolation_probe(cfg, root, work):
             "source": "Claude Code stream-json tool_use/tool_result records and result permission_denials (CLI-recorded)"}
 
 
-def preflight(cfg, root=HERE):
-    """Real bounded calls to both configured models; records requested vs observed metadata."""
+def preflight(cfg, root=HERE, machine=None):
+    """Real bounded calls to both configured models; records requested vs observed metadata. The temporary work
+    directory is removed whether the calls succeed or fail."""
     import tempfile
-    out = {"at": now_iso(), "project": cfg["project_id"]}
     work = Path(tempfile.mkdtemp(prefix="agent-review-preflight-"))
+    try:
+        return _preflight(cfg, root, machine, work)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _preflight(cfg, root, machine, work):
+    out = {"at": now_iso(), "project": cfg["project_id"], "machine": machine_facts(cfg, machine)}
     atomic_write_json(work / "developer-settings.json", compose_developer_settings(cfg, root, "preflight"))
     dev = ClaudeDeveloper(cfg["developer"], work / "developer-settings.json", root / REPORT_SCHEMA_FILE)
     sid = str(uuid.uuid4())
@@ -5758,7 +6119,6 @@ def preflight(cfg, root=HERE):
         "Cost: Claude reports list-price cost even on subscription auth; Codex reports tokens and plan type only. "
         "No precise combined cost is claimed.",
     ]
-    shutil.rmtree(work, ignore_errors=True)
     return out
 
 
@@ -5857,16 +6217,30 @@ def install(dest: Path, source: Path = HERE):
 
 # --------------------------------------------------------------------------- onboarding
 
-def check_project(cfg, repo):
-    """Compare a project config with its repository, GitHub and local tools. Returns (problems, facts)."""
+def check_project(cfg, repo, machine=None):
+    """Compare a project config with its repository, GitHub and local tools. Returns (problems, facts). `machine` is
+    the identity of the machine profile the configuration was loaded under (load_project_effective)."""
     problems, facts = [], {}
+    # local availability is reported beside, not in, the problems that decide this command's result
+    facts.update(machine_facts(cfg, machine))
+    facts["machine_problems"] = [f"{key}: {facts[key]['problem']}" for key in
+                                 ("developer_executable", "reviewer_executable", "claude_config_dir", "codex_home")
+                                 if facts[key].get("problem")]
+    facts["machine_problems"] += [f"invalid value: {p}" for p in facts["invalid_values"]
+                                  if not any(p in q for q in facts["machine_problems"])]
+    if facts["codex_home"]["path"] and not Path(facts["codex_home"]["path"]).is_dir():
+        facts["machine_problems"].append(f"codex_home: {facts['codex_home']['path']} does not exist "
+                                         "(sign it in with codex login)")
     git = Git(repo)
     try:
         top = git.toplevel()
-    except CommandError as exc:
+    except (CommandError, OSError, subprocess.SubprocessError) as exc:
         return [f"not a git repository: {exc}"], facts
     facts["repo_root"] = top
-    url = git.remote_url()
+    try:
+        url = git.remote_url()
+    except (CommandError, OSError, subprocess.SubprocessError) as exc:
+        return [f"origin remote unavailable: {exc}"], facts
     facts["origin"] = url
     if url not in cfg["allowed_remote_urls"] or github_slug(url) != cfg["repository"]:
         problems.append(f"origin {url} does not match {cfg['repository']}")
@@ -5881,7 +6255,8 @@ def check_project(cfg, repo):
             problems.append(f"default branch is {facts['default_branch']}, config says {cfg['default_target_branch']}")
         if facts["permission"] not in ("ADMIN", "MAINTAIN", "WRITE"):
             problems.append(f"insufficient repository permission {facts['permission']}")
-    except (CommandError, UsageError, ValueError, KeyError) as exc:
+    except (CommandError, UsageError, ValueError, KeyError, OSError, subprocess.SubprocessError) as exc:
+        # OSError: gh could not be started; SubprocessError: a probe exceeded its deadline
         problems.append(f"GitHub check failed: {exc}")
     for item in cfg.get("push_command") or []:
         if item.lower().endswith((".ps1", ".py", ".sh")) and "{" not in item and not Path(expand(item)).is_file():
@@ -5907,6 +6282,12 @@ def github_slug(url: str):
     return f"{match.group(1)}/{match.group(2)}" if match else None
 
 
+def in_nima(path) -> bool:
+    """Whether a repository lies in C:\\Dev\\nima or below it (path components, case-insensitive)."""
+    parts = [p.lower() for p in PureWindowsPath(Path(path).resolve()).parts]
+    return parts[:3] == ["c:\\", "dev", "nima"]
+
+
 def init_project(args, root=HERE, github_factory=GitHub):
     """Write a project config for a repository under the machine-level home (~/.agent-review/projects)."""
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.name):
@@ -5927,8 +6308,14 @@ def init_project(args, root=HERE, github_factory=GitHub):
         raise UsageError(f"a shipped project named {args.name} already exists")
     owner, name = slug.split("/")
     prefix = args.branch_prefix.rstrip("/") + "/"
-    in_nima = Path(top).resolve().as_posix().lower().startswith("c:/dev/nima")
-    config_dir = args.claude_config_dir or ("%USERPROFILE%/.claude" if in_nima else "%USERPROFILE%/.claude-personal")
+    machine = load_machine_profile() or {}
+    machine_dev = machine.get("developer") or {}
+    # explicit flags, then the nima rule, then this machine's profile; otherwise Claude Code on PATH with its
+    # standard config directory, written explicitly so an inherited CLAUDE_CONFIG_DIR cannot redirect it
+    flag_exe, flag_dir = getattr(args, "claude_executable", None), args.claude_config_dir  # "" is supplied, not omitted
+    executable = flag_exe if flag_exe is not None else machine_dev.get("executable") or "claude"
+    config_dir = flag_dir if flag_dir is not None else ("%USERPROFILE%/.claude" if in_nima(top)
+                                                        else machine_dev.get("config_dir") or "~/.claude")
     instructions = [p for p in ("AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md") if (Path(top) / p).exists()]
     shipped = read_json(root / "projects" / "kingmaker-gunslinger.json")
     cfg = {
@@ -5936,15 +6323,17 @@ def init_project(args, root=HERE, github_factory=GitHub):
         "allowed_remote_urls": sorted({f"https://github.com/{owner}/{name}.git", f"git@github.com:{owner}/{name}.git", url}),
         "default_target_branch": default_branch, "branch_pattern": f"^{re.escape(prefix)}[a-z0-9][a-z0-9._/-]*$",
         "expected_actor": actor, "transcript_dir": "docs/agent-reviews", "instructions": instructions,
-        "developer": {"executable": "%USERPROFILE%/.local/bin/claude.exe", "config_dir": config_dir,
+        "developer": {"executable": executable, "config_dir": config_dir,
                       **POLICY["developer"], "soft_deadline_minutes": 480, "grace_minutes": 60,
                       "permissions": {"allow": [r for cmd in args.allow for r in (f"Bash({cmd}*)", f"PowerShell({cmd}*)")],
                                       "deny": []}},
-        "reviewer": {**shipped["reviewer"], **POLICY["reviewer"]},
+        "reviewer": {**shipped["reviewer"], **(machine.get("reviewer") or {}), **POLICY["reviewer"]},
         "limits": shipped["limits"], "runtime_lock_paths": [],
     }
     if args.push_command:
         cfg["push_command"] = json.loads(args.push_command)
+    for section, key in (("developer", "executable"), ("developer", "config_dir"), ("reviewer", "codex_home")):
+        validate_machine_value(key, cfg[section][key], f"init-project {section}.{key}")  # before any write
     check_policy(cfg)
     atomic_write_json(target, cfg)
     return target, cfg
@@ -6533,6 +6922,7 @@ def build_parser():
                    help="command prefix the headless developer may run (e.g. 'npm test'); repeatable")
     p.add_argument("--push-command", help="JSON argv for a repository-owned guarded push wrapper")
     p.add_argument("--claude-config-dir")
+    p.add_argument("--claude-executable", help="Claude Code executable (default: the machine profile, else claude on PATH)")
     p.add_argument("--force", action="store_true")
     p = sub.add_parser("push", help="developer helper: guarded push of the enrolled branch (no force)")
     p.add_argument("--enrollment", required=True)
@@ -6644,11 +7034,21 @@ def dispatch(args, root=HERE):
             print(json.dumps(result, indent=2))
             return EXIT_OK if result["ok"] else EXIT_BLOCKED
         if args.command == "preflight":
-            result = preflight(load_project(args.project))
+            cfg, machine = load_project_effective(args.project)
+            try:
+                unstable = machine_value_problems(cfg)
+                if unstable:  # the values enrollment refuses are never launched with
+                    raise UsageError("invalid machine values: " + "; ".join(unstable))
+                result = preflight(cfg, machine=machine)
+            except (UsageError, CommandError, OSError, subprocess.SubprocessError) as exc:  # unresolvable, unstartable or timed-out CLI
+                result = {"at": now_iso(), "project": cfg["project_id"], "machine": machine_facts(cfg, machine),
+                          "ok": False, "error": f"{type(exc).__name__}: {exc}"}
             text = json.dumps(result, indent=2)
             if args.out:
                 write_text(args.out, text + "\n")
             print(text)
+            if result.get("error"):
+                return EXIT_BLOCKED
             isolation = result["developer"]["permission_isolation"]["ok"] is not False  # None: nothing to probe
             return EXIT_OK if result["developer"]["ok"] and isolation and result["reviewer"]["ok"] else EXIT_BLOCKED
         if args.command == "init-project":
@@ -6680,7 +7080,8 @@ def dispatch(args, root=HERE):
                                                       "passed", "duration_s", "log")}, indent=2))
             return EXIT_OK if receipt["passed"] else EXIT_BLOCKED
         if args.command == "check-project":
-            problems, facts = check_project(load_project(args.project), args.repo)
+            cfg, machine = load_project_effective(args.project)
+            problems, facts = check_project(cfg, args.repo, machine)
             print(json.dumps({"project": args.project, "problems": problems, **facts}, indent=2))
             return EXIT_OK if not problems else EXIT_BLOCKED
         if args.command == "list":
