@@ -5712,10 +5712,10 @@ class ResumeGuidanceTests(Base):
         ctl._reviewer = None  # normal lazy construction of the real Codex boundary
         name = ar.expand(ctl.cfg["reviewer"].get("executable", "codex"))
         self.assertFalse(os.path.isabs(name))  # the shipped configuration needs a PATH lookup
-        which = shutil.which
+        lookup = ar.find_on_path
         env.developer.script += [self.fix]
         reviews = len(env.reviewer.calls)
-        with mock.patch.object(ar.shutil, "which", lambda cmd, *a, **k: None if cmd == name else which(cmd, *a, **k)):
+        with mock.patch.object(ar, "find_on_path", lambda cmd: None if cmd == name else lookup(cmd)):
             code, out = self.resume(ctl, guidance=path)  # simulated: the reviewer executable is absent from PATH
         self.assertEqual(ar.EXIT_BLOCKED, code)
         self.assertIn("could not be prepared", out["reason"])
