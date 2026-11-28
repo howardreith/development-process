@@ -185,8 +185,13 @@ controller instance runs in. The load marks each role section it pinned, and
 the controller uses those values exactly as written; it never expands them
 again. Values it did not pin (the GitHub client's `gh`, and the raw settings of
 an enrollment made before this release, including after a bare `activate`) are
-expanded as before. An anchored executable without an extension still finds,
-for example, `codex.cmd` at that location if the tool is installed later. A
+expanded as before. Executable paths are matched as Windows does: a name with
+a PATHEXT extension (`codex.exe`) is exact, while an anchored command stem
+(`codex`) is matched only as stem plus extension, so it still finds, for
+example, `codex.cmd` installed there later even if a directory or extensionless
+file shares the stem. Bare names search only fully qualified PATH directories.
+A machine field present with a non-string or empty value is reported and
+refused like any other invalid value; an omitted field keeps its default. A
 project's empty `developer.config_dir` keeps its established meaning: the
 inherited `CLAUDE_CONFIG_DIR` when set, otherwise `~/.claude`.
 

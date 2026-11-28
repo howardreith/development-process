@@ -200,12 +200,17 @@ def is_fully_qualified(path: str) -> bool:
 
 
 def with_pathext(path: str) -> str:
-    """An absolute executable path, or on Windows the first PATHEXT spelling of it that exists (an extensionless
-    path pinned before its tool was installed still finds, for example, codex.cmd in that directory)."""
-    if os.name == "nt" and not os.path.exists(path):
-        for ext in (os.environ.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD").split(os.pathsep):
-            if ext and os.path.isfile(path + ext):
-                return path + ext
+    """A fully qualified executable path as Windows matches it: a name carrying a PATHEXT extension (codex.exe) is
+    exact; a command stem (codex) is matched only as stem+extension, so a directory or extensionless file at the stem
+    never hides, for example, a codex.cmd installed after the stem was pinned. Elsewhere the path is exact."""
+    if os.name != "nt":
+        return path
+    pathext = [e for e in (os.environ.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if e]
+    if Path(path).suffix.lower() in {e.lower() for e in pathext}:
+        return path
+    for ext in pathext:
+        if os.path.isfile(path + ext):
+            return path + ext
     return path
 
 
@@ -218,7 +223,7 @@ def find_on_path(name: str):
         exts = ([""] if Path(name).suffix.lower() in pathext else []) + pathext
     for folder in os.environ.get("PATH", "").split(os.pathsep):
         folder = folder.strip().strip('"')
-        if not folder or not os.path.isabs(folder):
+        if not folder or not is_fully_qualified(folder):  # a drive-less entry would follow the current drive
             continue
         for ext in exts:
             candidate = os.path.join(folder, name + ext)
@@ -5579,16 +5584,17 @@ def pin_machine_values(cfg):
         del dev["config_dir"]  # the established project form of "Claude Code's standard directory"
     for section, key, var, default in ((dev, "config_dir", "CLAUDE_CONFIG_DIR", None),
                                        (rev, "codex_home", "CODEX_HOME", "~/.codex")):
-        value = section.get(key, default)
-        if value:
+        value, problem = machine_field(section, key, default, key)
+        if value and not problem:
             try:
                 section[key] = str(pin_dir(value, var, key))
             except UsageError:
                 pass
     for section in (dev, rev):
-        if section.get("executable"):
+        value, problem = machine_field(section, "executable", None, "executable")
+        if value and not problem:
             try:
-                section["executable"] = pin_executable(section["executable"], "executable")
+                section["executable"] = pin_executable(value, "executable")
             except UsageError:
                 pass
     unstable = " ".join(machine_value_problems(cfg))
@@ -5599,17 +5605,29 @@ def pin_machine_values(cfg):
     return cfg
 
 
+def machine_field(section_cfg, key, default, label):
+    """(value, problem) for one machine field: the default when the field is omitted; a present value must be a
+    non-empty string, and is never passed on otherwise."""
+    if key not in section_cfg:
+        return default, None
+    value = section_cfg[key]
+    if isinstance(value, str) and value.strip():
+        return value, None
+    return None, f"{label} must be a non-empty string (got {json.dumps(value)})"
+
+
 def machine_value_problems(cfg):
     """Why a loaded configuration's machine values could change meaning after pinning (empty when stable)."""
     problems = []
     for section, key, default in (("developer", "config_dir", None), ("developer", "executable", None),
                                   ("reviewer", "codex_home", "~/.codex"), ("reviewer", "executable", None)):
-        value = cfg[section].get(key, default)
+        value, problem = machine_field(cfg[section], key, default, f"{section}.{key}")
+        if problem:
+            problems.append(problem)
+            continue
         if value is None:
             continue
         try:
-            if not isinstance(value, str) or not value.strip():
-                raise UsageError(f"{section}.{key} must be a non-empty string")
             if key == "executable":
                 pin_executable(value, f"{section}.{key}")  # an explicit relative project path stays allowed
             else:
@@ -5642,8 +5660,10 @@ def machine_facts(cfg, identity):
     """Where this machine runs the configured roles, from the loaded configuration and the identity of the profile
     that load applied (check-project, preflight): each executable as resolved, and the Claude config directory and
     Codex home the child processes use. A resolution failure is reported in place of a path."""
-    def executable(section, default):
-        exe = section.get("executable", default)
+    def executable(section, name, default):
+        exe, problem = machine_field(section, "executable", default, f"{name}.executable")
+        if problem:
+            return {"configured": section.get("executable"), "path": None, "problem": problem}
         try:
             path = resolve_exe(exe, literal=section.get(PINNED_MARK) is True)
         except UsageError as exc:
@@ -5652,17 +5672,22 @@ def machine_facts(cfg, identity):
             return {"configured": exe, "path": None, "problem": f"{path} does not exist"}
         return {"configured": exe, "path": path}
 
-    def directory(resolve):
+    def directory(section, label, key, default, resolve):
+        _, problem = machine_field(section, key, default, label)
+        if problem:  # never handed to a path function
+            return {"path": None, "problem": problem}
         try:
             return {"path": str(resolve())}
         except UsageError as exc:
             return {"path": None, "problem": str(exc)}
     dev, rev = cfg["developer"], cfg["reviewer"]
     return {"machine_profile": identity,
-            "developer_executable": executable(dev, "claude"),
-            "reviewer_executable": executable(rev, "codex"),
-            "claude_config_dir": directory(lambda: claude_config_dir(dev)),
-            "codex_home": directory(lambda: stable_dir(rev.get("codex_home", "~/.codex"), "CODEX_HOME",
+            "developer_executable": executable(dev, "developer", "claude"),
+            "reviewer_executable": executable(rev, "reviewer", "codex"),
+            "claude_config_dir": directory(dev, "developer.config_dir", "config_dir", None,
+                                           lambda: claude_config_dir(dev)),
+            "codex_home": directory(rev, "reviewer.codex_home", "codex_home", "~/.codex",
+                                    lambda: stable_dir(rev.get("codex_home", "~/.codex"), "CODEX_HOME",
                                                        "reviewer Codex home", literal=rev.get(PINNED_MARK) is True)),
             "invalid_values": machine_value_problems(cfg)}
 

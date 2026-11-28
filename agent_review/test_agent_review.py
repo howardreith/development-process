@@ -1740,14 +1740,16 @@ class MachinePortabilityTests(unittest.TestCase):
         ar.atomic_write_json(path, cfg)
 
     def test_current_drive_rooted_executables_keep_their_drive(self):
-        """R4-F1, including Python 3.12's os.path.isabs, for which \\tools\\x is absolute."""
+        """R4-F1. Native path functions, run from the fixture's directory (whose drive the spelling refers to).
+        Whatever this interpreter's os.path.isabs says about \\tools\\x (True before Python 3.13), the drive is
+        what makes a path fully qualified."""
         env = self.env
         shim = self.command_shim(env.root / "tools-abs", "claude-root", ["print('rooted')"])
-        rooted = str(shim)[2:]  # the drive stripped, the leading separator kept
-        self.assertTrue(rooted.startswith("\\"))
+        drive, rooted = os.path.splitdrive(str(shim))  # the drive stripped, the leading separator kept
+        self.assertTrue(drive and rooted.startswith("\\"))
         same = os.path.normcase
-        ntpath_312 = lambda p: bool(re.match(r"^([A-Za-z]:)?[\\/]", os.fspath(p)))
-        with mock.patch.object(ar.os.path, "isabs", ntpath_312):
+        with contextlib.chdir(env.root):
+            self.assertEqual("", os.path.splitdrive(rooted)[0])
             self.assertFalse(ar.is_fully_qualified(rooted))
             pinned = ar.pin_machine_values({"developer": {"executable": rooted}, "reviewer": {}})
         self.assertEqual(same(str(shim)), same(pinned["developer"]["executable"]))
@@ -1840,10 +1842,78 @@ class MachinePortabilityTests(unittest.TestCase):
         self.assertEqual(str(first_dir / "tools" / "codex"), state["project"]["reviewer"]["executable"])
         installed = self.command_shim(first_dir / "tools", "codex", ["print('codex-cli first')"])
         self.command_shim(second_dir / "tools", "codex", ["print('codex-cli second')"])
-        with contextlib.chdir(second_dir):
-            rev = ar.CodexReviewer(env.controller().cfg["reviewer"])
-            self.assertEqual(os.path.normcase(str(installed)), os.path.normcase(rev.exe))
-            self.assertEqual("codex-cli first", rev.version())
+        stem = first_dir / "tools" / "codex"
+        for occupant in ("nothing", "directory", "text launcher"):
+            if occupant == "directory":
+                stem.mkdir()
+            elif occupant == "text launcher":
+                stem.rmdir()
+                stem.write_text("#!/bin/sh\necho not-a-windows-executable\n", encoding="utf-8")
+            with contextlib.chdir(second_dir):
+                rev = ar.CodexReviewer(env.controller().cfg["reviewer"])
+                self.assertEqual(os.path.normcase(str(installed)), os.path.normcase(rev.exe), occupant)
+                self.assertEqual("codex-cli first", rev.version(), occupant)
+
+    def test_an_explicit_executable_extension_is_exact(self):
+        """R6-F1: a missing codex.exe is reported missing, never replaced by codex.exe.cmd."""
+        env = self.env
+        calls = env.root / "exe-calls.txt"
+        self.command_shim(env.root / "exe-dir", "codex.exe",
+                          ["import sys", f"open({str(calls)!r}, 'a').write('called' + chr(10))", "print('wrong')"])
+        missing = str(env.root / "exe-dir" / "codex.exe")
+        self.assertEqual(missing, ar.resolve_exe(missing))
+        facts = ar.machine_facts({"developer": {"executable": sys.executable},
+                                  "reviewer": {"executable": missing, "codex_home": self.review_home}}, None)
+        self.assertIn("does not exist", facts["reviewer_executable"]["problem"])
+        rev = ar.CodexReviewer({"executable": missing, "codex_home": self.review_home, "model": "m", "effort": "high"})
+        with self.assertRaises(OSError):
+            rev.version()
+        self.assertFalse(calls.exists())
+        stem = str(env.root / "exe-dir" / "codex")  # the extensionless case still finds a wrapper
+        self.command_shim(env.root / "exe-dir", "codex", ["print('right')"])
+        self.assertEqual(os.path.normcase(stem + ".cmd"), os.path.normcase(ar.resolve_exe(stem)))
+
+    def test_bare_commands_ignore_drive_less_path_entries(self):
+        """R6-F2: a PATH entry without a drive follows the current drive and is skipped."""
+        env = self.env
+        self.command_shim(env.root / "driveless-bin", "claude-pathcheck", ["print('drive-less')"])
+        qualified = self.command_shim(env.root / "qualified-bin", "claude-pathcheck", ["print('qualified')"])
+        driveless = os.path.splitdrive(str(env.root / "driveless-bin"))[1]
+        path = os.pathsep.join([driveless, str(env.root / "qualified-bin")])
+        with contextlib.chdir(env.root), mock.patch.dict(os.environ, {"PATH": path}):
+            self.assertFalse(ar.is_fully_qualified(driveless))
+            self.assertEqual(os.path.normcase(str(qualified)), os.path.normcase(ar.resolve_exe("claude-pathcheck")))
+
+    def test_non_string_machine_fields_are_reported_and_refused(self):
+        """R6-F3: a null or numeric reviewer home; the omitted home keeps its default."""
+        env = self.env
+        env.controller().cancel("enroll again with malformed machine fields")
+        states = sorted((env.root / "state").iterdir())
+        original = ar.read_json(self.project)
+        for bad in (None, 5):
+            self.check_fixture()
+            self.rewrite_check_fixture(lambda cfg, bad=bad: cfg["reviewer"].update(codex_home=bad))
+            code, out = self.run_cli("check-project", "--project", "check-fixture", "--repo", str(env.work))
+            self.assertEqual(ar.EXIT_OK, code, out["problems"])  # the existing exit policy for machine diagnostics
+            self.assertIsNone(out["codex_home"]["path"])
+            self.assertIn("non-empty string", out["codex_home"]["problem"])
+            self.assertTrue(any("reviewer.codex_home" in p for p in out["machine_problems"]))
+            target = env.root / f"preflight-home-{bad}.json"
+            code, out = self.run_cli("preflight", "--project", "check-fixture", "--out", str(target))
+            self.assertEqual(ar.EXIT_BLOCKED, code)
+            self.assertIn("reviewer.codex_home", out["error"])
+            self.assertEqual(out, ar.read_json(target))
+            cfg = json.loads(json.dumps(original))
+            cfg["reviewer"]["codex_home"] = bad
+            ar.atomic_write_json(self.project, cfg)
+            with self.assertRaises(ar.UsageError) as refused:
+                ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
+            self.assertIn("nothing was created", str(refused.exception))
+            self.assertEqual(states, sorted((env.root / "state").iterdir()))
+        cfg = json.loads(json.dumps(original))
+        cfg["reviewer"].pop("codex_home")
+        ar.atomic_write_json(self.project, cfg)
+        self.assertEqual(str(Path.home() / ".codex"), ar.load_project(self.project, env.wf)["reviewer"]["codex_home"])
 
     def test_nima_rule_matches_path_components(self):
         """R1-F6: a descendant of C:\\Dev\\nima, not a similarly named sibling."""
