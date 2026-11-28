@@ -185,14 +185,17 @@ controller instance runs in. The load marks each role section it pinned, and
 the controller uses those values exactly as written; it never expands them
 again. Values it did not pin (the GitHub client's `gh`, and the raw settings of
 an enrollment made before this release, including after a bare `activate`) are
-expanded as before. Executable paths are matched as Windows does: a name with
-a PATHEXT extension (`codex.exe`) is exact, while an anchored command stem
-(`codex`) is matched only as stem plus extension, so it still finds, for
-example, `codex.cmd` installed there later even if a directory or extensionless
-file shares the stem. Bare names search only fully qualified PATH directories.
+expanded as before. Executable names are matched as Windows does: a name that
+already carries an executable extension (`.exe`, `.cmd`, `.bat`, `.com` or any
+PATHEXT entry) is exact, whether absolute, relative or bare, whatever PATHEXT
+lists; a command stem (`codex`) is completed with PATHEXT, so it still finds,
+for example, `codex.cmd` installed there later even if a directory or
+extensionless file shares the stem. When no suffixed sibling exists, the
+configured path itself is used, and `check-project` reports it as missing if it
+is not a regular file. Bare names search only fully qualified PATH directories.
 A machine field present with a non-string or empty value is reported and
 refused like any other invalid value; an omitted field keeps its default. A
-project's empty `developer.config_dir` keeps its established meaning: the
+project's empty or null `developer.config_dir` keeps its established meaning: the
 inherited `CLAUDE_CONFIG_DIR` when set, otherwise `~/.claude`.
 
 A value that would still contain an unresolved variable after expansion

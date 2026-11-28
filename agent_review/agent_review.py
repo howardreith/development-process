@@ -203,24 +203,33 @@ def with_pathext(path: str) -> str:
     """A fully qualified executable path as Windows matches it: a name carrying a PATHEXT extension (codex.exe) is
     exact; a command stem (codex) is matched only as stem+extension, so a directory or extensionless file at the stem
     never hides, for example, a codex.cmd installed after the stem was pinned. Elsewhere the path is exact."""
-    if os.name != "nt":
+    if os.name != "nt" or has_executable_suffix(path):
         return path
-    pathext = [e for e in (os.environ.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if e]
-    if Path(path).suffix.lower() in {e.lower() for e in pathext}:
-        return path
-    for ext in pathext:
+    for ext in windows_pathext():
         if os.path.isfile(path + ext):
             return path + ext
-    return path
+    return path  # no suffixed sibling: the configured path itself (reported missing if absent)
+
+
+WINDOWS_EXECUTABLE_SUFFIXES = (".com", ".exe", ".bat", ".cmd")
+
+
+def windows_pathext():
+    return [e.lower() for e in (os.environ.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if e]
+
+
+def has_executable_suffix(name: str) -> bool:
+    """Whether a Windows executable name already carries its extension (codex.exe): such a name is matched exactly,
+    whatever the shell's PATHEXT lists; only a stem (codex) is completed with PATHEXT."""
+    return Path(name).suffix.lower() in set(WINDOWS_EXECUTABLE_SUFFIXES) | set(windows_pathext())
 
 
 def find_on_path(name: str):
     """A bare command found only in PATH's absolute directories. Unlike shutil.which on Windows, the current
     directory (for example a worktree holding a same-named file) is never searched."""
     exts = [""]
-    if os.name == "nt":
-        pathext = [e.lower() for e in (os.environ.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if e]
-        exts = ([""] if Path(name).suffix.lower() in pathext else []) + pathext
+    if os.name == "nt" and not has_executable_suffix(name):  # a name with its extension is matched exactly
+        exts = windows_pathext()
     for folder in os.environ.get("PATH", "").split(os.pathsep):
         folder = folder.strip().strip('"')
         if not folder or not is_fully_qualified(folder):  # a drive-less entry would follow the current drive
@@ -244,10 +253,10 @@ def resolve_exe(name: str, literal: bool = False) -> str:
     if is_fully_qualified(candidate):
         return with_pathext(candidate)
     if not is_command_name(candidate):  # an explicit relative path is checked as given, never searched for
-        found = shutil.which(candidate)
-        if not found:
+        found = with_pathext(os.path.abspath(candidate))
+        if not os.path.isfile(found):
             raise UsageError(f"Executable not found: {name}")
-        return os.path.abspath(found)
+        return found
     found = find_on_path(candidate)
     if not found:
         raise UsageError(f"Executable not found on PATH: {name}")
@@ -296,7 +305,7 @@ def pin_executable(value: str, what: str) -> str:
         raise UsageError(f"{what} '{value}' expands to a blank value")
     if is_command_name(exe) or is_fully_qualified(exe):
         return exe
-    return os.path.abspath(shutil.which(exe) or exe)  # explicit paths keep their PATHEXT lookup (also at launch)
+    return os.path.abspath(exe)  # anchored as written; a stem is completed with PATHEXT at launch (with_pathext)
 
 
 def run(argv, cwd=None, input_text=None, env=None, timeout=300, check=True):
@@ -5580,8 +5589,8 @@ def pin_machine_values(cfg):
     (machine_value_problems)."""
     cfg = json.loads(json.dumps(cfg))
     dev, rev = cfg["developer"], cfg["reviewer"]
-    if dev.get("config_dir") == "":
-        del dev["config_dir"]  # the established project form of "Claude Code's standard directory"
+    if "config_dir" in dev and dev["config_dir"] in ("", None):
+        del dev["config_dir"]  # the established project forms of "Claude Code's standard directory"
     for section, key, var, default in ((dev, "config_dir", "CLAUDE_CONFIG_DIR", None),
                                        (rev, "codex_home", "CODEX_HOME", "~/.codex")):
         value, problem = machine_field(section, key, default, key)

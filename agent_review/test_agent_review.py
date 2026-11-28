@@ -1698,27 +1698,38 @@ class MachinePortabilityTests(unittest.TestCase):
         ar.atomic_write_json(self.project, cfg)
         with contextlib.chdir(first_dir):
             env.dir, state = ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
-        same = os.path.normcase  # PATHEXT may add the extension in another case
-        self.assertEqual(same(str(original)), same(state["project"]["developer"]["executable"]))  # anchored
+        same = os.path.normcase
+        # anchored as written (the stem); the extension is completed at launch, as for a later-installed tool
+        self.assertEqual(same(str(first_dir / "tools" / "claude-rel")), same(state["project"]["developer"]["executable"]))
         with contextlib.chdir(second_dir):
             ctl = env.controller()
             self.assertEqual(same(str(original)), same(ar.ClaudeDeveloper(ctl.cfg["developer"], None, None).exe))
 
     def test_a_legacy_empty_claude_directory_means_the_standard_one(self):
-        """R4-F2: an empty project config_dir enrolls and selects ~/.claude; an empty profile value is refused."""
+        """R4-F2, R7-F1: an empty or null project config_dir enrolls like an omitted one (the inherited
+        CLAUDE_CONFIG_DIR when set, otherwise ~/.claude); empty or null profile values are refused."""
         env = self.env
-        env.controller().cancel("enroll again with an empty config_dir")
-        cfg = ar.read_json(self.project)
-        cfg["developer"]["config_dir"] = ""
-        ar.atomic_write_json(self.project, cfg)
-        with mock.patch.dict(os.environ):
-            os.environ.pop("CLAUDE_CONFIG_DIR", None)
-            env.dir, state = ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
-            self.assertNotIn("config_dir", state["project"]["developer"])
-            self.assertEqual(Path.home() / ".claude", ar.claude_config_dir(env.controller().cfg["developer"]))
-        self.write_profile(developer={"config_dir": ""})
-        with self.assertRaises(ar.UsageError):
-            ar.load_project(self.project, env.wf)
+        inherited = env.root / "inherited-claude"
+        for legacy in ("", None):
+            for inherit in (None, inherited):
+                env.controller().cancel("enroll again with a legacy config_dir")
+                cfg = ar.read_json(self.project)
+                cfg["developer"]["config_dir"] = legacy
+                ar.atomic_write_json(self.project, cfg)
+                with mock.patch.dict(os.environ):
+                    os.environ.pop("CLAUDE_CONFIG_DIR", None)
+                    if inherit:
+                        os.environ["CLAUDE_CONFIG_DIR"] = str(inherit)
+                    env.dir, state = ar.enroll(env.args(), github=env.gh, root=env.wf, developer=env.developer)
+                    self.assertNotIn("config_dir", state["project"]["developer"])
+                    effective = ar.claude_config_dir(env.controller().cfg["developer"])
+                    self.assertEqual(inherit or Path.home() / ".claude", effective, (legacy, inherit))
+                    reported = ar.machine_facts(env.controller().cfg, None)["claude_config_dir"]["path"]
+                    self.assertEqual(str(effective), reported)
+        for bad in ("", None):
+            self.write_profile(developer={"config_dir": bad})
+            with self.assertRaises(ar.UsageError):
+                ar.load_project(self.project, env.wf)
 
     def test_a_timed_out_repository_probe_keeps_the_check_project_report(self):
         """R4-F3: simulated TimeoutExpired at the GitHub boundary."""
@@ -1872,6 +1883,39 @@ class MachinePortabilityTests(unittest.TestCase):
         stem = str(env.root / "exe-dir" / "codex")  # the extensionless case still finds a wrapper
         self.command_shim(env.root / "exe-dir", "codex", ["print('right')"])
         self.assertEqual(os.path.normcase(stem + ".cmd"), os.path.normcase(ar.resolve_exe(stem)))
+
+    def test_explicit_executable_names_are_exact_whatever_pathext_lists(self):
+        """R6-F1: absolute, relative and bare `.exe` names never select a double-suffixed `.exe.cmd` wrapper."""
+        env = self.env
+        calls = env.root / "double-suffix-calls.txt"
+        record = ["import sys", f"open({str(calls)!r}, 'a').write('called' + chr(10))", "print('wrong')"]
+        absolute = env.root / "abs-dir" / "codex.exe"
+        self.command_shim(env.root / "abs-dir", "codex.exe", record)
+        for pathext in (".CMD", ".COM;.EXE;.BAT;.CMD"):
+            with mock.patch.dict(os.environ, {"PATHEXT": pathext}):
+                self.assertEqual(str(absolute), ar.resolve_exe(str(absolute)), pathext)
+                facts = ar.machine_facts({"developer": {"executable": sys.executable},
+                                          "reviewer": {"executable": str(absolute), "codex_home": self.review_home}},
+                                         None)
+                self.assertIn("does not exist", facts["reviewer_executable"]["problem"])
+                rev = ar.CodexReviewer({"executable": str(absolute), "codex_home": self.review_home, "model": "m",
+                                        "effort": "high"})
+                with self.assertRaises(OSError):
+                    rev.version()
+        work = env.root / "rel-launch"
+        self.command_shim(work / "tools", "codex.exe", record)
+        with contextlib.chdir(work):
+            pinned = ar.pin_machine_values({"developer": {}, "reviewer": {"executable": "tools\\codex.exe"}})
+            self.assertEqual(str(work / "tools" / "codex.exe"), pinned["reviewer"]["executable"])
+            with self.assertRaises(ar.UsageError):
+                ar.resolve_exe("tools\\codex.exe")  # missing, and never completed to codex.exe.cmd
+        early, late = env.root / "path-early", env.root / "path-late"
+        self.command_shim(early, "codex-exact.exe", record)
+        late.mkdir()
+        (late / "codex-exact.exe").write_bytes(b"MZ")  # the exact name, later on PATH (selected, not run)
+        with mock.patch.dict(os.environ, {"PATH": os.pathsep.join([str(early), str(late)])}):
+            self.assertEqual(str(late / "codex-exact.exe"), ar.resolve_exe("codex-exact.exe"))
+        self.assertFalse(calls.exists())  # no double-suffixed wrapper was ever invoked
 
     def test_bare_commands_ignore_drive_less_path_entries(self):
         """R6-F2: a PATH entry without a drive follows the current drive and is skipped."""
